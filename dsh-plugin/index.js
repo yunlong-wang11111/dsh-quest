@@ -51,11 +51,11 @@ function apply(ctx, config = {}) {
     name: 'quest_plan',
     description: [
       '写入/替换当前工作区的任务线计划（quest 系统的源头定义，markdown 格式）。',
-      '⚠️ 写之前必须先用 read 工具读模板：<quest-dir>\\PLAN-TEMPLATE.md',
+      '⚠️ 写之前必须先用 read 工具读模板：quest 插件目录下的 PLAN-TEMPLATE.md（从本插件的安装目录找）',
       '（含五段科研流水标准骨架、handoff 写作指南与红线——handoff 质量决定 worker 总结质量）。',
       '要点速览：节点用 "---node: <id>---" 分节；command 必填（解释器绝对路径）；',
       'expect_minutes 写真实值（超时护栏=2倍）；after 声明依赖（上游成功自动派发、失败冻结下游）；',
-      '写完 plan 后顺手用 task_summary_update 把各节点登记进任务总揽（标题=节点id，备注=做什么）；manual: true 停下等人工；auto_fix: true 失败后自动修复；when: <节点>.verdict==ok 或 <节点>.metrics.loss_slope_10ep < -0.05 等条件门控（趋势运算符 slope_N/plateau_epochs 支持"看变化程度"的分支：a好跑b、不好跑c）；watch_log+watch_rules 运行中监控（默认只警告，NaN/OOM 类可配 action=kill+confirm 连续命中）；只需派发链头节点。workspace 取当前会话 cwd。',
+      '写完 plan 后顺手用 task_summary_update 把各节点登记进任务总揽（标题=节点id，备注=做什么）；manual: true 停下等人工；auto_fix: true 失败后自动修复；when: <节点>.verdict==ok 或 <节点>.metrics.loss_slope_10ep < -0.05 等条件门控（趋势运算符 slope_N/plateau_epochs 支持"看变化程度"的分支：a好跑b、不好跑c）；watch_log+watch_rules 运行中监控（默认只警告，NaN/OOM 类可配 action=kill+confirm 连续命中）；只需派发链头节点。**派发后不要设 goal 轮询——任务完成会 QQ 通知+自动流转。** workspace 取当前会话 cwd。',
     ].join(' '),
     parameters: {
       markdown: { type: 'string', description: '完整 plan.md 内容' },
@@ -84,6 +84,40 @@ function apply(ctx, config = {}) {
     execute: async (args, exec) => questCall(cfg(), `/api/dispatch?ws=${encodeURIComponent(wsOf(args, exec))}`, {
       method: 'POST', body: JSON.stringify({ node: String(args.node || '') }),
     }),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'quest_run',
+    description: [
+      '快速单发：不写任务线，直接派一个临时长任务到后台（全套判定+worker 总结+QQ 推送）。',
+      '适合脚本已定型、想立刻后台跑的单个命令。探索期的临时实验/训练/数据生成都用它。',
+      '**门禁规则**：解释器（python/node/Rscript/matlab/julia）跑工作区内脚本的命令直接执行；其它命令（删除/下载/系统类/工作区外路径）会被挂起推送 owner QQ 等人工确认，30 分钟不确认自动作废——这不是失败，返回的 note 会说明原因。夜间窗口（23:00-08:00）带 reason 可自批执行。所以：常规长任务请写成"python 工作区内脚本"形式，永远畅通；命令被挂起时不要反复原样重试，等确认或改写。',
+      '任务结束自动通知（QQ 推送+worker 总结）——**派发后你的工作就完成了，不要设 goal/create_goal 来轮询进度，不要 Sleep 后再查。quest 有事件驱动通知，你等着被通知或被问就行。** 用户催进度时读工作区的 progress.md（quest 自动维护的实时快照）。',
+    ].join(' '),
+    parameters: {
+      command: { type: 'string', description: '要后台执行的完整命令（解释器用绝对路径）' },
+      cwd: { type: 'string', description: '工作目录' },
+      title: { type: 'string', description: '任务短名（用于识别和通知）' },
+      reason: { type: 'string', description: '为什么跑这条命令（一句话）。夜间自批必填；白天也给上——挂起推送时它就是给 owner 看的审批理由' },
+      expect_minutes: { type: 'string', description: '预计时长（分钟，超时=2倍）' },
+      handoff: { type: 'string', description: '交接上下文：这个任务做什么、看什么指标、异常特征' },
+      auto_fix: { type: 'string', description: '"true" = 失败后自动修复（默认关）' },
+      ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, nodeId: { type: 'string' }, gate: { type: 'string' }, gateId: { type: 'string' }, note: { type: 'string' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `派发失败：${v.error}` : v.gate === 'pending-confirm' ? `⏳ 命令被门禁挂起（${v.gateId}）：${v.note || '已推送 owner QQ 等确认'}` : `✅ 已后台派发：${v.nodeId}${v.gate === 'night-self-approved' ? '（夜间自批，已留痕）' : ''}
+进度自动写入工作区 progress.md，完成后 QQ 通知` }],
+    },
+    execute: async (args, exec) => questCall(cfg(), `/api/run?ws=${encodeURIComponent(wsOf(args, exec))}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        command: String(args.command || ''), cwd: String(args.cwd || wsOf(args, exec)),
+        title: String(args.title || args.command || 'quick'), expectMinutes: Number(args.expect_minutes) || 30,
+        reason: String(args.reason || ''),
+        handoff: String(args.handoff || ''), autoFix: args.auto_fix === 'true' || args.auto_fix === true,
+      }),
+    }, 8000),
   }));
 
   ctx.tools.register(defineTool({

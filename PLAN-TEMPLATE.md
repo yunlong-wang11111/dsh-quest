@@ -1,6 +1,6 @@
 # quest_plan 模板与写法指南（AI 写任务线前先读本文件）
 
-> 位置固定：`<quest 安装目录>\PLAN-TEMPLATE.md`
+> 位置固定：quest 插件目录下的 PLAN-TEMPLATE.md
 > `quest_plan` 工具的 markdown 参数按本模板写。写作原则：**handoff 是 worker 总结质量的上限**——
 > worker 只能看到 handoff + 日志尾部，看不到你们的研究语境，所以要在这里替它把语境补齐。
 
@@ -19,13 +19,9 @@ after: <上游节点 id，逗号分隔；链头节点不写此行>
 manual: <true=上游完成后停下等人工确认；缺省=false 全自动>
 auto_fix: <true=失败后触发自动修复会话：机械性问题（显存/参数/路径）自动改+.bak备份+重派>
 fix_budget: <自动修复次数上限，默认 2；烧完停手 QQ 告警>
-when: <条件门控：上游完成后，条件成立才跑本节点。如 when: train-a.metrics.loss_slope_10ep < -0.05
-       支持趋势运算符：loss_slope_5ep/10ep/20ep（相对变化，负=在降）、loss_plateau_epochs（尾部连续变化<1%的样本数）
-       也支持 train-a.verdict == ok 这类终态判断。不成立 → skipped（终态，下游冻结）>
-watch_rules: <运行中盯梢（可选，分号分组）：if=NaN|CUDA out of memory; confirm=2; action=kill
-             默认只警告（action=notify）不杀；kill 仅限机械致命模式且需连续 confirm 次命中
-             盯的日志默认是 quest 捕获的 stdout（watch_log 省略即可）>
 quiet: <true=不发 QQ；缺省=false>
+max_log_mb: <stdout 日志封顶 MB，默认 256；超限截断（保留尾部新内容），防 verbose 训练吃满磁盘>
+push_images: <成功后把 cwd 里新产出的 png/jpg 直推 QQ 的张数上限，默认 2；0=关。可视化节点建议保持默认>
 handoff: |
   <3~8 行交接上下文，给一个看不到你们对话的 worker 读。覆盖：>
   1. 这个脚本在整个研究里的角色（"生成 XX 消融实验的训练数据"）

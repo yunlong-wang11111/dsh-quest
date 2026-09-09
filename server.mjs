@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // quest 服务 —— 任务线编排核心（P1：账本+作业执行+预检+判定器；P2：worker 子会话；P3：QQ 推送）
 //
-// 设计文档：DESIGN.md（本仓库根目录）
+// 设计文档见仓库 DESIGN.md（如未附带则参考 README）
 // 数据目录：~/.dsh/quests/<wsKey>/（plan.md + ledger.jsonl + logs/ + state.json）
 // 端口：默认 3110，仅绑定 127.0.0.1；token 首启生成于 ~/.dsh/quests/.token
 //
@@ -30,18 +30,18 @@ fs.mkdirSync(HOMEOverride, { recursive: true });
 if (!fs.existsSync(CONFIG_PATH)) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify({
     port: 3110,
-    // worker 会话目标：生产=http://127.0.0.1:3080（token 从 dsh-run.log 解析）
-    // 沙盒=http://127.0.0.1:3090 + tokenLog 指向沙盒日志
-    dshBaseUrl: 'http://127.0.0.1:3090',
-    dshTokenLog: '',
+    // worker 会话目标：你的 DSH Web 地址（token 从 DSH 运行日志解析，或直接填 dshToken）
+    dshBaseUrl: 'http://127.0.0.1:3080',
+    dshTokenLog: '', // DSH 运行日志路径，首次启动时用于解析 token
     dshToken: '',
     workerPreset: 'quest-worker',
     fixerPreset: 'quest-fixer',
+    // QQ 通知（可选，需配套 OneBot 桥接，见 README）：enabled=false 时纯本地运行
     qqNotify: {
       enabled: false,
       bridgeUrl: 'http://127.0.0.1:3100',
-      tokenFile: '',
-      userId: 0,
+      tokenFile: '', // 桥接的控制台令牌文件路径
+      userId: 0, // 接收通知的 QQ 号
     },
   }, null, 2));
 }
@@ -75,13 +75,16 @@ function parsePlan(markdown) {
     const m = line.match(/^---node:\s*(\S+)---\s*$/);
     if (m) {
       if (cur) nodes.push(cur);
-      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [] };
+      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2 };
       handoffMode = false;
       continue;
     }
     if (!cur) {
       const kv = line.match(/^([a-zA-Z_]+):\s*(.*)$/);
       if (kv && ['workspace', 'title'].includes(kv[1])) meta[kv[1]] = kv[2].trim();
+      // 没写 title: 时，取第一个 Markdown 一级标题当标题（模板惯例是 "# 任务线：<名字>"）
+      const h = line.match(/^#\s+(.+)$/);
+      if (h && !meta.heading) meta.heading = h[1].replace(/^\s*任务线[：:]\s*/, '').trim().slice(0, 40);
       continue;
     }
     if (handoffMode) {
@@ -103,6 +106,8 @@ function parsePlan(markdown) {
       case 'manual': cur.manual = v.trim() === 'true'; break;
       case 'auto_fix': cur.autoFix = v.trim() === 'true'; break;
       case 'fix_budget': cur.fixBudget = Number(v) || 2; break;
+      case 'max_log_mb': cur.maxLogMB = Number(v) || 0; break; // 0 = 默认 256MB
+      case 'push_images': cur.pushImages = Number(v) || 0; break; // 成功后直推 QQ 的图片数上限，0 = 关
       case 'when': cur.when = v.trim(); break;
       case 'watch_log': cur.watchLog = v.trim(); break;
       case 'watch_interval_minutes': cur.watchIntervalMinutes = Number(v) || 10; break;
@@ -124,6 +129,7 @@ function parsePlan(markdown) {
     }
   }
   if (cur) nodes.push(cur);
+  meta.title = meta.title || meta.heading || '';
   for (const n of nodes) {
     if (!n.command) errors.push(`节点 ${n.id} 缺 command`);
     if (!n.cwd) n.cwd = meta.workspace || '';
@@ -196,6 +202,27 @@ const wakeEventWaiters = () => { for (const w of eventWaiters.splice(0)) w(); };
 const inbox = [];
 const pushInbox = (msg) => { inbox.push({ ts: Date.now(), ...msg }); if (inbox.length > 50) inbox.shift(); };
 
+/** 尾部读取：日志可能被允许涨到几百 MB，绝不能整读进内存。
+ *  cmd.exe 中文输出默认 GBK（chcp 936）：先按 UTF-8 解，出乱码替换符就换 GBK 重解——
+ *  否则"训练完成"这类中文关键词判定在 Windows 上永远失灵。 */
+function readTail(file, bytes = 4096) {
+  try {
+    const size = fs.statSync(file).size;
+    const fh = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(Math.min(bytes, size));
+    fs.readSync(fh, buf, 0, buf.length, Math.max(0, size - buf.length));
+    fs.closeSync(fh);
+    let text = buf.toString('utf8');
+    if (text.includes('\uFFFD')) {
+      try {
+        const gbk = new TextDecoder('gbk').decode(buf);
+        if (!gbk.includes('\uFFFD')) text = gbk;
+      } catch {} // 无 ICU 的精简版 node 退回 UTF-8 乱码（数字指标仍可提取）
+    }
+    return text;
+  } catch { return ''; }
+}
+
 // ── 判定器（移植 python-manager checkTaskOutput，0 token）──────────────
 const FINISH_KEYWORDS = ['训练完成', '训练结束', '训练成功', '训练完毕', '训练已完成',
   'training complete', 'training finished', 'training done', 'finished', 'completed',
@@ -210,7 +237,7 @@ function judge(node, exitCode, runSec, logFile) {
     return { verdict: 'crashed', via: 'nonzero-exit' };
   }
   // 查输出证据：cwd 常见目录 + 任务运行窗口内的文件
-  const tail = (() => { try { return fs.readFileSync(logFile, 'utf8').slice(-4096).toLowerCase(); } catch { return ''; } })();
+  const tail = readTail(logFile, 4096).toLowerCase();
   if (FINISH_KEYWORDS.some((k) => tail.includes(k.toLowerCase()))) return { verdict: 'ok', via: 'finish-keyword' };
   const dirs = [node.cwd, path.join(node.cwd, 'out'), path.join(node.cwd, 'logs'), path.join(node.cwd, 'output'), path.join(node.cwd, 'results'), path.join(node.cwd, 'runs')];
   let latest = null;
@@ -226,7 +253,8 @@ function judge(node, exitCode, runSec, logFile) {
       } catch {}
     }
   }
-  const startMs = Date.now() - runSec * 1000;
+  // 快任务 runSec 舍入到 0 时 startMs=now 会和自己的产物自竞争；+2s 容文件系统时间戳粒度
+  const startMs = Date.now() - Math.max(runSec, 1) * 1000 - 2000;
   if (latest && latest.mtimeMs > Date.now() - 10 * 60 * 1000 && latest.mtimeMs > startMs) {
     return { verdict: ARTIFACT_EXTS.some((x) => latest.file.toLowerCase().endsWith(x)) ? 'ok' : 'ok', via: 'artifact-fresh', file: latest.file };
   }
@@ -250,6 +278,99 @@ function preflight(node) {
     });
   });
 }
+
+// ── P4：运行实例（进程树）────────────────────────────────────────────────
+// 每条流水线派发时创建 runs/<runId>.json；节点状态变化时同步更新。
+// 与 ledger 的分工：ledger 是追加式历史（审计用），runs 是"当前活着的树"（查询用）。
+// 翻篇（flip）时：跑着的 runs 继续跑（quest 进程不重启），完成的 run 归档。
+
+function runsDirOf(wsKey) {
+  const d = path.join(dirOf(wsKey), 'runs');
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function newRun(wsKey, title, rootNodeId) {
+  const runId = `run-${Date.now().toString(36)}`;
+  const run = {
+    runId, title: title || '', wsKey,
+    startedAt: new Date().toISOString(),
+    nodes: {
+      [rootNodeId]: { status: 'running', attempts: 1, fixCount: 0, parent: null, children: [], jobId: null, metrics: null, summary: null },
+    },
+  };
+  fs.writeFileSync(path.join(runsDirOf(wsKey), `${runId}.json`), JSON.stringify(run, null, 2));
+  return { runId, run };
+}
+
+// 从 plan 的 after 关系构建树结构（children/parent），保留已有节点的运行时状态
+function syncRunTree(run, planNodes) {
+  for (const n of planNodes) {
+    if (!run.nodes[n.id]) {
+      run.nodes[n.id] = { status: 'pending', attempts: 0, fixCount: 0, parent: (n.after ?? [])[0] ?? null, children: [], jobId: null, metrics: null, summary: null };
+    }
+  }
+  for (const n of planNodes) {
+    for (const p of n.after ?? []) {
+      if (run.nodes[p] && !run.nodes[p].children.includes(n.id)) run.nodes[p].children.push(n.id);
+      if (run.nodes[n.id] && !n.after.includes(p)) run.nodes[n.id].parent = p;
+    }
+  }
+}
+
+function updateRun(wsKey, runId, nodeId, patch) {
+  try {
+    const f = path.join(runsDirOf(wsKey), `${runId}.json`);
+    const run = JSON.parse(fs.readFileSync(f, 'utf8'));
+    Object.assign(run.nodes[nodeId] ?? (run.nodes[nodeId] = {}), patch);
+    fs.writeFileSync(f, JSON.stringify(run, null, 2));
+  } catch {}
+}
+
+// 找 runId：节点派发时若未指定，取同 wsKey 下含该节点的最新 run
+function findRunId(wsKey, nodeId) {
+  const dir = runsDirOf(wsKey);
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort().reverse();
+  for (const f of files) {
+    try {
+      const run = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+      if (run.nodes[nodeId]) return run.runId;
+    } catch {}
+  }
+  return null;
+}
+
+
+/**
+ * P5：progress.md 实时更新——主对话的"被动快照"。
+ * 节点派发/终态时重写；AI 被问到实验时读它即知最新状态（几行，零注入）。
+ */
+function writeProgress(wsKey) {
+  try {
+    const state = buildState(wsKey);
+    if (!state.plan) return;
+    const plan = parsePlan(state.plan);
+    const wsDir = plan.meta.workspace || '';
+    if (!wsDir) return;
+    const lines = [`# 任务进度（自动更新：${new Date().toLocaleString('zh-CN')}）`, ''];
+    for (const n of plan.nodes) {
+      const st = state.nodes[n.id] ?? {};
+      const icon = { running: '▶', completed: '✅', failed: '❌', cancelled: '🛑', frozen: '⛔', skipped: '⏭', ready: '⏸' }[st.status ?? 'pending'] ?? '·';
+      let l = `- ${icon} **${n.id}**: ${st.status ?? 'pending'}`;
+      if (st.verdict && st.status !== 'completed') l += `（${st.verdict}）`;
+      if (st.runSeconds != null) l += ` 已跑 ${formatDur(st.runSeconds)}`;
+      if (st.metrics?.loss_last != null) l += ` · loss ${st.metrics.loss_last}`;
+      if (st.metrics?.loss_slope_10ep != null) l += ` · 10ep斜率 ${st.metrics.loss_slope_10ep}`;
+      if (st.watchWarns) l += ` · ⚠️watch警告×${st.watchWarns}`;
+      if (st.fixCount) l += ` · 修复${st.fixCount}次`;
+      lines.push(l);
+      if (st.lastFix) lines.push(`  - 最近修复: ${String(st.lastFix).split('\n')[0].slice(0, 120)}`);
+      if (st.summary) lines.push(`  - 总结: ${String(st.summary).split('\n')[0].slice(0, 150)}`);
+    }
+    fs.writeFileSync(path.join(wsDir, 'progress.md'), lines.join('\n') + '\n', 'utf8');
+  } catch {}
+}
+
 
 // ── 硬指标提取（P1-1）：正则从日志抠逐轮数值，零幻觉 ──────────────────────
 /**
@@ -337,13 +458,13 @@ const isQuestPid = (pid) => {
 };
 // 活跃作业注册表（P1-3/P1-4）：nodeKey -> { child, timers[], flags }
 const activeJobs = new Map();
-function dispatchJob(wsKey, node) {
+function dispatchJob(wsKey, node, body = {}) {
   return new Promise(async (resolve) => {
     // 预检
     const pf = await preflight(node);
     if (pf) {
       appendEvent(wsKey, { t: 'node.preflight-failed', node: node.id, error: pf.error });
-      if (!node.quiet) qqPush(`[❌ 预检失败] ${node.id}\n${pf.error.slice(0, 300)}`).catch(() => {});
+      if (!node.quiet) qqPush(wsKey, `[❌ 预检失败] ${node.id}\n${pf.error.slice(0, 300)}`).catch(() => {});
       pushInbox({ node: node.id, verdict: 'preflight-failed' });
       resolve({ ok: false, error: 'preflight-failed' });
       return;
@@ -353,8 +474,30 @@ function dispatchJob(wsKey, node) {
     const logFile = path.join(dirOf(wsKey), 'logs', `${node.id}-${logTs}.log`);
     const out = fs.openSync(logFile, 'a');
     const startedAt = Date.now();
-    const child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true });
+    // stdio 句柄直挂而非管道：quest 崩溃时管道会断裂、子进程 print 即 BrokenPipeError；
+    // 直挂 append 句柄则子进程继续写日志，重启后可再认领（见 adoptOrphan）。
+    const child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', out, out] });
     appendEvent(wsKey, { t: 'node.dispatched', node: node.id, jobId, pid: child.pid, logTs });
+    // P4 进程树：同步 run 实例
+    try {
+      const runId = body?.runId || findRunId(wsKey, node.id);
+      const state0 = buildState(wsKey);
+      const plan0 = state0.plan ? parsePlan(state0.plan) : null;
+      if (plan0 && plan0.nodes.length) {
+        let rid = runId;
+        let run;
+        if (rid) {
+          try { run = JSON.parse(fs.readFileSync(path.join(runsDirOf(wsKey), rid + '.json'), 'utf8')); } catch { run = null; }
+        }
+        if (!run) {
+          const created = newRun(wsKey, plan0.meta.title || '', node.id);
+          rid = created.runId; run = created.run;
+        }
+        syncRunTree(run, plan0.nodes);
+        Object.assign(run.nodes[node.id] ?? (run.nodes[node.id] = {}), { status: 'running', attempts: (run.nodes[node.id]?.attempts ?? 0) + 1, jobId });
+        fs.writeFileSync(path.join(runsDirOf(wsKey), rid + '.json'), JSON.stringify(run, null, 2));
+      }
+    } catch (e) { log('run sync 失败:', e?.message); }
     questPids.set(child.pid, Date.now() + 24 * 3600 * 1000); // 活跃期先按 24h 登记
     // 派发即返回：不等 job 结束（HTTP 客户端不该被 70 分钟的训练挂住；结果走账本/收件箱/推送）
     resolve({ ok: true, jobId });
@@ -370,84 +513,103 @@ function dispatchJob(wsKey, node) {
       try { execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => {}); } catch {}
     }, timeoutMs));
 
-    // P1-3 watch：定时 tail 节点自己的日志文件（区别于 quest 的 stdout 捕获）
-    // 规则命中需连续 confirm 次才动作；notify 只推 QQ 不杀；kill 仅限机械致命模式
-    if (node.watchRules.length) {
-      // 默认 watch quest 自己捕获的 stdout 日志；watch_log 显式指定脚本自建的日志文件时才覆盖
-      const watchFile = !node.watchLog ? logFile
-        : path.isAbsolute(node.watchLog) ? node.watchLog : path.join(node.cwd || '.', node.watchLog);
-      const ivMs = Math.max(1, node.watchIntervalMinutes) * 60 * 1000;
-      job.timers.push(setInterval(async () => {
-        let tail = '';
-        try {
-          const st = fs.statSync(watchFile);
-          const fh2 = fs.openSync(watchFile, 'r');
-          const b2 = Buffer.alloc(Math.min(4096, st.size));
-          fs.readSync(fh2, b2, 0, b2.length, Math.max(0, st.size - b2.length));
-          fs.closeSync(fh2);
-          tail = b2.toString('utf8');
-        } catch { return; } // 日志还没建 = 没东西可看
-        for (const rule of node.watchRules) {
-          let hit = false;
-          try { hit = new RegExp(rule.if, 'i').test(tail); } catch { continue; }
-          rule.hits = hit ? (rule.hits ?? 0) + 1 : 0;
-          if (rule.hits >= rule.confirm) {
-            rule.hits = 0;
-            if (rule.action === 'kill') {
-              appendEvent(wsKey, { t: 'watch.kill', node: node.id, rule: rule.if });
-              if (!node.quiet) qqPush(`[👁 watch 击杀] ${node.id}\n规则「${rule.if}」连续 ${rule.confirm} 次命中，已终止任务`).catch(() => {});
-              job.killedByWatch = rule.if;
-              try { execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => {}); } catch {}
-            } else {
-              appendEvent(wsKey, { t: 'watch.warn', node: node.id, rule: rule.if });
-              if (!node.quiet) qqPush(`[⚠️ watch 警告] ${node.id}\n规则「${rule.if}」命中（只警告不杀；要杀请在 plan 里配 action=kill 或人工 /q停）`).catch(() => {});
-            }
-          }
+    // 日志封顶：句柄直挂后 quest 不在写入路径上，只做周期巡检——超 max_log_mb（默认 256MB）
+    // 就截断（append 句柄会自动跟到新 EOF）。截断丢的是旧 stdout，账本/指标/总结都不依赖它。
+    const capMB = node.maxLogMB > 0 ? node.maxLogMB : 256;
+    job.timers.push(setInterval(() => {
+      try {
+        if (fs.statSync(logFile).size > capMB * 1024 * 1024) {
+          fs.truncateSync(logFile, 0);
+          fs.appendFileSync(logFile, `\n── quest：日志超 ${capMB}MB 已截断（${new Date().toISOString()}）──\n`);
         }
-      }, ivMs));
-    }
+      } catch {}
+    }, 60 * 1000));
 
-    child.stdout.on('data', (d) => { try { fs.writeSync(out, d); } catch {} });
-    child.stderr.on('data', (d) => { try { fs.writeSync(out, d); } catch {} });
+    // P1-3 watch + 退出收尾见独立函数（quest 重启再认领的孤儿也复用同一套）
+    setupWatch(wsKey, node, job, logFile, child.pid);
+
     child.on('error', (err) => {
       job.timers.forEach(clearTimeout); job.timers.forEach(clearInterval); activeJobs.delete(`${wsKey}|${node.id}`);
       try { fs.closeSync(out); } catch {}
       appendEvent(wsKey, { t: 'node.preflight-failed', node: node.id, error: `spawn 失败: ${err.message}` });
       resolve({ ok: false, error: err.message });
     });
-    child.on('exit', (code) => {
-      job.timers.forEach(clearTimeout); job.timers.forEach(clearInterval); activeJobs.delete(`${wsKey}|${node.id}`);
-      try { fs.closeSync(out); } catch {}
-      const runSec = Math.round((Date.now() - startedAt) / 1000);
-      // 完结后保留 15 分钟（覆盖外部检测的确认延迟窗口），之后过期放行
-      questPids.set(child.pid, Date.now() + 15 * 60 * 1000);
-      appendEvent(wsKey, { t: 'node.exited', node: node.id, code, runSec });
-      // P1-4 人工终止：独立终态，worker/fixer 全部静默，绝不续杯
-      if (job.cancelledByHuman) {
-        appendEvent(wsKey, { t: 'node.cancelled', node: node.id, reason: job.cancelledByHuman });
-        pushInbox({ node: node.id, verdict: 'cancelled' });
-        if (!node.quiet && CFG.qqNotify?.enabled) qqPush(`[🛑 人工终止] ${node.id} · 已跑 ${formatDur(runSec)}\n原因：${job.cancelledByHuman}\n（不触发自动修复）`.slice(0, 400)).catch(() => {});
-        orchestrate(wsKey).catch(() => {});
-        return;
-      }
-      // 硬指标提取（P1-1）：无论成败都抠一份进账本
-      const metrics = extractMetrics(logFile);
-      if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
-      if (timedOut || job.killedByWatch) {
-        const via = timedOut ? `超过 ${Math.round(timeoutMs / 1000)}s 被杀` : `watch 击杀（${job.killedByWatch}）`;
-        appendEvent(wsKey, { t: 'node.timeout', node: node.id, runSec });
-        finishNode(wsKey, node, { verdict: 'timeout', via, logFile }, null, runSec);
-      } else {
-        const j = judge(node, code, runSec, logFile);
-        appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
-        finishNode(wsKey, node, { ...j, logFile }, code, runSec);
-      }
-    });
+    child.on('exit', (code) => handleNodeExit(wsKey, node, { code, timedOut, logFile, startedAt, timeoutMs, job, out, pid: child.pid }));
   });
 }
 
+/** P1-3 watch：定时 tail 节点日志；规则命中需连续 confirm 次才动作；notify 只推 QQ 不杀；kill 仅限机械致命模式。 */
+function setupWatch(wsKey, node, job, logFile, pid) {
+  if (!node.watchRules.length) return;
+  // 默认 watch quest 捕获的 stdout 日志；watch_log 显式指定脚本自建的日志文件时才覆盖
+  const watchFile = !node.watchLog ? logFile
+    : path.isAbsolute(node.watchLog) ? node.watchLog : path.join(node.cwd || '.', node.watchLog);
+  const ivMs = Math.max(1, node.watchIntervalMinutes) * 60 * 1000;
+  job.timers.push(setInterval(async () => {
+    const tail = readTail(watchFile, 4096);
+    if (!tail) return; // 日志还没建 = 没东西可看
+    for (const rule of node.watchRules) {
+      let hit = false;
+      try { hit = new RegExp(rule.if, 'i').test(tail); } catch { continue; }
+      rule.hits = hit ? (rule.hits ?? 0) + 1 : 0;
+      if (rule.hits >= rule.confirm) {
+        rule.hits = 0;
+        if (rule.action === 'kill') {
+          appendEvent(wsKey, { t: 'watch.kill', node: node.id, rule: rule.if });
+          if (!node.quiet) qqPush(wsKey, `[👁 watch 击杀] ${node.id}\n规则「${rule.if}」连续 ${rule.confirm} 次命中，已终止任务`).catch(() => {});
+          job.killedByWatch = rule.if;
+          try { execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => {}); } catch {}
+        } else {
+          appendEvent(wsKey, { t: 'watch.warn', node: node.id, rule: rule.if });
+          if (!node.quiet) qqPush(wsKey, `[⚠️ watch 警告] ${node.id}\n规则「${rule.if}」命中（只警告不杀；要杀请在 plan 里配 action=kill 或人工 /q停）`).catch(() => {});
+        }
+      }
+    }
+  }, ivMs));
+}
+
+/**
+ * 子进程退出统一收尾：真实 child 的 exit 事件与再认领孤儿的轮询发现共用。
+ * code 为 null 表示拿不到退出码（quest 重启后再认领），按退出码 0 走证据判定（关键词/产物），via 里注明。
+ */
+function handleNodeExit(wsKey, node, ctx) {
+  const { code, timedOut, logFile, startedAt, timeoutMs, job, pid } = ctx;
+  job.timers.forEach(clearTimeout); job.timers.forEach(clearInterval); activeJobs.delete(`${wsKey}|${node.id}`);
+  if (ctx.out) { try { fs.closeSync(ctx.out); } catch {} }
+  const runSec = Math.round((Date.now() - startedAt) / 1000);
+  // 完结后保留 15 分钟（覆盖外部检测的确认延迟窗口），之后过期放行
+  questPids.set(pid, Date.now() + 15 * 60 * 1000);
+  appendEvent(wsKey, { t: 'node.exited', node: node.id, code, runSec, reAdopted: ctx.reAdopted || undefined });
+  // P1-4 人工终止：独立终态，worker/fixer 全部静默，绝不续杯
+  if (job.cancelledByHuman) {
+    appendEvent(wsKey, { t: 'node.cancelled', node: node.id, reason: job.cancelledByHuman });
+    pushInbox({ node: node.id, verdict: 'cancelled' });
+    if (!node.quiet && CFG.qqNotify?.enabled) qqPush(wsKey, `[🛑 人工终止] ${node.id} · 已跑 ${formatDur(runSec)}\n原因：${job.cancelledByHuman}\n（不触发自动修复）`.slice(0, 400)).catch(() => {});
+    orchestrate(wsKey).catch(() => {});
+    return;
+  }
+  // 硬指标提取（P1-1）：无论成败都抠一份进账本
+  const metrics = extractMetrics(logFile);
+  if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
+  // P4：同步进程树终态
+  try {
+    const rid = findRunId(wsKey, node.id);
+    if (rid) updateRun(wsKey, rid, node.id, { status: 'exited', exitCode: code, metrics });
+  } catch {}
+  if (timedOut || job.killedByWatch) {
+    const via = timedOut ? `超过 ${Math.round(timeoutMs / 1000)}s 被杀` : `watch 击杀（${job.killedByWatch}）`;
+    appendEvent(wsKey, { t: 'node.timeout', node: node.id, runSec });
+    finishNode(wsKey, node, { verdict: 'timeout', via, logFile }, null, runSec, startedAt);
+  } else {
+    const j = judge(node, code == null ? 0 : code, runSec, logFile);
+    if (code == null) j.via = `${j.via}（退出码未知：quest 重启后再认领）`;
+    appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
+    finishNode(wsKey, node, { ...j, logFile }, code, runSec, startedAt);
+  }
+}
+
 /** 判定后的收尾：worker 总结（P2）→ 账本终结 → QQ（P3）→ 收件箱。 */
-async function finishNode(wsKey, node, j, _code, runSec) {
+async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() - runSec * 1000) {
   let summary = '';
   if (CFG.workersEnabled !== false) {
     try { summary = await runWorker(wsKey, node, j, runSec); } catch (e) { log('worker 失败:', e.message); }
@@ -457,14 +619,134 @@ async function finishNode(wsKey, node, j, _code, runSec) {
   pushInbox({ node: node.id, verdict: j.verdict, summary });
   if (!node.quiet && CFG.qqNotify?.enabled) {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
-    qqPush(`[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || (j.error || j.via || '')}`.slice(0, 600)).catch(() => {});
+    qqPush(wsKey, `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || (j.error || j.via || '')}`.slice(0, 600)).catch(() => {});
   }
+  writeProgress(wsKey);
+  // 产物图直推（2026-09-09）：成功节点把运行窗口内新产出的 png/jpg（≤push_images 张，默认 2）发 owner QQ
+  if (ok && (node.pushImages ?? 2) > 0 && !node.quiet) pushArtifactImages(wsKey, node, startedAt).catch(() => {});
   // 依赖编排：成功续链 / 失败冻结下游 / 全线落定推收尾铃
   orchestrate(wsKey).catch(() => {});
   // WA 触发器：失败 + 节点声明 auto_fix + 预算未烧完 → 修复会话（最小修复+备份+重派）
   if (!ok && node.autoFix) {
     runFixer(wsKey, node, j, summary).catch((e) => log('fixer 异常:', e?.message));
   }
+}
+
+/** 扫节点 cwd（不递归）里运行窗口内新产出的 png/jpg，按 mtime 取最新 N 张直推 QQ。
+ *  时间窗用节点真实起点（worker 总结耗时几秒到几分钟，不能用 now-runSec 倒推，会把刚产出的图当旧货滤掉）。 */
+async function pushArtifactImages(wsKey, node, startedAt) {
+  const dir = node.cwd;
+  if (!dir) return;
+  const sinceMs = startedAt - 2000;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  const cands = [];
+  for (const e of entries) {
+    if (!e.isFile() || !/\.(png|jpe?g)$/i.test(e.name)) continue;
+    const f = path.join(dir, e.name);
+    try {
+      const st = fs.statSync(f);
+      if (st.mtimeMs > sinceMs && st.size > 0 && st.size <= 15 * 1024 * 1024) cands.push({ f, mtimeMs: st.mtimeMs });
+    } catch {}
+  }
+  cands.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const c of cands.slice(0, node.pushImages ?? 2)) {
+    await qqPushImage(wsKey, c.f, `[🖼 ${node.id}] ${path.basename(c.f)}`);
+  }
+}
+
+/**
+ * PID 复用防御：进程命令行里应含节点命令的指纹片段（我们派的是 cmd /c <command>，命令行原样可见）。
+ * 查询失败（权限/超时）时退回只信存活信号——再认领错杀的代价由超时护栏承担，概率极低。
+ */
+function pidMatches(pid, node) {
+  return new Promise((resolve) => {
+    const fingerprint = node.command.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 30);
+    if (!fingerprint) return resolve(true);
+    execFile('powershell', ['-NoProfile', '-Command',
+      `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`],
+    { windowsHide: true, timeout: 8000 }, (err, stdout) => {
+      const cl = String(stdout || '').trim();
+      if (err || !cl) return resolve(true);
+      resolve(cl.toLowerCase().includes(fingerprint));
+    });
+  });
+}
+
+/**
+ * 工作进程定位：账本 pid 是 cmd.exe 包装层，quest 崩溃时包装层可能先死而真正的
+ * python/训练进程还活着（被挂到别的父进程下）。按命令行指纹搜全进程表找回它。
+ * 排除探针自身（powershell）与 quest 自身（node）；拿 CreationDate 靠近节点起点再过滤一层。
+ */
+function findWorkerPid(node, startedAt) {
+  return new Promise((resolve) => {
+    const needle = node.command.replace(/\s+/g, ' ').trim().toLowerCase().replace(/"/g, '').slice(0, 40);
+    if (!needle) return resolve(null);
+    const psNeedle = needle.replace(/'/g, "''");
+    const ps = `Get-CimInstance Win32_Process | Where-Object { $_.Name -ne 'powershell.exe' -and $_.Name -ne 'node.exe' -and $_.CommandLine -and ($_.CommandLine.ToLower() -replace '\\s+',' ').Contains('${psNeedle}') } | ForEach-Object { if ($_.CreationDate -gt [DateTimeOffset]::FromUnixTimeSeconds(${Math.floor(startedAt / 1000) - 120}).LocalDateTime) { "$($_.ProcessId)" } }`;
+    execFile('powershell', ['-NoProfile', '-Command', ps], { windowsHide: true, timeout: 12000 }, (err, stdout) => {
+      if (err || !String(stdout || '').trim()) return resolve(null);
+      const pid = Number(String(stdout).trim().split(/\r?\n/)[0]);
+      resolve(Number.isFinite(pid) && pid > 0 ? pid : null);
+    });
+  });
+}
+
+/**
+ * 孤儿再认领（2026-09-09）：quest 重启后接管仍存活的作业。
+ * 句柄直挂（stdio fd）保证子进程在 quest 死亡期间继续跑、继续写日志；
+ * 这里轮询 PID 等退出（拿不到退出码，判定走关键词/产物证据路线），
+ * 超时护栏按原起点重算剩余时间，watch 规则照常挂，/q停 照常可用。
+ */
+async function adoptOrphan(wsKey, node, n) {
+  let pid = Number(n.pid);
+  let alive = false;
+  try { process.kill(pid, 0); alive = true; } catch {}
+  if (alive && !(await pidMatches(pid, node))) alive = false;
+  const logFile = path.join(dirOf(wsKey), 'logs', `${node.id}-${n.logTs}.log`);
+  const startedAt = Date.parse(n.startedAt) || Date.now();
+
+  if (!alive) {
+    // 包装层（cmd.exe）可能先死而工作进程还在：按命令指纹找回真正的负载
+    const found = await findWorkerPid(node, startedAt);
+    if (found) {
+      pid = found;
+      alive = true;
+    }
+  }
+
+  if (!alive) {
+    // 进程在 quest 停机期间已消失（跑完或崩了）：按证据判定落终态，账本留痕
+    appendEvent(wsKey, { t: 'node.readopted', node: node.id, pid, result: 'gone' });
+    const runSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    const metrics = extractMetrics(logFile);
+    if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
+    const j = judge(node, 0, runSec, logFile);
+    j.via = `${j.via}（quest 重启期间进程已消失，按产物/关键词判定）`;
+    appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
+    await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
+    return;
+  }
+
+  const timeoutMs = (node.timeoutSeconds > 0 ? node.timeoutSeconds : node.expectMinutes * 2 * 60) * 1000;
+  let timedOut = false;
+  const job = { child: { pid }, timers: [], cancelledByHuman: null, killedByWatch: null };
+  activeJobs.set(`${wsKey}|${node.id}`, job);
+  questPids.set(pid, Date.now() + 24 * 3600 * 1000);
+  appendEvent(wsKey, { t: 'node.readopted', node: node.id, pid, result: 'adopted' });
+  // 超时护栏按原起点续算；已超时的立刻杀
+  job.timers.push(setTimeout(() => {
+    timedOut = true;
+    try { execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => {}); } catch {}
+  }, Math.max(0, startedAt + timeoutMs - Date.now())));
+  setupWatch(wsKey, node, job, logFile, pid);
+  const iv = setInterval(() => {
+    let a = false;
+    try { process.kill(pid, 0); a = true; } catch {}
+    if (!a) handleNodeExit(wsKey, node, { code: null, timedOut, logFile, startedAt, timeoutMs, job, pid, reAdopted: true });
+  }, 5000);
+  job.timers.push(iv);
+  log(`再认领孤儿: ${wsKey}/${node.id} pid=${pid}`);
 }
 
 /**
@@ -480,7 +762,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
   const attempt = (st.fixCount ?? 0) + 1;
   if (attempt > (node.fixBudget ?? 2)) {
     appendEvent(wsKey, { t: 'fix.stopped', node: node.id, reason: `预算耗尽（${node.fixBudget ?? 2} 次）` });
-    qqPush(`[🛑 自动修复停手] ${node.id}：${node.fixBudget ?? 2} 次尝试后仍失败，等人工。
+    qqPush(wsKey, `[🛑 自动修复停手] ${node.id}：${node.fixBudget ?? 2} 次尝试后仍失败，等人工。
 最近一次修复：${String(st.lastFix || '').slice(0, 200)}`).catch(() => {});
     return;
   }
@@ -501,7 +783,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
     const logTail = (() => {
       if (!j.logFile) return '';
       if (/\.(pt|npz|pth|ckpt|png|jpg|h5|npy|bin)$/i.test(j.logFile)) return '';
-      try { return fs.readFileSync(j.logFile, 'utf8').slice(-4096); } catch { return ''; }
+      return readTail(j.logFile, 4096);
     })();
     const script = String(node.command || '').match(/([\w.\-]+\.py)/)?.[1] || '';
 
@@ -545,7 +827,7 @@ ${logTail}
     const okFix = /FIX_OK/i.test(reply.slice(-200));
     appendEvent(wsKey, { t: 'fix.reported', node: node.id, changes: reply.slice(0, 600), diff: diff || '(无文件改动)' });
     if (!node.quiet && CFG.qqNotify?.enabled) {
-      qqPush(`[🔧 自动修复 ${giveup ? '放弃' : okFix ? '完成' : '未知'}] ${node.id} 第${attempt}次
+      qqPush(wsKey, `[🔧 自动修复 ${giveup ? '放弃' : okFix ? '完成' : '未知'}] ${node.id} 第${attempt}次
 ${reply.slice(0, 250)}${diff ? `
 ── 实际改动 ──
 ${diff}` : ''}`.slice(0, 900)).catch(() => {});
@@ -654,7 +936,7 @@ async function orchestrate(wsKey) {
       }
     } catch (e) { log('research-state 追加失败:', e?.message); }
     if (CFG.qqNotify?.enabled) {
-      qqPush(`[🏁 任务线结束] ${plan.meta.title || wsKey}\n${plan.nodes.length} 段：${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(' / ')}${parts.length ? '\n' + parts.join('\n') : '\n全绿 ✅'}`.slice(0, 500)).catch(() => {});
+      qqPush(wsKey, `[🏁 任务线结束] ${plan.nodes.length} 段：${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(' / ')}${parts.length ? '\n' + parts.join('\n') : '\n全绿 ✅'}`.slice(0, 500)).catch(() => {});
     }
     pushInbox({ node: '(line)', verdict: 'concluded', summary: JSON.stringify(counts) });
   }
@@ -663,7 +945,17 @@ async function orchestrate(wsKey) {
 const formatDur = (s) => (s < 60 ? `${s}秒` : s < 3600 ? `${Math.floor(s / 60)}分${s % 60}秒` : `${Math.floor(s / 3600)}小时${Math.floor((s % 3600) / 60)}分`);
 
 // ── QQ 推送（P3：直打 bridge console，零 bridge 改动）──────────────────
-async function qqPush(message) {
+/** 通知前缀：[实验标题或工作区名]。多实验并行时用户能分辨是哪条任务线在说话。 */
+function qqTag(wsKey) {
+  try {
+    const st = buildState(wsKey);
+    const p = st.plan ? parsePlan(st.plan) : null;
+    const label = p?.meta?.title || path.basename(String(p?.meta?.workspace || wsKey));
+    return `[${String(label).split('\n')[0].slice(0, 24)}] `;
+  } catch { return `[${wsKey}] `; }
+}
+
+async function qqPush(wsKey, message) {
   const q = CFG.qqNotify;
   if (!q?.enabled) return;
   let token = '';
@@ -674,11 +966,33 @@ async function qqPush(message) {
     await fetch(`${q.bridgeUrl}/api/send/private`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-console-token': token },
-      body: JSON.stringify({ userId: q.userId, message }),
+      body: JSON.stringify({ userId: q.userId, message: `${qqTag(wsKey)}${message}` }),
       signal: ac.signal,
     });
   } catch (e) {
     log('qqPush 失败:', String(e?.message || e).slice(0, 120)); // 2026-09-08：静默吞错导致 15:20 漏推无从查起
+  } finally { clearTimeout(t); }
+}
+
+/** 产物图直推：把节点刚产出的 png/jpg 发 owner QQ（bridge /api/send/private-image，base64 image 段）。 */
+async function qqPushImage(wsKey, imagePath, caption) {
+  const q = CFG.qqNotify;
+  if (!q?.enabled) return false;
+  let token = '';
+  try { token = fs.readFileSync(q.tokenFile, 'utf8').trim(); } catch { return false; }
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 20000);
+  try {
+    const resp = await fetch(`${q.bridgeUrl}/api/send/private-image`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-console-token': token },
+      body: JSON.stringify({ userId: q.userId, imagePath, caption: `${qqTag(wsKey)}${caption}` }),
+      signal: ac.signal,
+    });
+    return resp.ok;
+  } catch (e) {
+    log('qqPushImage 失败:', String(e?.message || e).slice(0, 120));
+    return false;
   } finally { clearTimeout(t); }
 }
 
@@ -744,7 +1058,7 @@ async function runWorker(wsKey, node, j, runSec) {
       if (!j.logFile) return '';
       // 二进制产物（.pt/.npz 等）不当文本读
       if (/\.(pt|npz|pth|ckpt|png|jpg|h5|npy|bin)$/i.test(j.logFile)) return `（产物文件：${j.logFile}）`;
-      try { return fs.readFileSync(j.logFile, 'utf8').slice(-4096); } catch { return ''; }
+      return readTail(j.logFile, 4096);
     })();
     const verdictLine = j.verdict === 'ok' ? '✅ 判定：正常完成'
       : j.verdict === 'timeout' ? '⏹ 判定：超时被杀'
@@ -773,6 +1087,109 @@ async function runWorker(wsKey, node, j, runSec) {
 }
 
 // ── HTTP API ────────────────────────────────────────────────────────────
+// ── quest_run 门禁（v0.3）：白名单直通 / 白天 QQ 确认 / 夜间自批 ──────────
+// 设计边界：门挡的是误操作和不可审计执行，不是恶意（恶意由 DSH 沙箱权限层管）。
+// 白名单 = 常规解释器跑工作区内脚本；其余白天挂起等 QQ 确认（超时作废），
+// 夜间窗口内 AI 可自批但必须给 reason、每条推送留痕、每晚额度上限。
+// runGate.enabled=false 可整体关闭（回到 v0.2 行为）。
+
+const RUN_GATE_FILE = path.join(HOMEOverride, 'run-gate.json');
+const runGateCfg = Object.assign(
+  { enabled: true, nightStartHour: 23, nightEndHour: 8, nightQuota: 3, dayTimeoutMinutes: 30 },
+  CFG.runGate || {}
+);
+let runGate = { pending: [], day: { date: '', nightUsed: 0 } };
+try { runGate = Object.assign(runGate, JSON.parse(fs.readFileSync(RUN_GATE_FILE, 'utf8'))); } catch {}
+function saveRunGate() {
+  if (runGate.pending.length > 50) runGate.pending = runGate.pending.slice(-50);
+  try { fs.writeFileSync(RUN_GATE_FILE, JSON.stringify(runGate, null, 2)); } catch {}
+}
+function isNightNow() {
+  const h = new Date().getHours();
+  const { nightStartHour: s, nightEndHour: e } = runGateCfg;
+  return s > e ? (h >= s || h < e) : (h >= s && h < e); // 跨零点（23-8）与同日窗口都支持
+}
+function nightQuotaLeft() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (runGate.day.date !== today) { runGate.day = { date: today, nightUsed: 0 }; saveRunGate(); }
+  return Math.max(0, Number(runGateCfg.nightQuota) - runGate.day.nightUsed);
+}
+
+const INTERPRETER_RE = /^(python|python3|pypy|py|node|deno|bun|rscript|matlab|julia)(\.exe|\.cmd|\.bat)?$/i;
+
+/** 命令分级：ok=白名单直通；confirm=需人工确认或夜间自批。 */
+function classifyRunCommand(command, cwd) {
+  const cmd = String(command || '').trim();
+  if (/\b(del|erase|rd|rmdir|rm|format|diskpart|reg|regedit|shutdown|taskkill|net\s+user|sc|mklink|icacls|takeown|cipher|vssadmin)\b/i.test(cmd))
+    return { level: 'confirm', why: '含删除/系统类命令词' };
+  if (/\b(curl|wget|invoke-webrequest|invoke-restmethod|iwr|certutil\s+-urlcache)\b/i.test(cmd))
+    return { level: 'confirm', why: '含网络下载类命令' };
+  const first = cmd.split(/\s+/)[0].replace(/^"|"$/g, '');
+  const base = first.split(/[\\\/]/).pop();
+  if (INTERPRETER_RE.test(base)) {
+    if (/(^|\s)-c(\s|$)/.test(cmd)) return { level: 'confirm', why: '解释器 -c 内联代码不可静态审查' };
+    // 引用了工作区外的绝对路径（解释器本体除外）→ 提级确认
+    const norm = (p) => String(p).replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+    const wsNorm = norm(cwd);
+    const outside = (cmd.match(/[a-z]:[\\\/][^\s"]+/ig) || []).filter((p) => !INTERPRETER_RE.test(p.split(/[\\\/]/).pop()) && !norm(p).startsWith(wsNorm));
+    if (outside.length) return { level: 'confirm', why: `引用工作区外路径：${outside[0]}` };
+    return { level: 'ok' };
+  }
+  return { level: 'confirm', why: '非白名单解释器命令' };
+}
+
+/** 快速单发统一入口：写 plan 头 + 账本 + 派发（白名单/自批/人工放行共用）。 */
+function launchQuickRun(wsKey, node, extra = {}) {
+  try {
+    const dir2 = dirOf(wsKey);
+    if (!fs.existsSync(path.join(dir2, 'plan.md'))) {
+      fs.writeFileSync(path.join(dir2, 'plan.md'), `# 任务线：快速单发-${String(extra.title || path.basename(String(node.cwd))).slice(0, 30)}\nworkspace: ${node.cwd}\n`, 'utf8');
+    }
+  } catch {}
+  appendEvent(wsKey, { t: 'plan.created', nodes: [node.id] });
+  dispatchJob(wsKey, node).catch(() => {});
+}
+
+function submitRunForConfirm(wsKey, node, b, cls) {
+  const rec = {
+    id: `rg-${Date.now().toString(36)}`, wsKey, command: node.command, cwd: node.cwd,
+    title: b.title || '', reason: String(b.reason || '').slice(0, 300), why: cls.why,
+    createdAt: Date.now(), status: 'pending', node,
+  };
+  runGate.pending.push(rec); saveRunGate();
+  appendEvent(wsKey, { t: 'gate.pending', node: node.id, gateId: rec.id, why: cls.why });
+  pushInbox({ node: node.id, verdict: 'gate-pending', gateId: rec.id });
+  qqPush(wsKey, `[⏳ 等确认] ${node.id}\n命令：${node.command.slice(0, 200)}\nAI 理由：${rec.reason || '（未给）'}\n分级理由：${cls.why}\n回复 /q确认 ${rec.id} 执行；/q拒绝 ${rec.id} 作废；${runGateCfg.dayTimeoutMinutes} 分钟不回自动作废`.slice(0, 600)).catch(() => {});
+  return rec;
+}
+
+/** 夜间自批：必须给 reason 且当晚额度未烧完。返回 {approved} 或 {blocked} 或 null（白天）。 */
+function tryNightSelfApprove(wsKey, node, b) {
+  if (!isNightNow()) return null;
+  const reason = String(b.reason || '').trim();
+  if (!reason) return { blocked: '夜间自批必须给 reason（quest_run 时带上为什么要跑这条命令），已改为挂起等人工确认' };
+  if (nightQuotaLeft() <= 0) return { blocked: `今晚夜间自批额度已用完（${runGateCfg.nightQuota} 条），已挂起等人工确认` };
+  runGate.day.nightUsed++; saveRunGate();
+  appendEvent(wsKey, { t: 'gate.night-self-approved', node: node.id, reason: reason.slice(0, 200), used: `${runGate.day.nightUsed}/${runGateCfg.nightQuota}` });
+  qqPush(wsKey, `[🌙 夜间自批 ${runGate.day.nightUsed}/${runGateCfg.nightQuota}] ${node.id}\n命令：${node.command.slice(0, 200)}\nAI 理由：${reason.slice(0, 200)}\n（已直接执行，早上可复盘，账本留痕）`.slice(0, 600)).catch(() => {});
+  return { approved: true };
+}
+
+// 过期巡检：白天确认门超时作废（命令从头到尾没执行过，零副作用）
+setInterval(() => {
+  const now = Date.now();
+  let dirty = false;
+  for (const r of runGate.pending) {
+    if (r.status === 'pending' && now - r.createdAt > runGateCfg.dayTimeoutMinutes * 60000) {
+      r.status = 'expired'; r.decidedAt = now; dirty = true;
+      appendEvent(r.wsKey, { t: 'gate.expired', node: r.node.id, gateId: r.id });
+      pushInbox({ node: r.node.id, verdict: 'gate-expired', gateId: r.id });
+      qqPush(r.wsKey, `[⌛ 过期作废] ${r.node.id}（${r.id}）\n${runGateCfg.dayTimeoutMinutes} 分钟未确认，命令未执行`.slice(0, 400)).catch(() => {});
+    }
+  }
+  if (dirty) saveRunGate();
+}, 60 * 1000);
+
 const server = http.createServer(async (req, res) => {
   const json = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(obj)); };
   try {
@@ -786,7 +1203,8 @@ const server = http.createServer(async (req, res) => {
       const plan = state.plan ? parsePlan(state.plan) : { nodes: [] };
       const nodes = plan.nodes.map((n) => ({ id: n.id, ...(state.nodes[n.id] || { status: 'pending' }), quiet: n.quiet, expectMinutes: n.expectMinutes }));
       const unread = inbox.splice(0); // 取走即清
-      return json(200, { plan: { workspace: ws, nodes }, unread, questVersion: '0.1.0' });
+      // workspace 优先取 plan.md 里声明的绝对路径（权威），入参只做缺省——/q翻页 等下游要拿真路径去匹配 DSH 会话
+      return json(200, { plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes }, unread, questVersion: '0.2.0' });
     }
     if (req.method === 'POST' && u.pathname === '/api/plan') {
       const body = await readBody(req);
@@ -796,6 +1214,109 @@ const server = http.createServer(async (req, res) => {
       fs.writeFileSync(path.join(dir, 'plan.md'), body.markdown, 'utf8');
       appendEvent(wsKey, { t: fs.existsSync(path.join(dir, 'ledger.jsonl')) ? 'plan.reloaded' : 'plan.created', nodes: parsed.nodes.map((n) => n.id) });
       return json(200, { ok: true, nodes: parsed.nodes.map((n) => n.id), workspace: ws });
+    }
+    // P4：进程树查询
+    if (req.method === 'GET' && u.pathname === '/api/runs') {
+      const dir = runsDirOf(wsKey);
+      const runs = fs.readdirSync(dir).filter((f) => f.endsWith('.json')).sort().reverse().slice(0, 10).map((f) => {
+        try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { return null; }
+      }).filter(Boolean);
+      return json(200, { runs });
+    }
+    // ② quest_run：快速单发——不写 plan 直接派一个临时节点（全套判定+worker+QQ）
+    // v0.3 门禁：白名单直通 / 白天挂起 QQ 确认 / 夜间自批（reason+额度）
+    if (req.method === 'POST' && u.pathname === '/api/run') {
+      const b = await readBody(req);
+      if (!b.command || !b.cwd) return json(400, { ok: false, error: '缺少 command/cwd' });
+      const node = {
+        id: `quick-${String(b.title || b.command).slice(0, 40).replace(/[^\w一-龥-]/g, '_')}-${Date.now().toString(36)}`,
+        command: String(b.command).slice(0, 500), cwd: b.cwd,
+        expectMinutes: Number(b.expectMinutes) || 30, quiet: b.quiet === true,
+        autoFix: b.autoFix === true, fixBudget: 2,
+        handoff: String(b.handoff || '快速单发任务').slice(0, 2000),
+        after: [], when: '', watchRules: [],
+      };
+      const wsKey2 = wsKeyOf(b.cwd);
+      const cls = runGateCfg.enabled === false ? { level: 'ok' } : classifyRunCommand(node.command, node.cwd);
+      if (cls.level !== 'ok') {
+        const night = tryNightSelfApprove(wsKey2, node, b);
+        if (night?.approved) {
+          launchQuickRun(wsKey2, node, b);
+          return json(200, { ok: true, nodeId: node.id, gate: 'night-self-approved' });
+        }
+        const rec = submitRunForConfirm(wsKey2, node, b, cls);
+        return json(200, {
+          ok: true, nodeId: node.id, gate: 'pending-confirm', gateId: rec.id,
+          note: night?.blocked || `命令不在白名单（${cls.why}），已推送 owner QQ 等确认，${runGateCfg.dayTimeoutMinutes} 分钟不确认自动作废。改写成白名单形式（解释器跑工作区内脚本）可直接跑。`,
+        });
+      }
+      launchQuickRun(wsKey2, node, b);
+      return json(200, { ok: true, nodeId: node.id, gate: 'whitelist' });
+    }
+    // v0.3 门禁裁决：/q确认 /q拒绝 的后端
+    if (req.method === 'POST' && u.pathname === '/api/gate/decide') {
+      const b = await readBody(req);
+      const rec = runGate.pending.find((r) => r.id === String(b.id || '') && r.status === 'pending');
+      if (!rec) return json(404, { ok: false, error: `没有待确认的 ${b.id}` });
+      rec.decidedAt = Date.now();
+      if (b.approve) {
+        rec.status = 'approved'; saveRunGate();
+        appendEvent(rec.wsKey, { t: 'gate.approved', node: rec.node.id, gateId: rec.id });
+        pushInbox({ node: rec.node.id, verdict: 'gate-approved', gateId: rec.id });
+        qqPush(rec.wsKey, `[✅ 已放行] ${rec.node.id}（${rec.id}）\n命令：${rec.command.slice(0, 200)}\n开始执行，照常走判定/总结/通知`.slice(0, 500)).catch(() => {});
+        launchQuickRun(rec.wsKey, rec.node, { title: rec.title });
+        return json(200, { ok: true, action: 'dispatched', nodeId: rec.node.id });
+      }
+      rec.status = 'rejected'; saveRunGate();
+      appendEvent(rec.wsKey, { t: 'gate.rejected', node: rec.node.id, gateId: rec.id });
+      pushInbox({ node: rec.node.id, verdict: 'gate-rejected', gateId: rec.id });
+      qqPush(rec.wsKey, `[🚫 已作废] ${rec.node.id}（${rec.id}）\n命令从未执行`.slice(0, 400)).catch(() => {});
+      return json(200, { ok: true, action: 'rejected' });
+    }
+    if (req.method === 'GET' && u.pathname === '/api/gate/list') {
+      return json(200, {
+        pending: runGate.pending.filter((r) => r.status === 'pending').map((r) => ({ id: r.id, command: r.command, cwd: r.cwd, reason: r.reason, why: r.why, createdAt: r.createdAt })),
+        night: { active: isNightNow(), quotaLeft: nightQuotaLeft(), quota: runGateCfg.nightQuota },
+      });
+    }
+    // P4：翻篇（flip）——归档当前会话 + 开新会话 + 种子消息（读 research-state.md 恢复上下文）
+    // 流程：AI 先写好 research-state.md → 调本端点 → 本端点做会话切换
+    if (req.method === 'POST' && u.pathname === '/api/flip') {
+      const b = await readBody(req);
+      const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+      const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+      const results = { archived: [], created: null, errors: [] };
+      // 1) 归档旧会话（该工作区下所有会话）
+      try {
+        const lr = await api.sessions.list({});
+        if (lr.result.ok) {
+          for (const item of lr.result.value?.items ?? []) {
+            if (String(item.cwd ?? '').replace(/\\/g, '/') === String(b.ws ?? '').replace(/\\/g, '/')) {
+              try {
+                await api.workspace.archiveSession({ sessionId: item.sessionId });
+                results.archived.push(item.sessionId);
+              } catch (e) { results.errors.push(`archive ${item.sessionId}: ${e.message}`); }
+            }
+          }
+        }
+      } catch (e) { results.errors.push(`list: ${e.message}`); }
+      // 2) 开新会话
+      try {
+        const created = await api.sessions.create({ cwd: b.ws, agentPreset: b.preset || undefined });
+        if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 150));
+        results.created = created.result.value.sessionId;
+      } catch (e) { results.errors.push(`create: ${e.message}`); }
+      // 3) 种子消息：让新会话读研究状态文件
+      if (results.created && b.seed !== false) {
+        try {
+          await api.sessions.prompt({
+            sessionId: results.created, mode: 'queue',
+            content: [{ type: 'text', text: `【翻篇恢复】工作区刚完成一次翻篇归档。请先读取 ${path.join(b.ws, 'research-state.md')} 恢复研究上下文（历史结论、参数基线、待办），读完后回复"上下文已恢复"并简述当前状态（3 行以内）。之后等待用户指示。` }],
+          });
+        } catch (e) { results.errors.push(`seed: ${e.message}`); }
+      }
+      appendEvent(wsKey, { t: 'flip.done', archived: results.archived.length, created: results.created });
+      return json(200, { ok: results.errors.length === 0, ...results });
     }
     // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
     if (req.method === 'POST' && u.pathname === '/api/cancel') {
@@ -827,7 +1348,7 @@ const server = http.createServer(async (req, res) => {
           if (['frozen', 'ready'].includes(state.nodes[id]?.status ?? '')) appendEvent(wsKey, { t: 'node.unfrozen', node: id });
         }
       }
-      const r = await dispatchJob(wsKey, node);
+      const r = await dispatchJob(wsKey, node, { runId: body.runId });
       return json(200, r);
     }
     if (req.method === 'GET' && u.pathname === '/api/log') {
@@ -895,18 +1416,21 @@ const readBody = (req) => new Promise((resolve, reject) => {
 server.listen(CFG.port || 3110, '127.0.0.1', () => {
   log(`quest 服务就绪 http://127.0.0.1:${CFG.port || 3110}（token: ${QUEST_TOKEN.slice(0, 6)}…）`);
   log(`worker 目标: ${CFG.dshBaseUrl}${CFG.workersEnabled === false ? '（worker 已禁用）' : ''}`);
-  // 启动对账：上次运行留下的 running 节点 = 孤儿（进程可能还活着但已不受管）。
-  // 标记 cancelled 终态（不触发修复），人可重派。孤儿进程本身由超时/人处理。
+  // 启动对账（2026-09-09 改版）：running 节点 = quest 重启前的活作业。
+  // 句柄直挂后子进程不再随 quest 死亡：PID 存活（且命令行指纹匹配）→ 再认领接管；
+  // 已消失 → 按产物/关键词证据落终态。两者都比"一律标 cancelled"保数据。
   try {
     for (const dir of fs.readdirSync(HOMEOverride, { withFileTypes: true })) {
       if (!dir.isDirectory()) continue;
+      const wsKey = dir.name;
       let state;
-      try { state = buildState(dir.name); } catch { continue; }
-      for (const [nid, n] of Object.entries(state.nodes ?? {})) {
-        if (n.status === 'running') {
-          appendEvent(dir.name, { t: 'node.cancelled', node: nid, reason: 'quest 重启：作业失去管理（孤儿进程可能仍在，请确认后重派）' });
-          log('孤儿作业标记:', dir.name, nid);
-        }
+      try { state = buildState(wsKey); } catch { continue; }
+      if (!state.plan) continue;
+      const plan = parsePlan(state.plan);
+      for (const node of plan.nodes) {
+        const n = state.nodes[node.id];
+        if (n?.status !== 'running' || !n.pid) continue;
+        adoptOrphan(wsKey, node, n).catch((e) => log('再认领失败:', wsKey, node.id, e?.message));
       }
     }
   } catch {}
