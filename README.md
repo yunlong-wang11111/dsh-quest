@@ -82,6 +82,15 @@ handoff: |                   # 给 worker 的交接上下文（决定总结质�
 
 完整字段说明与五段科研流水（生成→训练→后处理→评估→可视化）标准骨架见 [PLAN-TEMPLATE.md](PLAN-TEMPLATE.md)，设计取舍见 [DESIGN.md](DESIGN.md)。
 
+## v0.2 新增
+
+- **硬指标提取**：正则从日志抠逐轮 loss → 自动算斜率 / 平台检测 → 账本里的零幻觉数字层
+- **`when:` 条件分支**：`when: train-a.metrics.loss_slope_10ep < -0.05` 趋势门控——a 好跑 b、不好跑 c（斜率/平台运算符支持"看变化程度"的分支）
+- **watch 盯梢**：`watch_rules: if=NaN; confirm=2; action=kill`——运行中定时 tail（默认盯 quest 捕获的 stdout）；默认只警告，NaN/OOM 类可配 kill；连续 confirm 次命中才动手
+- **quest_cancel 人工终止**：`/api/cancel` + `quest_cancel` 工具——cancelled 独立终态，不触发自动修复（绝不续杯）、不派 worker
+- **research-state.md 自动追加**：任务线收尾自动写研究状态文件到工作区——下次开口时主对话已知道一切，零注入零膨胀
+- **启动对账**：quest 重启后把孤儿作业标记 cancelled——不再有"幽灵 running"卡住调度
+
 ## 安全边界 / Safety
 
 - fixer 只做机械性修复（prompt 级纪律 + 服务端 diff 审计 + 预算硬停三层约束），公式/模型结构级的改动永远留给人类
@@ -93,6 +102,15 @@ handoff: |                   # 给 worker 的交接上下文（决定总结质�
 - quest 服务是任务的父进程：quest 重启会杀掉跑着的任务（守卫循环只救 quest 自己）——重启前先确认无 running 节点
 - worker 会话归档后仍出现在 DSH 会话列表（archived 语义：脱离工作区，不删除）
 - 目前仅 Windows（taskkill 树杀、cmd /c 包装）；Linux/macOS 需替换进程管理部分
+
+## QQ 命令（搭配 qq-bridge 类通知端）
+
+```
+/q帮助          — 命令速查
+/q状态          — 任务线全景（最近活跃工作区，零 token，DSH 挂了也能用）
+/q派发 <节点>   — 派发/重派
+/q停 <节点> [原因] — 人工终止（cancelled 终态，不触发自动修复）
+```
 
 ## License
 

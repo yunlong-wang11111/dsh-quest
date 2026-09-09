@@ -33,15 +33,15 @@ if (!fs.existsSync(CONFIG_PATH)) {
     // worker 会话目标：生产=http://127.0.0.1:3080（token 从 dsh-run.log 解析）
     // 沙盒=http://127.0.0.1:3090 + tokenLog 指向沙盒日志
     dshBaseUrl: 'http://127.0.0.1:3090',
-    dshTokenLog: '',   // DSH 启动日志路径（解析 token 用）,
+    dshTokenLog: '',
     dshToken: '',
     workerPreset: 'quest-worker',
     fixerPreset: 'quest-fixer',
     qqNotify: {
       enabled: false,
       bridgeUrl: 'http://127.0.0.1:3100',
-      tokenFile: '',     // bridge console token 文件路径,
-      userId: 0,          // 你的 QQ 号
+      tokenFile: '',
+      userId: 0,
     },
   }, null, 2));
 }
@@ -75,7 +75,7 @@ function parsePlan(markdown) {
     const m = line.match(/^---node:\s*(\S+)---\s*$/);
     if (m) {
       if (cur) nodes.push(cur);
-      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2 };
+      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [] };
       handoffMode = false;
       continue;
     }
@@ -103,6 +103,20 @@ function parsePlan(markdown) {
       case 'manual': cur.manual = v.trim() === 'true'; break;
       case 'auto_fix': cur.autoFix = v.trim() === 'true'; break;
       case 'fix_budget': cur.fixBudget = Number(v) || 2; break;
+      case 'when': cur.when = v.trim(); break;
+      case 'watch_log': cur.watchLog = v.trim(); break;
+      case 'watch_interval_minutes': cur.watchIntervalMinutes = Number(v) || 10; break;
+      case 'watch_rules':
+        // 每行一条：if=正则 ; confirm=N ; action=notify|kill（分号分隔，if 必填）
+        for (const rl of v.split(/;(?=\s*if=)/)) {
+          const t = rl.trim();
+          if (!t) continue;
+          const ifM = t.match(/if=([^;]+)/);
+          const confM = t.match(/confirm=(\d+)/);
+          const actM = t.match(/action=(notify|kill)/);
+          if (ifM) cur.watchRules.push({ if: ifM[1].trim(), confirm: Number(confM?.[1]) || 2, action: actM?.[1] || 'notify', hits: 0 });
+        }
+        break;
       case 'handoff':
         if (v.trim() === '|' || v.trim() === '') handoffMode = true;
         else cur.handoff = v.trim() + '\n';
@@ -150,6 +164,11 @@ function buildState(wsKey) {
       if (e.t === 'node.frozen') { n.status = 'frozen'; n.detail = e.reason; }
       if (e.t === 'node.ready') { n.status = 'ready'; }
       if (e.t === 'node.unfrozen') { n.status = 'pending'; n.verdict = undefined; n.via = undefined; n.detail = undefined; }
+      if (e.t === 'node.cancelled') { n.status = 'cancelled'; n.verdict = 'cancelled'; n.detail = e.reason; }
+      if (e.t === 'node.skipped') { n.status = 'skipped'; n.detail = e.reason; }
+      if (e.t === 'node.metrics') { n.metrics = e.metrics; }
+      if (e.t === 'watch.warn') { n.watchWarns = (n.watchWarns ?? 0) + 1; }
+      if (e.t === 'watch.kill') { n.watchKilled = e.rule; }
     }
   } catch {}
   return state;
@@ -157,6 +176,7 @@ function buildState(wsKey) {
 
 function appendEvent(wsKey, e) {
   const dir = dirOf(wsKey);
+  lastActiveWs = wsKey; // P3：任何活动都刷新"最近工作区"
   e.at = new Date().toISOString();
   fs.appendFileSync(path.join(dir, 'ledger.jsonl'), JSON.stringify(e) + '\n');
   events.push({ ...e });
@@ -168,6 +188,7 @@ function appendEvent(wsKey, e) {
 }
 
 const events = []; // 内存事件环形（供 /api/events 拉取）
+let lastActiveWs = ''; // P3：QQ 命令免带 ws 参数用的"最近活跃工作区"
 const eventWaiters = [];
 const wakeEventWaiters = () => { for (const w of eventWaiters.splice(0)) w(); };
 
@@ -230,6 +251,80 @@ function preflight(node) {
   });
 }
 
+// ── 硬指标提取（P1-1）：正则从日志抠逐轮数值，零幻觉 ──────────────────────
+/**
+ * 从日志尾部提取 loss 序列并计算趋势指标：
+ *   loss_first / loss_last / loss_min     —— 绝对值（少用，判断主要看趋势）
+ *   loss_slope_N                          —— 近 N 个样本的相对变化（负=在降）
+ *   loss_plateau_epochs                   —— 尾部连续"变化<1%"的样本数（平台检测）
+ * 返回形如 { loss_first, loss_last, loss_min, loss_slope_10ep, loss_plateau_epochs }
+ * 提取不到（无 loss 字样）返回 {}——when 表达式引用缺失指标 = 条件不成立。
+ */
+function extractMetrics(logFile) {
+  try {
+    const size = fs.statSync(logFile).size;
+    const buf = Buffer.alloc(Math.min(64 * 1024, size));
+    const fh = fs.openSync(logFile, 'r');
+    fs.readSync(fh, buf, 0, buf.length, Math.max(0, size - buf.length));
+    fs.closeSync(fh);
+    const text = buf.toString('utf8');
+    const samples = [];
+    for (const m of text.matchAll(/\b(?:val_)?loss\D{0,4}(\d+(?:\.\d+)?(?:e[+-]?\d+)?)/gi)) {
+      const v = Number(m[1]);
+      if (Number.isFinite(v) && v >= 0) samples.push(v);
+    }
+    if (samples.length < 2) return {};
+    const s = samples.slice(-100); // 防超长
+    const last = s[s.length - 1];
+    const min = Math.min(...s);
+    const out = { loss_first: r4(s[0]), loss_last: r4(last), loss_min: r4(min) };
+    // 斜率：last / N 个样本前 的相对变化（<0 = 下降）
+    for (const n of [5, 10, 20]) {
+      if (s.length > n) out[`loss_slope_${n}ep`] = r4(last / s[s.length - 1 - n] - 1);
+    }
+    // 平台：尾部连续相对变化 < 1% 的样本数
+    let plateau = 0;
+    for (let i = s.length - 1; i > 0; i--) {
+      const rel = Math.abs(s[i] / (s[i - 1] || 1) - 1);
+      if (rel < 0.01) plateau++;
+      else break;
+    }
+    out.loss_plateau_epochs = plateau;
+    return out;
+  } catch { return {}; }
+}
+const r4 = (x) => Math.round(x * 10000) / 10000;
+
+/**
+ * when 表达式求值（P1-2）。语法：<nodeid>.verdict == ok|failed|timeout|cancelled
+ *                              <nodeid>.metrics.<key> <op> <number>
+ * 操作符：== != < <= > >=。引用缺失（节点不存在/指标没提到）→ false（保守）。
+ */
+function evalWhen(expr, state) {
+  try {
+    const m = String(expr).match(/^([\w.-]+)\s*(==|!=|<=|>=|<|>)\s*(.+)$/);
+    if (!m) return false;
+    const [, ref, op, rawVal] = m;
+    const val = rawVal.trim().replace(/^['"]|['"]$/g, '');
+    let actual;
+    if (ref.endsWith('.verdict')) {
+      actual = state.nodes[ref.slice(0, -8)]?.verdict;
+    } else if (ref.includes('.metrics.')) {
+      const ni = ref.indexOf('.metrics.');
+      actual = state.nodes[ref.slice(0, ni)]?.metrics?.[ref.slice(ni + 9)];
+    } else return false;
+    if (actual === undefined || actual === null) return false;
+    if (op === '==' || op === '!=') {
+      const eq = String(actual) === val;
+      return op === '==' ? eq : !eq;
+    }
+    const a = Number(actual); const b = Number(val);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+    return op === '<' ? a < b : op === '<=' ? a <= b : op === '>' ? a > b : a >= b;
+  } catch { return false; }
+}
+
+
 // ── 作业执行器 ──────────────────────────────────────────────────────────
 let jobSeq = 0;
 // quest 派发过的 pid：活跃 + 近 15 分钟内完结的。external-exit 检测到这些 pid 时跳过
@@ -240,6 +335,8 @@ const isQuestPid = (pid) => {
   for (const [p, exp] of questPids) if (exp < now) questPids.delete(p);
   return pid && questPids.has(Number(pid));
 };
+// 活跃作业注册表（P1-3/P1-4）：nodeKey -> { child, timers[], flags }
+const activeJobs = new Map();
 function dispatchJob(wsKey, node) {
   return new Promise(async (resolve) => {
     // 预检
@@ -262,31 +359,84 @@ function dispatchJob(wsKey, node) {
     // 派发即返回：不等 job 结束（HTTP 客户端不该被 70 分钟的训练挂住；结果走账本/收件箱/推送）
     resolve({ ok: true, jobId });
 
+    const job = { child, timers: [], cancelledByHuman: null, killedByWatch: null };
+    activeJobs.set(`${wsKey}|${node.id}`, job);
+
     // 超时护栏：timeout_seconds 显式指定，否则 expect_minutes × 2
     const timeoutMs = (node.timeoutSeconds > 0 ? node.timeoutSeconds : node.expectMinutes * 2 * 60) * 1000;
     let timedOut = false;
-    const timer = setTimeout(() => {
+    job.timers.push(setTimeout(() => {
       timedOut = true;
       try { execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => {}); } catch {}
-    }, timeoutMs);
+    }, timeoutMs));
+
+    // P1-3 watch：定时 tail 节点自己的日志文件（区别于 quest 的 stdout 捕获）
+    // 规则命中需连续 confirm 次才动作；notify 只推 QQ 不杀；kill 仅限机械致命模式
+    if (node.watchRules.length) {
+      // 默认 watch quest 自己捕获的 stdout 日志；watch_log 显式指定脚本自建的日志文件时才覆盖
+      const watchFile = !node.watchLog ? logFile
+        : path.isAbsolute(node.watchLog) ? node.watchLog : path.join(node.cwd || '.', node.watchLog);
+      const ivMs = Math.max(1, node.watchIntervalMinutes) * 60 * 1000;
+      job.timers.push(setInterval(async () => {
+        let tail = '';
+        try {
+          const st = fs.statSync(watchFile);
+          const fh2 = fs.openSync(watchFile, 'r');
+          const b2 = Buffer.alloc(Math.min(4096, st.size));
+          fs.readSync(fh2, b2, 0, b2.length, Math.max(0, st.size - b2.length));
+          fs.closeSync(fh2);
+          tail = b2.toString('utf8');
+        } catch { return; } // 日志还没建 = 没东西可看
+        for (const rule of node.watchRules) {
+          let hit = false;
+          try { hit = new RegExp(rule.if, 'i').test(tail); } catch { continue; }
+          rule.hits = hit ? (rule.hits ?? 0) + 1 : 0;
+          if (rule.hits >= rule.confirm) {
+            rule.hits = 0;
+            if (rule.action === 'kill') {
+              appendEvent(wsKey, { t: 'watch.kill', node: node.id, rule: rule.if });
+              if (!node.quiet) qqPush(`[👁 watch 击杀] ${node.id}\n规则「${rule.if}」连续 ${rule.confirm} 次命中，已终止任务`).catch(() => {});
+              job.killedByWatch = rule.if;
+              try { execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => {}); } catch {}
+            } else {
+              appendEvent(wsKey, { t: 'watch.warn', node: node.id, rule: rule.if });
+              if (!node.quiet) qqPush(`[⚠️ watch 警告] ${node.id}\n规则「${rule.if}」命中（只警告不杀；要杀请在 plan 里配 action=kill 或人工 /q停）`).catch(() => {});
+            }
+          }
+        }
+      }, ivMs));
+    }
 
     child.stdout.on('data', (d) => { try { fs.writeSync(out, d); } catch {} });
     child.stderr.on('data', (d) => { try { fs.writeSync(out, d); } catch {} });
     child.on('error', (err) => {
-      clearTimeout(timer); try { fs.closeSync(out); } catch {}
+      job.timers.forEach(clearTimeout); job.timers.forEach(clearInterval); activeJobs.delete(`${wsKey}|${node.id}`);
+      try { fs.closeSync(out); } catch {}
       appendEvent(wsKey, { t: 'node.preflight-failed', node: node.id, error: `spawn 失败: ${err.message}` });
       resolve({ ok: false, error: err.message });
     });
     child.on('exit', (code) => {
-      clearTimeout(timer);
+      job.timers.forEach(clearTimeout); job.timers.forEach(clearInterval); activeJobs.delete(`${wsKey}|${node.id}`);
       try { fs.closeSync(out); } catch {}
       const runSec = Math.round((Date.now() - startedAt) / 1000);
       // 完结后保留 15 分钟（覆盖外部检测的确认延迟窗口），之后过期放行
       questPids.set(child.pid, Date.now() + 15 * 60 * 1000);
       appendEvent(wsKey, { t: 'node.exited', node: node.id, code, runSec });
-      if (timedOut) {
+      // P1-4 人工终止：独立终态，worker/fixer 全部静默，绝不续杯
+      if (job.cancelledByHuman) {
+        appendEvent(wsKey, { t: 'node.cancelled', node: node.id, reason: job.cancelledByHuman });
+        pushInbox({ node: node.id, verdict: 'cancelled' });
+        if (!node.quiet && CFG.qqNotify?.enabled) qqPush(`[🛑 人工终止] ${node.id} · 已跑 ${formatDur(runSec)}\n原因：${job.cancelledByHuman}\n（不触发自动修复）`.slice(0, 400)).catch(() => {});
+        orchestrate(wsKey).catch(() => {});
+        return;
+      }
+      // 硬指标提取（P1-1）：无论成败都抠一份进账本
+      const metrics = extractMetrics(logFile);
+      if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
+      if (timedOut || job.killedByWatch) {
+        const via = timedOut ? `超过 ${Math.round(timeoutMs / 1000)}s 被杀` : `watch 击杀（${job.killedByWatch}）`;
         appendEvent(wsKey, { t: 'node.timeout', node: node.id, runSec });
-        finishNode(wsKey, node, { verdict: 'timeout', via: `超过 ${Math.round(timeoutMs / 1000)}s 被杀`, logFile }, null, runSec);
+        finishNode(wsKey, node, { verdict: 'timeout', via, logFile }, null, runSec);
       } else {
         const j = judge(node, code, runSec, logFile);
         appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
@@ -442,7 +592,7 @@ async function orchestrate(wsKey) {
 
   for (const n of plan.nodes) {
     if (stOf(n.id) !== 'pending' || !n.after?.length) continue;
-    const bad = n.after.find((d) => ['failed', 'timeout', 'frozen'].includes(stOf(d)));
+    const bad = n.after.find((d) => ['failed', 'timeout', 'frozen', 'cancelled', 'skipped'].includes(stOf(d)));
     if (bad && !evOf(n.id).includes('node.frozen')) {
       appendEvent(wsKey, { t: 'node.frozen', node: n.id, reason: `上游 ${bad} ${stOf(bad)}` });
       state.nodes[n.id] = state.nodes[n.id] ?? { status: 'pending', events: [] };
@@ -451,9 +601,22 @@ async function orchestrate(wsKey) {
     }
   }
 
+  // P1-2：when 条件门控。上游全部到终态后：when 成立 → 派发；不成立 → skipped（终态，下游冻结）。
+  // 注意逐个处理且每轮 orchestrate 只推进一个 dispatch（break），skipped 可一次标记多个。
   for (const n of plan.nodes) {
     if (stOf(n.id) !== 'pending' || !n.after?.length) continue;
-    if (!n.after.every((d) => stOf(d) === 'completed')) continue;
+    if (!n.after.every((d) => ['completed', 'failed', 'timeout', 'cancelled'].includes(stOf(d)))) continue;
+    if (n.when) {
+      const pass = evalWhen(n.when, state);
+      if (!pass) {
+        if (!evOf(n.id).includes('node.skipped')) {
+          appendEvent(wsKey, { t: 'node.skipped', node: n.id, reason: `when 不成立：${n.when}` });
+          state.nodes[n.id] = state.nodes[n.id] ?? { status: 'pending', events: [] };
+          state.nodes[n.id].status = 'skipped';
+        }
+        continue;
+      }
+    }
     if (n.manual) {
       if (!evOf(n.id).includes('node.ready')) {
         appendEvent(wsKey, { t: 'node.ready', node: n.id });
@@ -461,18 +624,35 @@ async function orchestrate(wsKey) {
       }
       continue;
     }
-    log('auto-dispatch:', n.id, '(after', n.after.join(','), ')');
+    log('auto-dispatch:', n.id, '(after', n.after.join(','), n.when ? `, when: ${n.when}` : '', ')');
     dispatchJob(wsKey, n).catch(() => {});
     break;
   }
 
-  const allStopped = plan.nodes.every((n) => ['completed', 'failed', 'timeout', 'frozen'].includes(stOf(n.id)));
+  const allStopped = plan.nodes.every((n) => ['completed', 'failed', 'timeout', 'frozen', 'cancelled', 'skipped'].includes(stOf(n.id)));
   if (allStopped && !(state.lineEvents ?? []).some((e) => e.t === 'line.concluded')) {
     const counts = {};
     for (const n of plan.nodes) counts[stOf(n.id)] = (counts[stOf(n.id)] ?? 0) + 1;
     const bad = plan.nodes.filter((n) => ['failed', 'timeout', 'frozen'].includes(stOf(n.id)));
     const parts = bad.map((n) => `${stOf(n.id) === 'frozen' ? '⛔' : stOf(n.id) === 'timeout' ? '⏹' : '❌'} ${n.id}（${state.nodes[n.id]?.verdict ? state.nodes[n.id].verdict + '/' : ''}${stOf(n.id)}）`);
     appendEvent(wsKey, { t: 'line.concluded', counts });
+    // P2：研究状态文件自动追加——主对话"下次开口时已知一切"的共享内存
+    try {
+      const wsDir = plan.meta.workspace || '';
+      if (wsDir) {
+        const stateFile = path.join(wsDir, 'research-state.md');
+        const ts = new Date().toLocaleString('zh-CN');
+        const lines = [``, `## ${ts} · ${plan.meta.title || wsKey}`, ``];
+        for (const n of plan.nodes) {
+          const st = state.nodes[n.id] ?? {};
+          const m = st.metrics ? ` loss_last=${st.metrics.loss_last ?? '?'} slope10=${st.metrics.loss_slope_10ep ?? '?'} plateau=${st.metrics.loss_plateau_epochs ?? '?'}` : '';
+          lines.push(`- **${n.id}**: ${stOf(n.id)}${st.verdict && stOf(n.id) !== 'completed' ? `（${st.verdict}）` : ''}${m}${st.detail ? ` — ${st.detail}` : ''}`);
+          if (st.summary) lines.push(`  > ${String(st.summary).split('\n')[0].slice(0, 150)}`);
+        }
+        fs.appendFileSync(stateFile, lines.join('\n') + '\n', 'utf8');
+        log('research-state.md 已追加:', stateFile);
+      }
+    } catch (e) { log('research-state 追加失败:', e?.message); }
     if (CFG.qqNotify?.enabled) {
       qqPush(`[🏁 任务线结束] ${plan.meta.title || wsKey}\n${plan.nodes.length} 段：${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(' / ')}${parts.length ? '\n' + parts.join('\n') : '\n全绿 ✅'}`.slice(0, 500)).catch(() => {});
     }
@@ -598,7 +778,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, 'http://localhost');
     if (req.headers['x-quest-token'] !== QUEST_TOKEN) return json(401, { error: 'unauthorized' });
-    const ws = u.searchParams.get('ws') || '';
+    const ws = u.searchParams.get('ws') || lastActiveWs || '';
     const wsKey = wsKeyOf(ws);
 
     if (req.method === 'GET' && u.pathname === '/api/status') {
@@ -616,6 +796,15 @@ const server = http.createServer(async (req, res) => {
       fs.writeFileSync(path.join(dir, 'plan.md'), body.markdown, 'utf8');
       appendEvent(wsKey, { t: fs.existsSync(path.join(dir, 'ledger.jsonl')) ? 'plan.reloaded' : 'plan.created', nodes: parsed.nodes.map((n) => n.id) });
       return json(200, { ok: true, nodes: parsed.nodes.map((n) => n.id), workspace: ws });
+    }
+    // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
+    if (req.method === 'POST' && u.pathname === '/api/cancel') {
+      const body = await readBody(req);
+      const job = activeJobs.get(`${wsKey}|${body.node}`);
+      if (!job) return json(404, { ok: false, error: `节点 ${body.node} 不在运行` });
+      job.cancelledByHuman = String(body.reason || '人工终止').slice(0, 200);
+      try { execFile('taskkill', ['/PID', String(job.child.pid), '/T', '/F'], () => {}); } catch {}
+      return json(200, { ok: true, node: body.node, note: '已杀树，等待退出事件落账（cancelled 终态，不触发自动修复）' });
     }
     if (req.method === 'POST' && u.pathname === '/api/dispatch') {
       const body = await readBody(req);
@@ -706,4 +895,19 @@ const readBody = (req) => new Promise((resolve, reject) => {
 server.listen(CFG.port || 3110, '127.0.0.1', () => {
   log(`quest 服务就绪 http://127.0.0.1:${CFG.port || 3110}（token: ${QUEST_TOKEN.slice(0, 6)}…）`);
   log(`worker 目标: ${CFG.dshBaseUrl}${CFG.workersEnabled === false ? '（worker 已禁用）' : ''}`);
+  // 启动对账：上次运行留下的 running 节点 = 孤儿（进程可能还活着但已不受管）。
+  // 标记 cancelled 终态（不触发修复），人可重派。孤儿进程本身由超时/人处理。
+  try {
+    for (const dir of fs.readdirSync(HOMEOverride, { withFileTypes: true })) {
+      if (!dir.isDirectory()) continue;
+      let state;
+      try { state = buildState(dir.name); } catch { continue; }
+      for (const [nid, n] of Object.entries(state.nodes ?? {})) {
+        if (n.status === 'running') {
+          appendEvent(dir.name, { t: 'node.cancelled', node: nid, reason: 'quest 重启：作业失去管理（孤儿进程可能仍在，请确认后重派）' });
+          log('孤儿作业标记:', dir.name, nid);
+        }
+      }
+    }
+  } catch {}
 });

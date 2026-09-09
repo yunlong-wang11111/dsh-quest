@@ -51,11 +51,11 @@ function apply(ctx, config = {}) {
     name: 'quest_plan',
     description: [
       '写入/替换当前工作区的任务线计划（quest 系统的源头定义，markdown 格式）。',
-      '⚠️ 写之前必须先用 read 工具读模板：C:<quest-dir>\\PLAN-TEMPLATE.md',
+      '⚠️ 写之前必须先用 read 工具读模板：<quest-dir>\\PLAN-TEMPLATE.md',
       '（含五段科研流水标准骨架、handoff 写作指南与红线——handoff 质量决定 worker 总结质量）。',
       '要点速览：节点用 "---node: <id>---" 分节；command 必填（解释器绝对路径）；',
       'expect_minutes 写真实值（超时护栏=2倍）；after 声明依赖（上游成功自动派发、失败冻结下游）；',
-      '写完 plan 后顺手用 task_summary_update 把各节点登记进任务总揽（标题=节点id，备注=做什么）；manual: true 停下等人工；auto_fix: true 失败后自动修复（机械性问题+.bak+重派，fix_budget 次上限）；只需派发链头节点。workspace 取当前会话 cwd。',
+      '写完 plan 后顺手用 task_summary_update 把各节点登记进任务总揽（标题=节点id，备注=做什么）；manual: true 停下等人工；auto_fix: true 失败后自动修复；when: <节点>.verdict==ok 或 <节点>.metrics.loss_slope_10ep < -0.05 等条件门控（趋势运算符 slope_N/plateau_epochs 支持"看变化程度"的分支：a好跑b、不好跑c）；watch_log+watch_rules 运行中监控（默认只警告，NaN/OOM 类可配 action=kill+confirm 连续命中）；只需派发链头节点。workspace 取当前会话 cwd。',
     ].join(' '),
     parameters: {
       markdown: { type: 'string', description: '完整 plan.md 内容' },
@@ -84,6 +84,27 @@ function apply(ctx, config = {}) {
     execute: async (args, exec) => questCall(cfg(), `/api/dispatch?ws=${encodeURIComponent(wsOf(args, exec))}`, {
       method: 'POST', body: JSON.stringify({ node: String(args.node || '') }),
     }),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'quest_cancel',
+    description: [
+      '人工终止一个正在运行的节点（杀整棵进程树）。',
+      '终止后记为 cancelled 独立终态：不触发自动修复（绝不续杯）、不做 worker 总结，下游保持冻结。',
+      '用户说"停掉/别跑了/这个卡死了"时使用。务必带上原因（会进账本和 QQ 通知）。',
+    ].join(' '),
+    parameters: {
+      node: { type: 'string', description: '节点 id' },
+      reason: { type: 'string', description: '终止原因（一句话，入账本+QQ）' },
+      ws: { type: 'string', description: '工作区绝对路径（缺省=最近活跃工作区）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, note: { type: 'string' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `终止失败：${v.error}` : `已终止：${v.note || '杀树指令已发'}` }],
+    },
+    execute: async (args, exec) => questCall(cfg(), `/api/cancel?ws=${encodeURIComponent(wsOf(args, exec))}`, {
+      method: 'POST', body: JSON.stringify({ node: String(args.node || ''), reason: String(args.reason || '人工终止') }),
+    }, 8000),
   }));
 
   ctx.tools.register(defineTool({
