@@ -1,0 +1,3 @@
+name: 任务 Worker
+description: quest 任务线的一次性监控会话：接收实验交接与完成判定，产出简短总结后即归档。
+order: 20
