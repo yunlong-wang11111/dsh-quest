@@ -164,7 +164,7 @@ function buildState(wsKey) {
       if (e.t === 'node.exited') { n.exitCode = e.code; n.runSeconds = e.runSec; }
       if (e.t === 'node.judged') { n.verdict = e.verdict; n.via = e.via; n.file = e.file || null; }
       if (e.t === 'worker.reported') { n.summary = e.summary; }
-      if (e.t === 'node.completed') n.status = 'completed';
+      if (e.t === 'node.completed') { n.status = 'completed'; n.completedAt = e.at; }
       if (e.t === 'node.failed') n.status = 'failed';
       if (e.t === 'node.timeout') { n.status = 'timeout'; n.verdict = 'timeout'; n.via = e.via || '超时被杀'; }
       if (e.t === 'node.frozen') { n.status = 'frozen'; n.detail = e.reason; }
@@ -344,7 +344,28 @@ function findRunId(wsKey, nodeId) {
 /**
  * P5：progress.md 实时更新——主对话的"被动快照"。
  * 节点派发/终态时重写；AI 被问到实验时读它即知最新状态（几行，零注入）。
+ * 排序（2026-09-10）：已完成（按账本里的真实完成时间倒序，最新在上）→ 运行中 →
+ * 异常终态 → 待办（按 plan 声明顺序——声明顺序即作者的重要性排序）。
+ * 时间取账本事件时刻（完成那一刻服务写入的），不是文件 mtime，无需 AI 参与排序。
  */
+function nodeDisplayOrder(plan, state) {
+  const order = plan.nodes.map((n, i) => ({ n, i, st: state.nodes[n.id] ?? {} }));
+  const bucket = (st) => {
+    const s = st.status ?? 'pending';
+    if (s === 'completed') return 0;
+    if (s === 'running') return 1;
+    if (['failed', 'timeout', 'cancelled'].includes(s)) return 2;
+    return 3;
+  };
+  order.sort((a, b) => {
+    const ba = bucket(a.st), bb = bucket(b.st);
+    if (ba !== bb) return ba - bb;
+    if (ba === 0) return Date.parse(b.st.completedAt || 0) - Date.parse(a.st.completedAt || 0);
+    return a.i - b.i;
+  });
+  return order;
+}
+
 function writeProgress(wsKey) {
   try {
     const state = buildState(wsKey);
@@ -352,11 +373,15 @@ function writeProgress(wsKey) {
     const plan = parsePlan(state.plan);
     const wsDir = plan.meta.workspace || '';
     if (!wsDir) return;
-    const lines = [`# 任务进度（自动更新：${new Date().toLocaleString('zh-CN')}）`, ''];
-    for (const n of plan.nodes) {
-      const st = state.nodes[n.id] ?? {};
+    const headers = { 0: '## ✅ 已完成', 1: '## ▶ 进行中', 2: '## ⚠️ 异常（失败/超时/终止）', 3: '## ⏳ 待办（按计划顺序）' };
+    const lines = [`# 任务进度（自动更新：${new Date().toLocaleString('zh-CN')}）`];
+    let curBucket = -1;
+    for (const { n, st } of nodeDisplayOrder(plan, state)) {
+      const b = ({ completed: 0, running: 1, failed: 2, timeout: 2, cancelled: 2 })[st.status ?? 'pending'] ?? 3;
+      if (b !== curBucket) { curBucket = b; lines.push('', headers[b], ''); }
       const icon = { running: '▶', completed: '✅', failed: '❌', cancelled: '🛑', frozen: '⛔', skipped: '⏭', ready: '⏸' }[st.status ?? 'pending'] ?? '·';
       let l = `- ${icon} **${n.id}**: ${st.status ?? 'pending'}`;
+      if (st.completedAt) l += ` · 完成于 ${String(st.completedAt).slice(11, 16)}`;
       if (st.verdict && st.status !== 'completed') l += `（${st.verdict}）`;
       if (st.runSeconds != null) l += ` 已跑 ${formatDur(st.runSeconds)}`;
       if (st.metrics?.loss_last != null) l += ` · loss ${st.metrics.loss_last}`;
@@ -504,6 +529,7 @@ function dispatchJob(wsKey, node, body = {}) {
 
     const job = { child, timers: [], cancelledByHuman: null, killedByWatch: null };
     activeJobs.set(`${wsKey}|${node.id}`, job);
+    writeProgress(wsKey); // 派发即刷新：运行中节点立刻上墙
 
     // 超时护栏：timeout_seconds 显式指定，否则 expect_minutes × 2
     const timeoutMs = (node.timeoutSeconds > 0 ? node.timeoutSeconds : node.expectMinutes * 2 * 60) * 1000;
@@ -1218,7 +1244,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && u.pathname === '/api/status') {
       const state = buildState(wsKey);
       const plan = state.plan ? parsePlan(state.plan) : { nodes: [] };
-      const nodes = plan.nodes.map((n) => ({ id: n.id, ...(state.nodes[n.id] || { status: 'pending' }), quiet: n.quiet, expectMinutes: n.expectMinutes }));
+      // 展示排序与 progress.md 一致：已完成（时间倒序）→运行中→异常→待办（声明序）
+      const nodes = nodeDisplayOrder(plan, state).map(({ n }) => ({ id: n.id, ...(state.nodes[n.id] || { status: 'pending' }), quiet: n.quiet, expectMinutes: n.expectMinutes }));
       const unread = inbox.splice(0); // 取走即清
       // workspace 优先取 plan.md 里声明的绝对路径（权威），入参只做缺省——/q翻页 等下游要拿真路径去匹配 DSH 会话
       return json(200, { plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes }, unread, questVersion: '0.2.0' });
