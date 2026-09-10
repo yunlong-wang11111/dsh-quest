@@ -585,6 +585,7 @@ function dispatchJob(wsKey, node, body = {}) {
         try {
           if (!CK_PAT.test(readTail(scriptPath, 262144))) {
             appendEvent(wsKey, { t: 'checkpoint.warn', node: node.id, why: '脚本未见存档模式' });
+            pushInbox({ node: node.id, verdict: 'no-checkpoint', detail: '脚本无存档模式：请按约定补断点（启动读 QUEST_RESUME_FROM、固定路径 torch.save），或确认无需断点' });
             if (!node.quiet) qqPush(wsKey, `[⚠️ 无断点提醒] ${node.id} 预计 ${node.expectMinutes} 分钟，但脚本没扫到 torch.save/checkpoint 模式——中途崩了要从零跑。确认无碍请在节点加 no_checkpoint: true`).catch(() => {});
           }
         } catch {}
@@ -681,6 +682,7 @@ function dispatchJob(wsKey, node, body = {}) {
         if (!latest || latest.mtimeMs < startedAt) {
           job.ckWarned = true;
           appendEvent(wsKey, { t: 'checkpoint.stale', node: node.id });
+          pushInbox({ node: node.id, verdict: 'stale-checkpoint', detail: '运行期间无新存档文件：检查存档路径是否写错或条件未触发' });
           if (!node.quiet) qqPush(wsKey, `[⚠️ 存档可疑] ${node.id} 已跑 ${Math.round((Date.now() - startedAt) / 60000)} 分钟，运行期间没有任何新 checkpoint 文件——存档可能写错路径或没触发`).catch(() => {});
         }
       }
