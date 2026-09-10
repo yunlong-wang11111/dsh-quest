@@ -146,6 +146,24 @@ function apply(ctx, config = {}) {
   }));
 
   ctx.tools.register(defineTool({
+    name: 'quest_files',
+    description: [
+      '浏览/读取任意路径的文件（Windows 绝对路径或 \\\\wsl$\\Ubuntu\\... UNC 路径，即 WSL 内部文件）。',
+      'mode=list 列目录（名称/大小/时间）；mode=read 读文本（大文件自动截尾）。',
+      '典型用途：查 WSL 里的实验产物（\\\\wsl$\\Ubuntu\\home\\solanine\\...）、看 checkpoint 目录、翻日志文件。',
+    ].join(' '),
+    parameters: {
+      path: { type: 'string', description: '绝对路径，如 \\\\wsl$\\Ubuntu\\home\\solanine\\exp 或 C:\\Users\\USER\\Desktop\\V8' },
+      mode: { type: 'string', description: 'list（列目录，缺省）或 read（读文件内容）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { path: { type: 'string' }, entries: { type: 'array', items: { type: 'object', additionalProperties: true } }, text: { type: 'string' }, truncated: { type: 'boolean' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `读取失败：${v.error}` : v.entries ? `📁 ${v.path}\n${v.entries.slice(0, 30).map((e) => `${e.dir ? '[D]' : '   '} ${e.name}${e.dir ? '' : ' · ' + Math.round((e.size || 0) / 1024) + 'KB'}`).join('\n')}${v.entries.length > 30 ? `\n…共 ${v.entries.length} 项` : ''}` : `📄 ${v.path}${v.truncated ? '（已截尾）' : ''}\n${String(v.text || '').slice(0, 3000)}` }],
+    },
+    execute: async (args) => questCall(cfg(), `/api/files?mode=${encodeURIComponent(String(args.mode || 'list'))}&path=${encodeURIComponent(String(args.path || ''))}`, undefined, 20000),
+  }));
+
+  ctx.tools.register(defineTool({
     name: 'quest_cancel',
     description: [
       '人工终止一个正在运行的节点（杀整棵进程树）。',

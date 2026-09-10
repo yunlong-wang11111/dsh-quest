@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quest 仪表盘</title>
+<style>
+  :root { --bg:#111418; --card:#1a1f26; --line:#2a313b; --fg:#d7dde5; --dim:#7b8794; --ok:#3fb96f; --run:#4a9eff; --bad:#e0563f; --warn:#d9a038; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.5 "Segoe UI",system-ui,sans-serif; padding:14px; }
+  header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+  h1 { font-size:17px; font-weight:600; margin-right:auto; }
+  h1 small { color:var(--dim); font-weight:400; margin-left:6px; }
+  nav { display:flex; gap:4px; margin-bottom:12px; }
+  nav button { background:var(--card); border:1px solid var(--line); color:var(--dim); padding:6px 14px; border-radius:8px 8px 0 0; cursor:pointer; font-size:14px; }
+  nav button.on { color:var(--fg); border-bottom-color:var(--bg); background:var(--bg); }
+  section { display:none; }
+  section.on { display:block; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:0 8px 8px 8px; padding:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  select, input[type=text], button.act { background:#0d1014; border:1px solid var(--line); color:var(--fg); border-radius:6px; padding:6px 10px; font-size:13px; }
+  button.act { cursor:pointer; } button.act:hover { border-color:var(--run); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:340px; }
+  th { color:var(--dim); font-weight:500; }
+  .st { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .st.completed{background:var(--ok)} .st.running{background:var(--run);animation:p 1s infinite alternate} .st.failed,.st.timeout{background:var(--bad)} .st.cancelled{background:var(--dim)} .st.pending,.st.frozen,.st.skipped,.st.ready{background:var(--warn)}
+  @keyframes p { to { opacity:.35; } }
+  #files table td:hover, #files table tr.dir:hover { cursor:pointer; color:var(--run); }
+  #viewer { margin-top:10px; }
+  #viewer img { max-width:100%; border-radius:6px; }
+  #viewer pre { background:#0d1014; border:1px solid var(--line); border-radius:6px; padding:10px; overflow:auto; max-height:60vh; font-size:12px; white-space:pre-wrap; }
+  .note { color:var(--dim); font-size:12px; }
+  .gate-item { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:8px; }
+  .gate-item code { display:block; background:#0d1014; padding:6px 8px; border-radius:6px; margin:6px 0; font-size:12px; word-break:break-all; }
+  #tokbar { position:fixed; inset:auto 14px 14px auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>quest 仪表盘<small id="qver"></small></h1>
+  <span class="note" id="wsl-home"></span>
+</header>
+<nav>
+  <button data-t="tasks" class="on">任务线</button>
+  <button data-t="files">文件</button>
+  <button data-t="gate">门禁</button>
+</nav>
+
+<section id="tasks" class="on">
+  <div class="card">
+    <div class="row">
+      <select id="ws"></select>
+      <button class="act" onclick="loadTasks()">刷新</button>
+      <span class="note" id="ws-title"></span>
+    </div>
+    <table><thead><tr><th>节点</th><th>状态</th><th>判定</th><th>耗时</th><th>指标</th></tr></thead><tbody id="nodes"></tbody></table>
+  </div>
+</section>
+
+<section id="files">
+  <div class="card">
+    <div class="row">
+      <input type="text" id="fpath" style="flex:1;min-width:260px" placeholder="绝对路径（Windows 或 \\wsl$\Ubuntu\...）">
+      <button class="act" onclick="go($('#fpath').value)">前往</button>
+      <button class="act" onclick="go(wslHome())">WSL 家目录</button>
+      <button class="act" onclick="go('C:\\\\Users\\\\USER\\\\Desktop')">桌面</button>
+    </div>
+    <table><tbody id="flist"></tbody></table>
+    <div id="viewer"></div>
+  </div>
+</section>
+
+<section id="gate">
+  <div class="card" id="gate-body"><span class="note">加载中…</span></div>
+</section>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('questTok') || '';
+if (!TOKEN) { TOKEN = prompt('quest token（见 ~/.dsh/quests/.token）') || ''; }
+localStorage.setItem('questTok', TOKEN);
+async function api(p) {
+  const r = await fetch(p, { headers: { 'x-quest-token': TOKEN } });
+  if (r.status === 401) { TOKEN = prompt('token 无效，重新输入：') || ''; localStorage.setItem('questTok', TOKEN); return api(p); }
+  return r.json();
+}
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtSize = (n) => n > 1048576 ? (n/1048576).toFixed(1)+'MB' : n > 1024 ? (n/1024).toFixed(0)+'KB' : n+'B';
+const wslHome = () => '\\\\wsl$\\Ubuntu\\home\\solanine';
+$('#wsl-home').textContent = 'WSL: ' + wslHome();
+
+document.querySelectorAll('nav button').forEach((b) => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach((x) => x.classList.remove('on'));
+  document.querySelectorAll('section').forEach((x) => x.classList.remove('on'));
+  b.classList.add('on'); $('#' + b.dataset.t).classList.add('on');
+  if (b.dataset.t === 'gate') loadGate();
+});
+
+async function loadWs() {
+  const d = await api('/api/workspaces');
+  const sel = $('#ws'); sel.innerHTML = '';
+  for (const w of d.workspaces) {
+    const o = document.createElement('option');
+    o.value = w.wsKey; o.textContent = (w.running ? '▶ ' : '') + (w.title || w.wsKey);
+    sel.appendChild(o);
+  }
+  const q = new URLSearchParams(location.search).get('ws');
+  if (q) sel.value = q;
+  sel.onchange = loadTasks;
+}
+async function loadTasks() {
+  const wsKey = $('#ws').value; if (!wsKey) return;
+  const d = await api('/api/status?ws=' + encodeURIComponent(wsKey));
+  $('#ws-title').textContent = d.plan?.workspace || '';
+  $('#qver').textContent = d.questVersion || '';
+  $('#nodes').innerHTML = (d.plan?.nodes || []).map((n) => `<tr>
+    <td>${esc(n.id)}</td>
+    <td><span class="st ${n.status}"></span>${esc(n.status)}</td>
+    <td>${esc(n.verdict || '')}${n.via ? ' <span class="note">' + esc(n.via) + '</span>' : ''}</td>
+    <td>${n.runSeconds != null ? esc(Math.round(n.runSeconds/60)) + '分' : ''}</td>
+    <td>${n.metrics?.loss_last != null ? 'loss ' + esc(n.metrics.loss_last) + (n.metrics.loss_slope_10ep != null ? ' · 斜率 ' + esc(n.metrics.loss_slope_10ep) : '') : ''}</td>
+  </tr>`).join('');
+}
+
+async function go(p) {
+  p = p.trim(); if (!p) return;
+  $('#fpath').value = p; $('#viewer').innerHTML = '';
+  const d = await api('/api/files?mode=list&path=' + encodeURIComponent(p));
+  if (d.error) { $('#flist').innerHTML = `<tr><td class="note">${esc(d.error)}</td></tr>`; return; }
+  $('#flist').innerHTML = d.entries.map((e) => `<tr class="${e.dir ? 'dir' : ''}" onclick="clickE('${esc(e.name).replace(/'/g,"\\'")}', ${e.dir})">
+    <td>${e.dir ? '📁' : '📄'} ${esc(e.name)}</td>
+    <td class="note">${e.dir ? '' : fmtSize(e.size)}</td>
+    <td class="note">${e.mtime ? new Date(e.mtime).toLocaleString('zh-CN', {hour12:false}) : ''}</td>
+  </tr>`).join('');
+}
+async function clickE(name, isDir) {
+  const base = $('#fpath').value.replace(/[\\/]+$/, '');
+  const full = base + (base.startsWith('\\\\') || /^\/\//.test(base) ? '\\' : '\\') + name;
+  if (isDir) return go(full);
+  if (/\.(png|jpe?g|gif|webp)$/i.test(name)) {
+    const d = await api('/api/files?mode=img&path=' + encodeURIComponent(full));
+    $('#viewer').innerHTML = d.error ? `<pre>${esc(d.error)}</pre>` : `<img src="${d.dataUrl}"><div class="note">${esc(name)}</div>`;
+    return;
+  }
+  const d = await api('/api/files?mode=read&path=' + encodeURIComponent(full));
+  $('#viewer').innerHTML = `<div class="note">${esc(name)}${d.truncated ? '（文件 ' + fmtSize(d.size) + '，只显示尾部 256KB）' : ''}</div><pre>${esc(d.text)}</pre>`;
+}
+
+async function loadGate() {
+  const d = await api('/api/gate/list');
+  const night = d.night?.active ? `🌙 夜间自批中 · 剩余额度 ${d.night.quotaLeft}/${d.night.quota}` : `☀️ 白天模式（夜间窗口自批）`;
+  const items = (d.pending || []).map((g) => `<div class="gate-item">
+    <b>${esc(g.id)}</b> <span class="note">${new Date(g.createdAt).toLocaleTimeString('zh-CN',{hour12:false})} · ${esc(g.why)}</span>
+    <code>${esc(g.command)}</code>
+    <span class="note">AI 理由：${esc(g.reason || '（未给）')}</span>
+  </div>`).join('');
+  $('#gate-body').innerHTML = `<div class="row">${night}</div>` + (items || '<span class="note">没有挂起的命令</span>');
+}
+
+loadWs().then(loadTasks);
+setInterval(() => { if ($('#tasks').classList.contains('on')) loadTasks(); }, 10000);
+</script>
+</body>
+</html>

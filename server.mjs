@@ -1293,6 +1293,13 @@ const server = http.createServer(async (req, res) => {
   const json = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(obj)); };
   try {
     const u = new URL(req.url, 'http://localhost');
+    // 仪表盘页面本体免头认证（页面自己管 token：URL 参数/localStorage/弹窗）——所有数据 API 仍需 token
+    if (req.method === 'GET' && (u.pathname === '/dashboard' || u.pathname === '/dashboard/')) {
+      const html = fs.readFileSync(path.join(import.meta.dirname, 'dashboard.html'));
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(html);
+      return;
+    }
     if (req.headers['x-quest-token'] !== QUEST_TOKEN) return json(401, { error: 'unauthorized' });
     const ws = u.searchParams.get('ws') || lastActiveWs || '';
     const wsKey = wsKeyOf(ws);
@@ -1374,6 +1381,59 @@ const server = http.createServer(async (req, res) => {
       pushInbox({ node: rec.node.id, verdict: 'gate-rejected', gateId: rec.id });
       qqPush(rec.wsKey, `[🚫 已作废] ${rec.node.id}（${rec.id}）\n命令从未执行`.slice(0, 400)).catch(() => {});
       return json(200, { ok: true, action: 'rejected' });
+    }
+    // ── v0.4 仪表盘配套：工作区列表 + 文件浏览（token 认证，本机/局域网）──────────
+    if (req.method === 'GET' && u.pathname === '/api/workspaces') {
+      const list = [];
+      try {
+        for (const d of fs.readdirSync(HOMEOverride, { withFileTypes: true })) {
+          if (!d.isDirectory()) continue;
+          let title = '';
+          let running = 0;
+          try {
+            const st = buildState(d.name);
+            if (st.plan) title = parsePlan(st.plan).meta?.title || '';
+            running = Object.values(st.nodes).filter((n) => n.status === 'running').length;
+          } catch {}
+          list.push({ wsKey: d.name, title, running });
+        }
+      } catch {}
+      list.sort((a, b) => b.running - a.running || a.wsKey.localeCompare(b.wsKey));
+      return json(200, { workspaces: list });
+    }
+    if (req.method === 'GET' && u.pathname === '/api/files') {
+      // mode=list 列目录（绝对路径，Windows 或 \\wsl$ UNC 均可）；mode=read 读文本（>512KB 截尾）；
+      // mode=img 返回 base64 dataURL（图片预览，≤10MB）。token 认证的 owner 本机服务，路径不设白名单。
+      const mode = u.searchParams.get('mode') || 'list';
+      const p = u.searchParams.get('path') || '';
+      if (!p) return json(400, { error: '缺少 path' });
+      try {
+        if (mode === 'list') {
+          const entries = fs.readdirSync(p, { withFileTypes: true }).map((e) => {
+            let st = null;
+            try { st = fs.statSync(path.join(p, e.name)); } catch {}
+            return { name: e.name, dir: e.isDirectory(), size: st?.size ?? 0, mtime: st?.mtimeMs ?? 0 };
+          });
+          entries.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+          return json(200, { path: p, entries });
+        }
+        if (mode === 'img') {
+          const st = fs.statSync(p);
+          if (st.size > 10 * 1024 * 1024) return json(413, { error: '图片超 10MB' });
+          const b64 = fs.readFileSync(p).toString('base64');
+          const ext = path.extname(p).toLowerCase();
+          const mime = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' }[ext] || 'image/png';
+          return json(200, { dataUrl: `data:${mime};base64,${b64}` });
+        }
+        // mode=read：文本读，大文件截尾
+        const st = fs.statSync(p);
+        if (st.size > 512 * 1024) {
+          return json(200, { truncated: true, size: st.size, text: readTail(p, 256 * 1024) });
+        }
+        return json(200, { truncated: false, size: st.size, text: fs.readFileSync(p, 'utf8') });
+      } catch (e) {
+        return json(404, { error: `读不到：${String(e?.message || e).slice(0, 120)}` });
+      }
     }
     if (req.method === 'GET' && u.pathname === '/api/gate/list') {
       return json(200, {
