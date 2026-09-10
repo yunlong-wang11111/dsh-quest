@@ -51,7 +51,7 @@ function apply(ctx, config = {}) {
     name: 'quest_plan',
     description: [
       '写入/替换当前工作区的任务线计划（quest 系统的源头定义，markdown 格式）。',
-      '⚠️ 写之前必须先用 read 工具读模板：quest 插件目录下的 PLAN-TEMPLATE.md（从本插件的安装目录找）',
+      '⚠️ 写之前必须先用 read 工具读模板：C:\\Users\\USER\\dsh-plugins\\quest\\PLAN-TEMPLATE.md',
       '（含五段科研流水标准骨架、handoff 写作指南与红线——handoff 质量决定 worker 总结质量）。',
       '要点速览：节点用 "---node: <id>---" 分节；command 必填（解释器绝对路径）；',
       'expect_minutes 写真实值（超时护栏=2倍）；after 声明依赖（上游成功自动派发、失败冻结下游）；',
@@ -91,6 +91,7 @@ function apply(ctx, config = {}) {
     description: [
       '快速单发：不写任务线，直接派一个临时长任务到后台（全套判定+worker 总结+QQ 推送）。',
       '适合脚本已定型、想立刻后台跑的单个命令。探索期的临时实验/训练/数据生成都用它。',
+      '**长实验禁止用本地终端的 run_in_background + Start-Sleep/轮询 stdout 文件来跑**——那是反模式：每轮询一次烧一轮上下文、DSH 重启实验就死、没有判定没有通知。凡是预计超过 1 分钟的命令，一律走本工具；它不占你的终端槽、quest 崩了任务照跑（重启自动接管）。',
       '**门禁规则**：解释器（python/node/Rscript/matlab/julia）跑工作区内脚本的命令直接执行；其它命令（删除/下载/系统类/工作区外路径）会被挂起推送 owner QQ 等人工确认，30 分钟不确认自动作废——这不是失败，返回的 note 会说明原因。夜间窗口（23:00-08:00）带 reason 可自批执行。所以：常规长任务请写成"python 工作区内脚本"形式，永远畅通；命令被挂起时不要反复原样重试，等确认或改写。',
       '任务结束自动通知（QQ 推送+worker 总结）——**派发后你的工作就完成了，不要设 goal/create_goal 来轮询进度，不要 Sleep 后再查。quest 有事件驱动通知，你等着被通知或被问就行。** 用户催进度时读工作区的 progress.md（quest 自动维护的实时快照）。',
     ].join(' '),
