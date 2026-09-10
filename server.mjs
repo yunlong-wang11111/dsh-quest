@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // quest 服务 —— 任务线编排核心（P1：账本+作业执行+预检+判定器；P2：worker 子会话；P3：QQ 推送）
 //
-// 设计文档见仓库 DESIGN.md（如未附带则参考 README）
+// 设计文档：__HOME__\dsh-plugins\QUEST_DESIGN.md
 // 数据目录：~/.dsh/quests/<wsKey>/（plan.md + ledger.jsonl + logs/ + state.json）
 // 端口：默认 3110，仅绑定 127.0.0.1；token 首启生成于 ~/.dsh/quests/.token
 //
@@ -30,18 +30,18 @@ fs.mkdirSync(HOMEOverride, { recursive: true });
 if (!fs.existsSync(CONFIG_PATH)) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify({
     port: 3110,
-    // worker 会话目标：你的 DSH Web 地址（token 从 DSH 运行日志解析，或直接填 dshToken）
-    dshBaseUrl: 'http://127.0.0.1:3080',
-    dshTokenLog: '', // DSH 运行日志路径，首次启动时用于解析 token
+    // worker 会话目标：生产=http://127.0.0.1:3080（token 从 dsh-run.log 解析）
+    // 沙盒=http://127.0.0.1:3090 + tokenLog 指向沙盒日志
+    dshBaseUrl: 'http://127.0.0.1:3090',
+    dshTokenLog: '__HOME__/.dsh-test/sandbox-run3.log',
     dshToken: '',
     workerPreset: 'quest-worker',
     fixerPreset: 'quest-fixer',
-    // QQ 通知（可选，需配套 OneBot 桥接，见 README）：enabled=false 时纯本地运行
     qqNotify: {
       enabled: false,
       bridgeUrl: 'http://127.0.0.1:3100',
-      tokenFile: '', // 桥接的控制台令牌文件路径
-      userId: 0, // 接收通知的 QQ 号
+      tokenFile: '__HOME__/qq-bridge/state/console-token',
+      userId: 0,
     },
   }, null, 2));
 }
@@ -692,6 +692,23 @@ function findWorkerPid(node, startedAt) {
   });
 }
 
+/** 引号感知分词（探针用）：python -c "print('x')" → ['python','-c',"print('x')"]。
+ *  外层引号按 shell 语义消费，内层原样保留——探针不经过 cmd.exe，绕开其剥引号的老毛病。 */
+function shellSplit(s) {
+  const out = [];
+  let cur = '';
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === q) q = null; else cur += c; continue; }
+    if (c === '"' || c === "'") { q = c; continue; }
+    if (/\s/.test(c)) { if (cur) { out.push(cur); cur = ''; } continue; }
+    cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 /**
  * 孤儿再认领（2026-09-09）：quest 重启后接管仍存活的作业。
  * 句柄直挂（stdio fd）保证子进程在 quest 死亡期间继续跑、继续写日志；
@@ -802,7 +819,7 @@ ${logTail}
 修复纪律（违反即失败）：
 1. 只做机械性修复：显存不足→调小 batch/梯度累积/相关参数；NaN→调小学习率/加 clip；路径/环境错→修路径；缺依赖→修 import。绝不修改实验逻辑、模型结构、数据处理方法。
 2. 动任何文件之前先复制一份 .bak-<今天日期> 备份。
-3. 改完对主脚本跑 py_compile 验证。
+3. 改完对主脚本跑 py_compile 验证；需要看中间量（张量形状/变量值/路径是否存在）可调 quest_probe 跑 30 秒内的诊断命令（如 python -c），改前改后都可以探。
 4. 你的回复：先一句话说明改了什么文件什么参数，然后以单独一行 "FIX_OK" 结尾；如果判断这问题不属于机械性修复（需要人决策），回复原因并以 "FIX_GIVEUP" 结尾。` }],
     });
     const ended = await Promise.race([turnP, new Promise((_, rej) => setTimeout(() => rej(new Error('修复会话超时（8min）')), 480000))]);
@@ -1360,12 +1377,43 @@ const server = http.createServer(async (req, res) => {
       const files = fs.readdirSync(path.join(dir, 'logs')).filter((f) => f.startsWith(`${node}-`)).sort();
       const file = path.join(dir, 'logs', files[files.length - 1]);
       const tail = Number(u.searchParams.get('tail')) || 4096;
-      const size = fs.statSync(file).size;
-      const buf = Buffer.alloc(Math.min(tail, size));
-      const fh = fs.openSync(file, 'r');
-      fs.readSync(fh, buf, 0, buf.length, Math.max(0, size - tail));
-      fs.closeSync(fh);
-      return json(200, { file, log: buf.toString('utf8') });
+      return json(200, { file, log: readTail(file, tail) });
+    }
+    // v0.3 探针：同步跑一条 ≤30s 的白名单诊断命令，尾部输出（≤8KB）直接返回。
+    // 与 quest_run 的区别：run 是派发后走人（异步+判定+通知），探针是"现在就要答案"。
+    // 安全四件套代替确认门（修复循环需要即时反馈，挂起等确认会把循环打断）：
+    // 白名单分类器（探针额外放行 -c 内联——fixer 本就有工作区写权限，执行的边际风险由下面兜住）
+    // + 30s 硬杀 + 危险词黑名单（分类器自带）+ 账本全量留痕。
+    if (req.method === 'POST' && u.pathname === '/api/probe') {
+      const b = await readBody(req);
+      if (!b.command || !b.cwd) return json(400, { ok: false, error: '缺少 command/cwd' });
+      const command = String(b.command).slice(0, 500);
+      const cwd = String(b.cwd);
+      const cls = classifyRunCommand(command, cwd);
+      const allowC = cls.why === '解释器 -c 内联代码不可静态审查'; // 探针放行 -c（quest_run 依然要过门）
+      if (cls.level !== 'ok' && !allowC) {
+        return json(403, { ok: false, error: `探针拒绝（${cls.why}）：只接受解释器跑工作区内脚本或 -c 内联诊断；长任务请用 quest_run。` });
+      }
+      const logFile = path.join(dirOf(wsKey), 'logs', `probe-${Date.now().toString(36)}.log`);
+      appendEvent(wsKey, { t: 'probe.run', command });
+      const out = fs.openSync(logFile, 'a');
+      // 直接 spawn 解释器（分词后），不经 cmd.exe：避开其嵌套双引号被剥的老毛病（python -c 是探针主场景）。
+      // 代价：无 shell 特性（管道/重定向/&），需要时写进 -c 代码里——对诊断场景是合理限制。
+      const argv = shellSplit(command);
+      if (!argv.length) return json(400, { ok: false, error: '空命令' });
+      const child = spawn(argv[0], argv.slice(1), { cwd, windowsHide: true, stdio: ['ignore', out, out] });
+      questPids.set(child.pid, Date.now() + 5 * 60 * 1000);
+      const startedAt = Date.now();
+      let killed = false;
+      const killer = setTimeout(() => {
+        killed = true;
+        try { execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => {}); } catch {}
+      }, 30000);
+      const code = await new Promise((resolve) => child.on('exit', resolve));
+      clearTimeout(killer);
+      try { fs.closeSync(out); } catch {}
+      appendEvent(wsKey, { t: 'probe.done', code, ms: Date.now() - startedAt, killed: killed || undefined });
+      return json(200, { ok: true, code, killed, ms: Date.now() - startedAt, log: readTail(logFile, 8192), logFile });
     }
     if (req.method === 'POST' && u.pathname === '/api/external-exit') {
       // 外部进程退出（python-manager 检测到的手动启动任务）：合成虚拟节点走同一条

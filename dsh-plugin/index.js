@@ -122,6 +122,29 @@ function apply(ctx, config = {}) {
   }));
 
   ctx.tools.register(defineTool({
+    name: 'quest_probe',
+    description: [
+      '诊断探针：同步跑一条命令，30 秒内拿回尾部输出（≤8KB）。跑 plan/run 任务的任何时候都能用，不影响它们。',
+      '用途：打印中间量/张量形状/验证路径存在/跑一行检查——"我现在就要看这个值"的场景；改完代码先探一下再等重派也是好习惯。',
+      '只接受解释器（python/node/Rscript/matlab/julia）跑工作区内脚本，或 -c 内联诊断；被拒绝说明命令超出探针范围。探针不走 shell（无管道/重定向），复杂逻辑写进 -c 代码里。',
+      '**超过 30 秒的任务不是探针的事，用 quest_run。**每次探针入账本留痕。看正在跑的任务的输出用 quest_log（读日志，不执行）。',
+    ].join(' '),
+    parameters: {
+      command: { type: 'string', description: '诊断命令，如 python -c "print(arr.shape)" 或 python check_env.py' },
+      cwd: { type: 'string', description: '工作目录' },
+      ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, code: { type: 'number' }, killed: { type: 'boolean' }, ms: { type: 'number' }, log: { type: 'string' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `探针被拒：${v.error}` : `${v.killed ? '⏱ 30s 超时被杀（输出为超时前内容）' : `退出码 ${v.code}`} · ${(Math.round((v.ms || 0) / 100) / 10).toString()}s\n${String(v.log || '').slice(-2000)}` }],
+    },
+    execute: async (args, exec) => questCall(cfg(), `/api/probe?ws=${encodeURIComponent(wsOf(args, exec))}`, {
+      method: 'POST',
+      body: JSON.stringify({ command: String(args.command || ''), cwd: String(args.cwd || wsOf(args, exec)) }),
+    }, 35000),
+  }));
+
+  ctx.tools.register(defineTool({
     name: 'quest_cancel',
     description: [
       '人工终止一个正在运行的节点（杀整棵进程树）。',
