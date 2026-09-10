@@ -78,11 +78,16 @@
 <script>
 const $ = (s) => document.querySelector(s);
 let TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('questTok') || '';
-if (!TOKEN) { TOKEN = prompt('quest token（见 ~/.dsh/quests/.token）') || ''; }
-localStorage.setItem('questTok', TOKEN);
+function showTokbar() { const b = document.createElement('div'); b.id = 'tokbar';
+  b.innerHTML = '<input id="tokin" placeholder="quest token（~/.dsh/quests/.token）"><button class="act" onclick="saveTok()">保存</button>';
+  document.body.appendChild(b); }
+function saveTok() { TOKEN = document.getElementById('tokin').value.trim();
+  localStorage.setItem('questTok', TOKEN); const b = document.getElementById('tokbar'); if (b) b.remove();
+  loadWs().then(loadTasks); }
+if (!TOKEN) showTokbar();
 async function api(p) {
   const r = await fetch(p, { headers: { 'x-quest-token': TOKEN } });
-  if (r.status === 401) { TOKEN = prompt('token 无效，重新输入：') || ''; localStorage.setItem('questTok', TOKEN); return api(p); }
+  if (r.status === 401) { if (!document.getElementById('tokbar')) showTokbar(); throw new Error('token 无效'); }
   return r.json();
 }
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
