@@ -1,6 +1,6 @@
 # quest_plan 模板与写法指南（AI 写任务线前先读本文件）
 
-> 位置固定：quest 插件目录下的 PLAN-TEMPLATE.md
+> 位置固定：`__HOME__\dsh-plugins\quest\PLAN-TEMPLATE.md`
 > `quest_plan` 工具的 markdown 参数按本模板写。写作原则：**handoff 是 worker 总结质量的上限**——
 > worker 只能看到 handoff + 日志尾部，看不到你们的研究语境，所以要在这里替它把语境补齐。
 
@@ -9,6 +9,7 @@
 ```markdown
 # 任务线：<一句话说清这批实验在验证什么>
 workspace: <绝对路径>
+# 任务线头部可写 shell: wsl —— 整条任务线默认进 WSL（节点级可单独覆盖为 windows），AI 无需逐节点决定
 
 ---node: <id-短横线小写>---
 command: <完整命令，解释器用绝对路径，如 E:\python_env\pinn\Scripts\python.exe>

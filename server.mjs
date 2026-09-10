@@ -75,13 +75,13 @@ function parsePlan(markdown) {
     const m = line.match(/^---node:\s*(\S+)---\s*$/);
     if (m) {
       if (cur) nodes.push(cur);
-      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2, shell: 'windows' };
+      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2, shell: '' };
       handoffMode = false;
       continue;
     }
     if (!cur) {
       const kv = line.match(/^([a-zA-Z_]+):\s*(.*)$/);
-      if (kv && ['workspace', 'title'].includes(kv[1])) meta[kv[1]] = kv[2].trim();
+      if (kv && ['workspace', 'title', 'shell'].includes(kv[1])) meta[kv[1]] = kv[2].trim();
       // 没写 title: 时，取第一个 Markdown 一级标题当标题（模板惯例是 "# 任务线：<名字>"）
       const h = line.match(/^#\s+(.+)$/);
       if (h && !meta.heading) meta.heading = h[1].replace(/^\s*任务线[：:]\s*/, '').trim().slice(0, 40);
@@ -131,6 +131,8 @@ function parsePlan(markdown) {
   }
   if (cur) nodes.push(cur);
   meta.title = meta.title || meta.heading || '';
+  // shell 解析优先级：节点级 > plan 级（meta）> windows。plan 头写一次 shell: wsl = 整条任务线默认进 WSL。
+  for (const n of nodes) n.shell = n.shell === 'wsl' ? 'wsl' : (meta.shell === 'wsl' ? 'wsl' : 'windows');
   for (const n of nodes) {
     if (!n.command) errors.push(`节点 ${n.id} 缺 command`);
     if (!n.cwd) n.cwd = meta.workspace || '';
@@ -715,7 +717,7 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
 /** 扫节点 cwd（不递归）里运行窗口内新产出的 png/jpg，按 mtime 取最新 N 张直推 QQ。
  *  时间窗用节点真实起点（worker 总结耗时几秒到几分钟，不能用 now-runSec 倒推，会把刚产出的图当旧货滤掉）。 */
 async function pushArtifactImages(wsKey, node, startedAt) {
-  const dir = node.cwd;
+  const dir = node.shell === 'wsl' ? wslUnc(node.cwd) : node.cwd; // WSL 节点经 UNC 扫产物
   if (!dir) return;
   const sinceMs = startedAt - 2000;
   let entries;
@@ -1301,6 +1303,7 @@ const server = http.createServer(async (req, res) => {
       // 展示排序与 progress.md 一致：已完成（时间倒序）→运行中→异常→待办（声明序）
       const nodes = nodeDisplayOrder(plan, state).map(({ n }) => ({ id: n.id, ...(state.nodes[n.id] || { status: 'pending' }), quiet: n.quiet, expectMinutes: n.expectMinutes }));
       const unread = inbox.splice(0); // 取走即清
+      writeProgress(wsKey); // 查询即刷新：progress.md 不再等下一个节点事件（排序/状态实时保鲜）
       // workspace 优先取 plan.md 里声明的绝对路径（权威），入参只做缺省——/q翻页 等下游要拿真路径去匹配 DSH 会话
       return json(200, { plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes }, unread, questVersion: '0.2.0' });
     }
