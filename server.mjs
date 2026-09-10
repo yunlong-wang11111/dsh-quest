@@ -114,7 +114,8 @@ function parsePlan(markdown) {
       case 'fix_budget': cur.fixBudget = Number(v) || 2; break;
       case 'max_log_mb': cur.maxLogMB = Number(v) || 0; break; // 0 = 默认 256MB
       case 'push_images': cur.pushImages = Number(v) || 0; break; // 成功后直推 QQ 的图片数上限，0 = 关
-      case 'shell': cur.shell = v.trim().toLowerCase() === 'wsl' ? 'wsl' : 'windows'; break; // wsl = 在 WSL(Ubuntu) 里跑（bash 语法，Linux 路径）
+      case 'shell': cur.shell = v.trim().toLowerCase() === 'wsl' ? 'wsl' : 'windows'; break;
+      case 'no_checkpoint': cur.noCheckpoint = v.trim() === 'true'; break; // 显式声明不需要断点（屏蔽第一二层提醒） // wsl = 在 WSL(Ubuntu) 里跑（bash 语法，Linux 路径）
       case 'when': cur.when = v.trim(); break;
       case 'watch_log': cur.watchLog = v.trim(); break;
       case 'watch_interval_minutes': cur.watchIntervalMinutes = Number(v) || 10; break;
@@ -514,6 +515,32 @@ const WSL_DISTRO = () => CFG.wslDistro || 'Ubuntu';
 const WSL_USER = () => CFG.wslUser || 'solanine';
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const wslUnc = (linuxPath) => `//wsl$/${WSL_DISTRO()}${String(linuxPath).startsWith('/') ? '' : '/'}${linuxPath}`;
+
+// ── 断点三层（2026-09-10）：防忘（派发前静态扫描）/ 防假（运行中盯档案）/ 防重跑（重派自动带存档指针）──
+const CK_EXTS = /\.(pt|ckpt|pth)$/i;
+const CK_PAT = /torch\.save|save_checkpoint|state_dict|checkpoint|resume_from|QUEST_RESUME_FROM/i;
+const uncToLinux = (p) => String(p).replace(/^\/\/wsl\$\/[^/]+/i, '');
+
+/** 找 dir 里最近 N 天内最新的存档文件（dir 为 Windows 路径或 UNC），返回 {file, mtimeMs} 或 null */
+function findLatestCheckpoint(dir, withinDays = 7) {
+  try {
+    const cutoff = Date.now() - withinDays * 86400000;
+    let best = null;
+    for (const d of [dir, path.join(dir, 'out'), path.join(dir, 'checkpoints'), path.join(dir, 'runs')]) {
+      let entries;
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+      for (const e of entries) {
+        if (!e.isFile() || !CK_EXTS.test(e.name)) continue;
+        try {
+          const st = fs.statSync(path.join(d, e.name));
+          if (st.mtimeMs > cutoff && st.size > 0 && (!best || st.mtimeMs > best.mtimeMs)) best = { file: path.join(d, e.name), mtimeMs: st.mtimeMs };
+        } catch {}
+      }
+    }
+    return best;
+  } catch { return null; }
+}
+
 /** 统一杀树：Windows 侧杀 wsl.exe 中继 + WSL 侧按进程组杀真正的负载。 */
 function killJobTree(job, winPid) {
   try { execFile('taskkill', ['/PID', String(winPid), '/T', '/F'], () => {}); } catch {}
@@ -548,6 +575,21 @@ function dispatchJob(wsKey, node, body = {}) {
       resolve({ ok: false, error: 'preflight-failed' });
       return;
     }
+    // 断点第一层（防忘）：长任务脚本无存档模式 → 警告不拦截（拦截会冻结无人值守任务线）
+    if ((node.expectMinutes >= 15) && !node.noCheckpoint) {
+      const pyFile = String(node.command || '').match(/\b([\w./\:-]+\.py)\b/)?.[1];
+      if (pyFile) {
+        const scriptPath = node.shell === 'wsl'
+          ? wslUnc((node.cwd || `/home/${WSL_USER()}`) + '/' + pyFile.replace(/^\/+/, ''))
+          : path.isAbsolute(pyFile) ? pyFile : path.join(node.cwd || '.', pyFile);
+        try {
+          if (!CK_PAT.test(readTail(scriptPath, 262144))) {
+            appendEvent(wsKey, { t: 'checkpoint.warn', node: node.id, why: '脚本未见存档模式' });
+            if (!node.quiet) qqPush(wsKey, `[⚠️ 无断点提醒] ${node.id} 预计 ${node.expectMinutes} 分钟，但脚本没扫到 torch.save/checkpoint 模式——中途崩了要从零跑。确认无碍请在节点加 no_checkpoint: true`).catch(() => {});
+          }
+        } catch {}
+      }
+    }
     const jobId = `j-${++jobSeq}-${Date.now().toString(36)}`;
     const logTs = new Date().toISOString().replace(/[:.]/g, '-');
     const startedAt = Date.now();
@@ -566,7 +608,9 @@ function dispatchJob(wsKey, node, body = {}) {
       // 退出码：service 模式 systemd-run 立即返回，wsl 会话改为轮询单元状态 + 从日志尾解析 EXIT_CODE。
       job.wslUnit = `quest-${String(node.id).replace(/[^a-zA-Z0-9_.-]/g, '_')}-${logTs}`.slice(0, 90);
       job.wslPidFile = `${dir}/${node.id}-${logTs}.unit`; // 记单元名（供重启后重建）
-      const svcCmd = `cd ${shq(node.cwd || `/home/${WSL_USER()}`)} 2>/dev/null || { echo 'cd 失败' >> ${shq(linuxLog)}; echo EXIT_CODE:111; exit 0; }; ${node.command}; ec=\$?; echo EXIT_CODE:\$ec`;
+      const ckL = findLatestCheckpoint(wslUnc(node.cwd || `/home/${WSL_USER()}`));
+      const resumeExport = ckL ? `export QUEST_RESUME_FROM=${shq(uncToLinux(ckL.file))}; ` : '';
+      const svcCmd = `${resumeExport}cd ${shq(node.cwd || `/home/${WSL_USER()}`)} 2>/dev/null || { echo 'cd 失败' >> ${shq(linuxLog)}; echo EXIT_CODE:111; exit 0; }; ${node.command}; ec=\$?; echo EXIT_CODE:\$ec`;
       const wrapped = [
         `mkdir -p ${shq(dir)}`,
         `printf '%s' ${shq(job.wslUnit)} > ${shq(job.wslPidFile)}`,
@@ -586,7 +630,9 @@ function dispatchJob(wsKey, node, body = {}) {
       job.outFd = fs.openSync(logFile, 'a');
       // stdio 句柄直挂而非管道：quest 崩溃时管道会断裂、子进程 print 即 BrokenPipeError；
       // 直挂 append 句柄则子进程继续写日志，重启后可再认领（见 adoptOrphan）。
-      child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', job.outFd, job.outFd] });
+      // 断点第三层（防重跑）：自动找最近存档塞进 QUEST_RESUME_FROM（脚本按约定读它续跑）
+      const ckW = findLatestCheckpoint(node.cwd || '.');
+      child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', job.outFd, job.outFd], env: ckW ? { ...process.env, QUEST_RESUME_FROM: ckW.file } : process.env });
     }
     appendEvent(wsKey, { t: 'node.dispatched', node: node.id, jobId, pid: child.pid, logTs });
     // P4 进程树：同步 run 实例
@@ -629,6 +675,15 @@ function dispatchJob(wsKey, node, body = {}) {
     // 就截断（append 句柄会自动跟到新 EOF）。截断丢的是旧 stdout，账本/指标/总结都不依赖它。
     const capMB = node.maxLogMB > 0 ? node.maxLogMB : 256;
     job.timers.push(setInterval(() => {
+      // 断点第二层（防假）：长任务 20 分钟内无新存档 → 提醒一次（存档路径写错/未生效）
+      if (!job.ckWarned && node.expectMinutes >= 20 && !node.noCheckpoint && Date.now() - startedAt > 20 * 60000) {
+        const latest = findLatestCheckpoint(node.shell === 'wsl' ? wslUnc(node.cwd || '') : node.cwd || '');
+        if (!latest || latest.mtimeMs < startedAt) {
+          job.ckWarned = true;
+          appendEvent(wsKey, { t: 'checkpoint.stale', node: node.id });
+          if (!node.quiet) qqPush(wsKey, `[⚠️ 存档可疑] ${node.id} 已跑 ${Math.round((Date.now() - startedAt) / 60000)} 分钟，运行期间没有任何新 checkpoint 文件——存档可能写错路径或没触发`).catch(() => {});
+        }
+      }
       try {
         if (fs.statSync(logFile).size > capMB * 1024 * 1024) {
           fs.truncateSync(logFile, 0);
@@ -967,7 +1022,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
       if (/\.(pt|npz|pth|ckpt|png|jpg|h5|npy|bin)$/i.test(j.logFile)) return '';
       return readTail(j.logFile, 4096);
     })();
-    const script = String(node.command || '').match(/([\w.\-]+\.py)/)?.[1] || '';
+    const script = String(node.command || '').match(/\b([\w.\-]+\.py)\b/)?.[1] || '';
 
     await api.sessions.prompt({
       sessionId, mode: 'queue',

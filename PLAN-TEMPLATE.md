@@ -23,7 +23,10 @@ fix_budget: <自动修复次数上限，默认 2；烧完停手 QQ 告警>
 quiet: <true=不发 QQ；缺省=false>
 max_log_mb: <stdout 日志封顶 MB，默认 256；超限截断（保留尾部新内容），防 verbose 训练吃满磁盘>
 push_images: <成功后把 cwd 里新产出的 png/jpg 直推 QQ 的张数上限，默认 2；0=关。可视化节点建议保持默认>
-shell: <windows 缺省；wsl = 该节点在 WSL(Ubuntu) 里跑——bash 语法、cwd 用 Linux 路径（如 /home/xxx/exp），命令不经 cmd.exe（无引号剥离问题），且负载由 WSL 虚拟机养着、quest/DSH 崩溃照常跑>
+shell: <windows 缺省；wsl = 该节点在 WSL(Ubuntu) 里跑
+no_checkpoint: <true = 显式声明不需要断点（屏蔽「无存档提醒」）>
+断点约定：quest 派发/重派时自动把 cwd 里最新的 .pt/.ckpt/.pth 路径放进环境变量 QUEST_RESUME_FROM——脚本开头按约定读它（有则加载续跑），存档写固定文件名。长任务（>=15 分钟）脚本里没有 torch.save/checkpoint 模式会被提醒。
+——bash 语法、cwd 用 Linux 路径（如 /home/xxx/exp），命令不经 cmd.exe（无引号剥离问题），且负载由 WSL 虚拟机养着、quest/DSH 崩溃照常跑>
 handoff: |
   <3~8 行交接上下文，给一个看不到你们对话的 worker 读。覆盖：>
   1. 这个脚本在整个研究里的角色（"生成 XX 消融实验的训练数据"）
