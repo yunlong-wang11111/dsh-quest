@@ -1772,10 +1772,20 @@ server.listen(CFG.port || 3110, '127.0.0.1', () => {
       try { state = buildState(wsKey); } catch { continue; }
       if (!state.plan) continue;
       const plan = parsePlan(state.plan);
-      for (const node of plan.nodes) {
-        const n = state.nodes[node.id];
+      // 2026-09-10 修复：对账要覆盖「账本节点 ∪ plan 节点」——快速单发（quest_run）只进账本
+      // 不写 plan.md 的 node 段，只遍历 plan.nodes 会漏掉它们 → quest 重启即成幽灵 running。
+      const planById = new Map(plan.nodes.map((n) => [n.id, n]));
+      const ids = new Set([...Object.keys(state.nodes), ...planById.keys()]);
+      for (const id of ids) {
+        const n = state.nodes[id];
         if (n?.status !== 'running' || !n.pid) continue;
-        adoptOrphan(wsKey, node, n).catch((e) => log('再认领失败:', wsKey, node.id, e?.message));
+        const node = planById.get(id) ?? {
+          // 账本独有的快速单发节点：合成最小配置（命令已不在账本里，认领只靠 pid/logTs）
+          id, command: '', cwd: plan.meta?.workspace || '', expectMinutes: 30, timeoutSeconds: 0,
+          shell: 'windows', quiet: true, autoFix: false, fixBudget: 0, when: '', after: [],
+          watchRules: [], maxLogMB: 0, pushImages: 0, noCheckpoint: true, handoff: '', success: '',
+        };
+        adoptOrphan(wsKey, node, n).catch((e) => log('再认领失败:', wsKey, id, e?.message));
       }
     }
   } catch {}
