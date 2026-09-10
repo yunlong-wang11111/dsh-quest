@@ -500,7 +500,11 @@ const wslUnc = (linuxPath) => `//wsl$/${WSL_DISTRO()}${String(linuxPath).startsW
 /** 统一杀树：Windows 侧杀 wsl.exe 中继 + WSL 侧按进程组杀真正的负载。 */
 function killJobTree(job, winPid) {
   try { execFile('taskkill', ['/PID', String(winPid), '/T', '/F'], () => {}); } catch {}
-  if (job?.wslPidFile) {
+  if (job?.wslUnit) {
+    try {
+      execFile('wsl.exe', ['-d', WSL_DISTRO(), '-u', 'root', '--exec', 'systemctl', 'kill', job.wslUnit, '--signal=SIGKILL', '--kill-whom=all'], { windowsHide: true }, () => {});
+    } catch {}
+  } else if (job?.wslPidFile) {
     try {
       execFile('wsl.exe', ['-d', WSL_DISTRO(), '--exec', 'bash', '-c', `kill -KILL -$(cat ${job.wslPidFile}) 2>/dev/null; rm -f ${job.wslPidFile}`], { windowsHide: true }, () => {});
     } catch {}
@@ -530,7 +534,7 @@ function dispatchJob(wsKey, node, body = {}) {
     const jobId = `j-${++jobSeq}-${Date.now().toString(36)}`;
     const logTs = new Date().toISOString().replace(/[:.]/g, '-');
     const startedAt = Date.now();
-    const job = { child: null, timers: [], cancelledByHuman: null, killedByWatch: null, wslPidFile: null };
+    const job = { child: null, timers: [], cancelledByHuman: null, killedByWatch: null, wslPidFile: null, wslUnit: null };
     let child;
     let logFile;
     if (node.shell === 'wsl') {
@@ -540,17 +544,26 @@ function dispatchJob(wsKey, node, body = {}) {
       const linuxLog = `/home/${WSL_USER()}/quest-logs/${safe}/${node.id}-${logTs}.log`;
       job.wslPidFile = `/home/${WSL_USER()}/quest-logs/${safe}/${node.id}-${logTs}.pid`;
       const dir = `/home/${WSL_USER()}/quest-logs/${safe}`;
+      // 2026-09-10 终版：systemd-run 的 SERVICE 模式（--scope 会随会话陪葬——cgroup 挂在调用会话下；
+      // service 进 system.slice 由 PID1 养，wsl.exe 会话退出/quest 崩溃都不影响）。
+      // 退出码：service 模式 systemd-run 立即返回，wsl 会话改为轮询单元状态 + 从日志尾解析 EXIT_CODE。
+      job.wslUnit = `quest-${String(node.id).replace(/[^a-zA-Z0-9_.-]/g, '_')}-${logTs}`.slice(0, 90);
+      job.wslPidFile = `${dir}/${node.id}-${logTs}.unit`; // 记单元名（供重启后重建）
+      const svcCmd = `cd ${shq(node.cwd || `/home/${WSL_USER()}`)} 2>/dev/null || { echo 'cd 失败' >> ${shq(linuxLog)}; echo EXIT_CODE:111; exit 0; }; ${node.command}; ec=\$?; echo EXIT_CODE:\$ec`;
       const wrapped = [
         `mkdir -p ${shq(dir)}`,
-        `cd ${shq(node.cwd || `/home/${WSL_USER()}`)} || { echo "cd 失败" >> ${shq(linuxLog)}; exit 111; }`,
-        `{ setsid bash -c ${shq(node.command)} > ${shq(linuxLog)} 2>&1 < /dev/null & echo $! > ${shq(job.wslPidFile)}; wait $!; }`,
+        `printf '%s' ${shq(job.wslUnit)} > ${shq(job.wslPidFile)}`,
+        `systemd-run --quiet --unit=${job.wslUnit} -p User=${WSL_USER()} bash -c ${shq(svcCmd)} >> ${shq(linuxLog)} 2>&1`,
+        `while systemctl is-active --quiet ${job.wslUnit} 2>/dev/null; do sleep 2; done`,
+        `exit $(tail -c 512 ${shq(linuxLog)} | grep -oE 'EXIT_CODE:[0-9]+' | tail -1 | cut -d: -f2 || echo 1)`,
       ].join('; ');
       logFile = wslUnc(linuxLog);
       try {
         fs.mkdirSync(wslUnc(dir), { recursive: true }); // UNC 建目录（经 9p 落到 WSL 内）
         job.outFd = fs.openSync(logFile, 'a'); // 捕获 wsl.exe 自身的报错（Linux 侧输出走它自己的重定向）
       } catch (e) { log('WSL 日志句柄降级为 ignore:', e?.message); }
-      child = spawn('wsl.exe', ['-d', WSL_DISTRO(), '--exec', 'bash', '-c', wrapped], { windowsHide: true, stdio: job.outFd ? ['ignore', job.outFd, job.outFd] : 'ignore' });
+      // -u root：systemd-run 创建系统单元需要 root（polkit）；负载本体经 -p User 降权为 solanine
+      child = spawn('wsl.exe', ['-d', WSL_DISTRO(), '-u', 'root', '--exec', 'bash', '-c', wrapped], { windowsHide: true, stdio: job.outFd ? ['ignore', job.outFd, job.outFd] : 'ignore' });
     } else {
       logFile = path.join(dirOf(wsKey), 'logs', `${node.id}-${logTs}.log`);
       job.outFd = fs.openSync(logFile, 'a');
@@ -791,6 +804,16 @@ function shellSplit(s) {
   return out;
 }
 
+/** WSL 单元存活探测（systemd service 模式）。探测本身会按需拉起 WSL VM。 */
+function wslUnitActive(unit) {
+  return new Promise((resolve) => {
+    execFile('wsl.exe', ['-d', WSL_DISTRO(), '--exec', 'systemctl', 'is-active', '--quiet', unit],
+    { windowsHide: true, timeout: 12000 }, (err) => {
+      resolve(!err); // is-active --quiet：退出码 0 = 活着
+    });
+  });
+}
+
 /**
  * 孤儿再认领（2026-09-09）：quest 重启后接管仍存活的作业。
  * 句柄直挂（stdio fd）保证子进程在 quest 死亡期间继续跑、继续写日志；
@@ -798,12 +821,55 @@ function shellSplit(s) {
  * 超时护栏按原起点重算剩余时间，watch 规则照常挂，/q停 照常可用。
  */
 async function adoptOrphan(wsKey, node, n) {
+  const startedAt0 = Date.parse(n.startedAt) || Date.now();
+
+  // ── WSL 节点的再认领（2026-09-10）：账本里的 pid 是 wsl.exe 中继（quest 重启后已死，无意义），
+  // 真正的存活判据是 WSL 内的 pidfile（setsid 进程组长）。日志在 WSL 内部，UNC 路径持久有效。
+  if (node.shell === 'wsl') {
+    const safe = wsKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-40);
+    const base = `/home/${WSL_USER()}/quest-logs/${safe}/${node.id}-${n.logTs}`;
+    const logFile = wslUnc(`${base}.log`);
+    const startedAt = startedAt0;
+    // 单元名持久化在 .unit 文件里（新）；没有则按派发时的规则重建（旧账本兼容）
+    let unit = '';
+    try { unit = fs.readFileSync(wslUnc(`${base}.unit`), 'utf8').trim(); } catch {}
+    if (!unit) unit = `quest-${String(node.id).replace(/[^a-zA-Z0-9_.-]/g, '_')}-${n.logTs}`.slice(0, 90);
+    n.wslUnit = unit;
+    const alive = await wslUnitActive(unit);
+    if (!alive) {
+      appendEvent(wsKey, { t: 'node.readopted', node: node.id, result: 'gone-wsl' });
+      const runSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+      const metrics = extractMetrics(logFile);
+      if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
+      const j = judge(node, 0, runSec, logFile);
+      j.via = `${j.via}（quest 重启期间 WSL 进程已消失，按产物/关键词判定）`;
+      appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
+      await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
+      return;
+    }
+    const timeoutMs = (node.timeoutSeconds > 0 ? node.timeoutSeconds : node.expectMinutes * 2 * 60) * 1000;
+    let timedOut = false;
+    const job = { child: { pid: 0 }, timers: [], cancelledByHuman: null, killedByWatch: null, wslUnit: unit };
+    activeJobs.set(`${wsKey}|${node.id}`, job);
+    appendEvent(wsKey, { t: 'node.readopted', node: node.id, result: 'adopted-wsl' });
+    job.timers.push(setTimeout(() => { timedOut = true; killJobTree(job, 0); }, Math.max(0, startedAt + timeoutMs - Date.now())));
+    setupWatch(wsKey, node, job, logFile, 0);
+    const iv = setInterval(async () => {
+      if (await wslUnitActive(unit)) return;
+      clearInterval(iv);
+      handleNodeExit(wsKey, node, { code: null, timedOut, logFile, startedAt, timeoutMs, job, pid: 0, reAdopted: true });
+    }, 10000);
+    job.timers.push(iv);
+    log(`WSL 再认领: ${wsKey}/${node.id}`);
+    return;
+  }
+
   let pid = Number(n.pid);
   let alive = false;
   try { process.kill(pid, 0); alive = true; } catch {}
   if (alive && !(await pidMatches(pid, node))) alive = false;
   const logFile = path.join(dirOf(wsKey), 'logs', `${node.id}-${n.logTs}.log`);
-  const startedAt = Date.parse(n.startedAt) || Date.now();
+  const startedAt = startedAt0;
 
   if (!alive) {
     // 包装层（cmd.exe）可能先死而工作进程还在：按命令指纹找回真正的负载
