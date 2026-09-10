@@ -357,7 +357,7 @@ function findRunId(wsKey, nodeId) {
 /**
  * P5：progress.md 实时更新——主对话的"被动快照"。
  * 节点派发/终态时重写；AI 被问到实验时读它即知最新状态（几行，零注入）。
- * 排序（2026-09-10）：已完成（按账本里的真实完成时间倒序，最新在上）→ 运行中 →
+ * 排序（2026-09-10）：已完成（按账本里的真实完成时间正序，早的在上）→ 运行中 →
  * 异常终态 → 待办（按 plan 声明顺序——声明顺序即作者的重要性排序）。
  * 时间取账本事件时刻（完成那一刻服务写入的），不是文件 mtime，无需 AI 参与排序。
  */
@@ -373,7 +373,7 @@ function nodeDisplayOrder(plan, state) {
   order.sort((a, b) => {
     const ba = bucket(a.st), bb = bucket(b.st);
     if (ba !== bb) return ba - bb;
-    if (ba === 0) return Date.parse(b.st.completedAt || 0) - Date.parse(a.st.completedAt || 0);
+    if (ba === 0) return Date.parse(a.st.completedAt || 0) - Date.parse(b.st.completedAt || 0); // 完成时间正序：早的在上、晚的在下
     return a.i - b.i;
   });
   return order;
