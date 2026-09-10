@@ -611,7 +611,7 @@ function dispatchJob(wsKey, node, body = {}) {
       job.wslPidFile = `${dir}/${node.id}-${logTs}.unit`; // 记单元名（供重启后重建）
       const ckL = findLatestCheckpoint(wslUnc(node.cwd || `/home/${WSL_USER()}`));
       const resumeExport = ckL ? `export QUEST_RESUME_FROM=${shq(uncToLinux(ckL.file))}; ` : '';
-      const svcCmd = `${resumeExport}cd ${shq(node.cwd || `/home/${WSL_USER()}`)} 2>/dev/null || { echo 'cd 失败' >> ${shq(linuxLog)}; echo EXIT_CODE:111; exit 0; }; ${node.command}; ec=\$?; echo EXIT_CODE:\$ec`;
+      const svcCmd = `${resumeExport}exec >> ${shq(linuxLog)} 2>&1; cd ${shq(node.cwd || `/home/${WSL_USER()}`)} 2>/dev/null || { echo 'cd 失败' >> ${shq(linuxLog)}; echo EXIT_CODE:111; exit 0; }; ${node.command}; ec=\$?; echo EXIT_CODE:\$ec`;
       const wrapped = [
         `mkdir -p ${shq(dir)}`,
         `printf '%s' ${shq(job.wslUnit)} > ${shq(job.wslPidFile)}`,
