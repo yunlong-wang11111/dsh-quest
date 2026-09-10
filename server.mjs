@@ -75,7 +75,7 @@ function parsePlan(markdown) {
     const m = line.match(/^---node:\s*(\S+)---\s*$/);
     if (m) {
       if (cur) nodes.push(cur);
-      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2 };
+      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2, shell: 'windows' };
       handoffMode = false;
       continue;
     }
@@ -108,6 +108,7 @@ function parsePlan(markdown) {
       case 'fix_budget': cur.fixBudget = Number(v) || 2; break;
       case 'max_log_mb': cur.maxLogMB = Number(v) || 0; break; // 0 = 默认 256MB
       case 'push_images': cur.pushImages = Number(v) || 0; break; // 成功后直推 QQ 的图片数上限，0 = 关
+      case 'shell': cur.shell = v.trim().toLowerCase() === 'wsl' ? 'wsl' : 'windows'; break; // wsl = 在 WSL(Ubuntu) 里跑（bash 语法，Linux 路径）
       case 'when': cur.when = v.trim(); break;
       case 'watch_log': cur.watchLog = v.trim(); break;
       case 'watch_interval_minutes': cur.watchIntervalMinutes = Number(v) || 10; break;
@@ -239,7 +240,9 @@ function judge(node, exitCode, runSec, logFile) {
   // 查输出证据：cwd 常见目录 + 任务运行窗口内的文件
   const tail = readTail(logFile, 4096).toLowerCase();
   if (FINISH_KEYWORDS.some((k) => tail.includes(k.toLowerCase()))) return { verdict: 'ok', via: 'finish-keyword' };
-  const dirs = [node.cwd, path.join(node.cwd, 'out'), path.join(node.cwd, 'logs'), path.join(node.cwd, 'output'), path.join(node.cwd, 'results'), path.join(node.cwd, 'runs')];
+  const dirs = node.shell === 'wsl'
+    ? [node.cwd, `${node.cwd}/out`, `${node.cwd}/logs`, `${node.cwd}/output`, `${node.cwd}/results`, `${node.cwd}/runs`].filter(Boolean).map(wslUnc)
+    : [node.cwd, path.join(node.cwd, 'out'), path.join(node.cwd, 'logs'), path.join(node.cwd, 'output'), path.join(node.cwd, 'results'), path.join(node.cwd, 'runs')];
   let latest = null;
   for (const d of dirs) {
     let entries; try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
@@ -269,6 +272,16 @@ function preflight(node) {
   if (!pyFile) return null; // 非 python 命令不预检
   const exe = cmd.trim().split(/\s+/)[0].replace(/^"|"$/g, '');
   const script = pyFile[1];
+  if (node.shell === 'wsl') {
+    return new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 15000);
+      execFile('wsl.exe', ['-d', WSL_DISTRO(), '--exec', 'bash', '-c', `cd ${shq(node.cwd || `/home/${WSL_USER()}`)} && python3 -m py_compile ${shq(script)}`], { windowsHide: true, timeout: 12000 }, (err, _so, se) => {
+        clearTimeout(t);
+        if (err) resolve({ error: String(se || err.message || 'py_compile 失败').slice(0, 600) });
+        else resolve(null);
+      });
+    });
+  }
   return new Promise((resolve) => {
     const t = setTimeout(() => resolve(null), 15000); // 预检自身卡住则放行（判定器兜底）
     execFile(exe, ['-m', 'py_compile', script], { cwd: node.cwd, windowsHide: true, timeout: 12000 }, (err, _so, se) => {
@@ -473,6 +486,24 @@ function evalWhen(expr, state) {
 
 // ── 作业执行器 ──────────────────────────────────────────────────────────
 let jobSeq = 0;
+// ── WSL 支持（2026-09-10）：shell: wsl 的节点在 WSL(Ubuntu) 里跑 ──────────
+// 设计：命令经 setsid 起独立进程组，输出重定向到 WSL 内部日志（Linux 原生写，不经
+// Windows 管道）——quest/DSH 崩溃时 wsl.exe 中继死了，Linux 进程照常跑照常写；
+// quest 侧通过 \\wsl$ UNC 路径读同一份日志做判定/watch/metrics。杀 = 先 taskkill
+// 中继，再进 WSL 按进程组 kill（pidfile 记录组长 PID）。
+const WSL_DISTRO = () => CFG.wslDistro || 'Ubuntu';
+const WSL_USER = () => CFG.wslUser || 'solanine';
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const wslUnc = (linuxPath) => `//wsl$/${WSL_DISTRO()}${String(linuxPath).startsWith('/') ? '' : '/'}${linuxPath}`;
+/** 统一杀树：Windows 侧杀 wsl.exe 中继 + WSL 侧按进程组杀真正的负载。 */
+function killJobTree(job, winPid) {
+  try { execFile('taskkill', ['/PID', String(winPid), '/T', '/F'], () => {}); } catch {}
+  if (job?.wslPidFile) {
+    try {
+      execFile('wsl.exe', ['-d', WSL_DISTRO(), '--exec', 'bash', '-c', `kill -KILL -$(cat ${job.wslPidFile}) 2>/dev/null; rm -f ${job.wslPidFile}`], { windowsHide: true }, () => {});
+    } catch {}
+  }
+}
 // quest 派发过的 pid：活跃 + 近 15 分钟内完结的。external-exit 检测到这些 pid 时跳过
 // （quest 已经直接通知过了，python-manager 的外部检测再报就是重复）。
 const questPids = new Map(); // pid -> expireAt
@@ -496,12 +527,35 @@ function dispatchJob(wsKey, node, body = {}) {
     }
     const jobId = `j-${++jobSeq}-${Date.now().toString(36)}`;
     const logTs = new Date().toISOString().replace(/[:.]/g, '-');
-    const logFile = path.join(dirOf(wsKey), 'logs', `${node.id}-${logTs}.log`);
-    const out = fs.openSync(logFile, 'a');
     const startedAt = Date.now();
-    // stdio 句柄直挂而非管道：quest 崩溃时管道会断裂、子进程 print 即 BrokenPipeError；
-    // 直挂 append 句柄则子进程继续写日志，重启后可再认领（见 adoptOrphan）。
-    const child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', out, out] });
+    const job = { child: null, timers: [], cancelledByHuman: null, killedByWatch: null, wslPidFile: null };
+    let child;
+    let logFile;
+    if (node.shell === 'wsl') {
+      // WSL 模式：日志写在 WSL 内部（Linux 原生，quest 死了也照写），quest 经 \\wsl$ 读同一份。
+      // setsid 起独立进程组 + pidfile 记组长 PID：杀=进程组 kill；quest 崩溃时负载成孤儿继续跑（再认领 WSL 版待做）。
+      const safe = wsKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-40);
+      const linuxLog = `/home/${WSL_USER()}/quest-logs/${safe}/${node.id}-${logTs}.log`;
+      job.wslPidFile = `/home/${WSL_USER()}/quest-logs/${safe}/${node.id}-${logTs}.pid`;
+      const dir = `/home/${WSL_USER()}/quest-logs/${safe}`;
+      const wrapped = [
+        `mkdir -p ${shq(dir)}`,
+        `cd ${shq(node.cwd || `/home/${WSL_USER()}`)} || { echo "cd 失败" >> ${shq(linuxLog)}; exit 111; }`,
+        `{ setsid bash -c ${shq(node.command)} > ${shq(linuxLog)} 2>&1 < /dev/null & echo $! > ${shq(job.wslPidFile)}; wait $!; }`,
+      ].join('; ');
+      logFile = wslUnc(linuxLog);
+      try {
+        fs.mkdirSync(wslUnc(dir), { recursive: true }); // UNC 建目录（经 9p 落到 WSL 内）
+        job.outFd = fs.openSync(logFile, 'a'); // 捕获 wsl.exe 自身的报错（Linux 侧输出走它自己的重定向）
+      } catch (e) { log('WSL 日志句柄降级为 ignore:', e?.message); }
+      child = spawn('wsl.exe', ['-d', WSL_DISTRO(), '--exec', 'bash', '-c', wrapped], { windowsHide: true, stdio: job.outFd ? ['ignore', job.outFd, job.outFd] : 'ignore' });
+    } else {
+      logFile = path.join(dirOf(wsKey), 'logs', `${node.id}-${logTs}.log`);
+      job.outFd = fs.openSync(logFile, 'a');
+      // stdio 句柄直挂而非管道：quest 崩溃时管道会断裂、子进程 print 即 BrokenPipeError；
+      // 直挂 append 句柄则子进程继续写日志，重启后可再认领（见 adoptOrphan）。
+      child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', out, out] });
+    }
     appendEvent(wsKey, { t: 'node.dispatched', node: node.id, jobId, pid: child.pid, logTs });
     // P4 进程树：同步 run 实例
     try {
@@ -527,7 +581,7 @@ function dispatchJob(wsKey, node, body = {}) {
     // 派发即返回：不等 job 结束（HTTP 客户端不该被 70 分钟的训练挂住；结果走账本/收件箱/推送）
     resolve({ ok: true, jobId });
 
-    const job = { child, timers: [], cancelledByHuman: null, killedByWatch: null };
+    job.child = child;
     activeJobs.set(`${wsKey}|${node.id}`, job);
     writeProgress(wsKey); // 派发即刷新：运行中节点立刻上墙
 
@@ -536,7 +590,7 @@ function dispatchJob(wsKey, node, body = {}) {
     let timedOut = false;
     job.timers.push(setTimeout(() => {
       timedOut = true;
-      try { execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => {}); } catch {}
+      killJobTree(job, child.pid);
     }, timeoutMs));
 
     // 日志封顶：句柄直挂后 quest 不在写入路径上，只做周期巡检——超 max_log_mb（默认 256MB）
@@ -556,11 +610,11 @@ function dispatchJob(wsKey, node, body = {}) {
 
     child.on('error', (err) => {
       job.timers.forEach(clearTimeout); job.timers.forEach(clearInterval); activeJobs.delete(`${wsKey}|${node.id}`);
-      try { fs.closeSync(out); } catch {}
+      if (job.outFd) { try { fs.closeSync(job.outFd); } catch {} }
       appendEvent(wsKey, { t: 'node.preflight-failed', node: node.id, error: `spawn 失败: ${err.message}` });
       resolve({ ok: false, error: err.message });
     });
-    child.on('exit', (code) => handleNodeExit(wsKey, node, { code, timedOut, logFile, startedAt, timeoutMs, job, out, pid: child.pid }));
+    child.on('exit', (code) => handleNodeExit(wsKey, node, { code, timedOut, logFile, startedAt, timeoutMs, job, out: job.outFd, pid: child.pid }));
   });
 }
 
@@ -780,7 +834,7 @@ async function adoptOrphan(wsKey, node, n) {
   // 超时护栏按原起点续算；已超时的立刻杀
   job.timers.push(setTimeout(() => {
     timedOut = true;
-    try { execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => {}); } catch {}
+    killJobTree(job, pid);
   }, Math.max(0, startedAt + timeoutMs - Date.now())));
   setupWatch(wsKey, node, job, logFile, pid);
   const iv = setInterval(() => {
@@ -1279,6 +1333,7 @@ const server = http.createServer(async (req, res) => {
         autoFix: b.autoFix === true, fixBudget: 2,
         handoff: String(b.handoff || '快速单发任务').slice(0, 2000),
         after: [], when: '', watchRules: [],
+        shell: b.shell === 'wsl' ? 'wsl' : 'windows',
       };
       const wsKey2 = wsKeyOf(b.cwd);
       const cls = runGateCfg.enabled === false ? { level: 'ok' } : classifyRunCommand(node.command, node.cwd);
@@ -1368,7 +1423,7 @@ const server = http.createServer(async (req, res) => {
       const job = activeJobs.get(`${wsKey}|${body.node}`);
       if (!job) return json(404, { ok: false, error: `节点 ${body.node} 不在运行` });
       job.cancelledByHuman = String(body.reason || '人工终止').slice(0, 200);
-      try { execFile('taskkill', ['/PID', String(job.child.pid), '/T', '/F'], () => {}); } catch {}
+      killJobTree(job, job.child.pid);
       return json(200, { ok: true, node: body.node, note: '已杀树，等待退出事件落账（cancelled 终态，不触发自动修复）' });
     }
     if (req.method === 'POST' && u.pathname === '/api/dispatch') {
@@ -1400,9 +1455,20 @@ const server = http.createServer(async (req, res) => {
       const state = buildState(wsKey);
       const n = state.nodes[node];
       if (!n?.logTs) return json(404, { error: '无日志' });
-      const dir = dirOf(wsKey);
-      const files = fs.readdirSync(path.join(dir, 'logs')).filter((f) => f.startsWith(`${node}-`)).sort();
-      const file = path.join(dir, 'logs', files[files.length - 1]);
+      const planN = state.plan ? parsePlan(state.plan).nodes.find((x) => x.id === node) : null;
+      let files = [];
+      let file = null;
+      if (planN?.shell === 'wsl') {
+        const safe = wsKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-40);
+        const wdir = wslUnc(`/home/${WSL_USER()}/quest-logs/${safe}`);
+        try { files = fs.readdirSync(wdir).filter((f) => f.startsWith(`${node}-`)).sort(); } catch {}
+        if (files.length) file = `${wdir}/${files[files.length - 1]}`;
+      } else {
+        const dir = dirOf(wsKey);
+        try { files = fs.readdirSync(path.join(dir, 'logs')).filter((f) => f.startsWith(`${node}-`)).sort(); } catch {}
+        if (files.length) file = path.join(dir, 'logs', files[files.length - 1]);
+      }
+      if (!file) return json(404, { error: '无日志' });
       const tail = Number(u.searchParams.get('tail')) || 4096;
       return json(200, { file, log: readTail(file, tail) });
     }
