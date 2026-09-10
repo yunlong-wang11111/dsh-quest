@@ -2,8 +2,10 @@
   'use strict';
   if (typeof window === 'undefined' || !window.__ModuleLoader__ || !window.__ModuleLoader__.load) return;
 
-  // dsh-quest 浏览器端薄壳（2026-09-10）：把 quest 的 HTTP 仪表盘嵌进 better-sidebar。
+  // dsh-quest 浏览器端薄壳（2026-09-10 v2）：把 quest 的 HTTP 仪表盘嵌进 better-sidebar。
   // 真正的 UI 全在 quest 服务（/dashboard）里——DSH 挂了仪表盘照常从浏览器开，这里只是便利层。
+  // v2 修复：v1 用 position:absolute+inset:0 铺满，在无定位祖先的容器里会盖住整个侧边栏（含标签栏），
+  // 用户被锁死无法切回其它标签。改为普通流式容器 + height:100%，撑不开时 iframe 退化为默认高度，无害。
   const PACKAGE_ID = 'dsh-quest';
   const QUEST_BASE = 'http://127.0.0.1:3110';
 
@@ -25,15 +27,15 @@
           const t = setInterval(probe, 15000);
           return () => clearInterval(t);
         }, []);
-        return React.createElement('div', { style: { position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minHeight: 0 } },
+        return React.createElement('div', { style: { width: '100%', height: '100%', minHeight: 320, display: 'flex', flexDirection: 'column', overflow: 'hidden' } },
           dead
-            ? React.createElement('div', { style: { padding: '8px 12px', fontSize: 12, opacity: 0.75, borderBottom: '1px solid rgba(128,128,128,.25)' } },
-                'quest 服务无响应（它是独立进程，不随 DSH 生死）。浏览器直开 ' + QUEST_BASE + '/dashboard 可确认。')
+            ? React.createElement('div', { style: { padding: '8px 12px', fontSize: 12, opacity: 0.75 } },
+                'quest 服务无响应（独立进程，不随 DSH 生死）。浏览器直开 ' + QUEST_BASE + '/dashboard 可确认。')
             : null,
           React.createElement('iframe', {
             src: QUEST_BASE + '/dashboard',
             title: 'quest 仪表盘',
-            style: { flex: 1, width: '100%', border: 'none', background: '#111418', minHeight: 0 },
+            style: { flex: 1, width: '100%', minHeight: 0, border: 'none', background: '#111418' },
           }));
       }
 
