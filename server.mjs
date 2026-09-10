@@ -1428,7 +1428,7 @@ setInterval(() => {
 }, 60 * 1000);
 
 const server = http.createServer(async (req, res) => {
-  const json = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(obj)); };
+  const json = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(obj)); };
   try {
     const u = new URL(req.url, 'http://localhost');
     // 仪表盘页面本体免头认证（页面自己管 token：URL 参数/localStorage/弹窗）——所有数据 API 仍需 token

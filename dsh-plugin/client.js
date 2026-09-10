@@ -7,7 +7,10 @@
   // v2 修复：v1 用 position:absolute+inset:0 铺满，在无定位祖先的容器里会盖住整个侧边栏（含标签栏），
   // 用户被锁死无法切回其它标签。改为普通流式容器 + height:100%，撑不开时 iframe 退化为默认高度，无害。
   const PACKAGE_ID = 'dsh-quest';
-  const QUEST_BASE = 'http://127.0.0.1:3110';
+  // 本地访问直连 3110；远程访问（经 3081/3082 进来的页面）走同主机的 3083 中继
+  const QUEST_BASE = (location.hostname === '127.0.0.1' || location.hostname === 'localhost')
+    ? 'http://127.0.0.1:3110'
+    : ('http://' + location.hostname + ':3083');
 
   window.__ModuleLoader__.load({
     id: PACKAGE_ID,
