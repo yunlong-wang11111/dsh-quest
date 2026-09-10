@@ -369,6 +369,17 @@ function findRunId(wsKey, nodeId) {
  * 异常终态 → 待办（按 plan 声明顺序——声明顺序即作者的重要性排序）。
  * 时间取账本事件时刻（完成那一刻服务写入的），不是文件 mtime，无需 AI 参与排序。
  */
+
+/** plan 节点 ∪ 账本独有节点：快速单发（quest_run）只进账本不写 plan.md 的 node 段，
+ *  status/progress 若只看 plan.md 会漏掉它们——2026-09-10 修复。 */
+function mergedPlanNodes(plan, state) {
+  const ids = new Set(plan.nodes.map((n) => n.id));
+  const extra = Object.keys(state.nodes || {})
+    .filter((id) => !ids.has(id) && state.nodes[id] && state.nodes[id].status)
+    .map((id) => ({ id, shell: 'windows', quiet: false, expectMinutes: 0 }));
+  return { meta: plan.meta, nodes: [...plan.nodes, ...extra] };
+}
+
 function nodeDisplayOrder(plan, state) {
   const order = plan.nodes.map((n, i) => ({ n, i, st: state.nodes[n.id] ?? {} }));
   const bucket = (st) => {
@@ -391,7 +402,7 @@ function writeProgress(wsKey) {
   try {
     const state = buildState(wsKey);
     if (!state.plan) return;
-    const plan = parsePlan(state.plan);
+    const plan = mergedPlanNodes(parsePlan(state.plan), state);
     const wsDir = plan.meta.workspace || '';
     if (!wsDir) return;
     const headers = { 0: '## ✅ 已完成', 1: '## ▶ 进行中', 2: '## ⚠️ 异常（失败/超时/终止）', 3: '## ⏳ 待办（按计划顺序）' };
@@ -1378,8 +1389,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && u.pathname === '/api/status') {
       const state = buildState(wsKey);
-      const plan = state.plan ? parsePlan(state.plan) : { nodes: [] };
-      // 展示排序与 progress.md 一致：已完成（时间倒序）→运行中→异常→待办（声明序）
+      const plan0 = state.plan ? parsePlan(state.plan) : { nodes: [] };
+      const plan = mergedPlanNodes(plan0, state); // 并入账本独有节点（快速单发）
+      // 展示排序与 progress.md 一致：已完成（时间正序）→运行中→异常→待办（声明序）
       const nodes = nodeDisplayOrder(plan, state).map(({ n }) => ({ id: n.id, ...(state.nodes[n.id] || { status: 'pending' }), quiet: n.quiet, expectMinutes: n.expectMinutes }));
       const unread = inbox.splice(0); // 取走即清
       writeProgress(wsKey); // 查询即刷新：progress.md 不再等下一个节点事件（排序/状态实时保鲜）
