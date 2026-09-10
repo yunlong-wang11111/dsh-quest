@@ -54,6 +54,12 @@ const QUEST_TOKEN = fs.readFileSync(TOKEN_PATH, 'utf8').trim();
 
 const log = (...a) => console.log(`[quest ${new Date().toISOString().slice(11, 19)}]`, ...a);
 
+// 2026-09-10 护栏：async executor 里的未捕获异常不会 reject Promise 而是变成 unhandledRejection，
+// Node 默认直接杀进程——一次派发 bug 不该带走整个服务（今天就这样静默死了两小时）。
+process.on('unhandledRejection', (e) => { log('unhandledRejection（已拦截，服务继续）:', String(e?.stack || e).slice(0, 300)); });
+process.on('uncaughtException', (e) => { log('uncaughtException（已拦截，服务继续）:', String(e?.stack || e).slice(0, 300)); });
+
+
 // ── 账本 ────────────────────────────────────────────────────────────────
 const wsKeyOf = (ws) => String(ws || '').replace(/\\/g, '/').replace(/\/+$/, '').replace(/[:/]/g, (c) => (c === ':' ? '' : '-'));
 
@@ -569,7 +575,7 @@ function dispatchJob(wsKey, node, body = {}) {
       job.outFd = fs.openSync(logFile, 'a');
       // stdio 句柄直挂而非管道：quest 崩溃时管道会断裂、子进程 print 即 BrokenPipeError；
       // 直挂 append 句柄则子进程继续写日志，重启后可再认领（见 adoptOrphan）。
-      child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', out, out] });
+      child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', job.outFd, job.outFd] });
     }
     appendEvent(wsKey, { t: 'node.dispatched', node: node.id, jobId, pid: child.pid, logTs });
     // P4 进程树：同步 run 实例
