@@ -15,7 +15,7 @@ import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { exportSessionArchive } from './session-export.mjs';
 import { completeText, workerViaBackend, fixerViaBackend, describeBackends } from './backends.mjs';
-import { sendText, sendImage, notifyKind } from './notify.mjs';
+import { sendText, sendImage, notifyKind, isRetryable } from './notify.mjs';
 import { offerResume, markResumed } from './resume.mjs';
 
 const QUEST_HOME = path.join(os.homedir(), '.dsh', 'quests');
@@ -1218,10 +1218,10 @@ function qqTag(wsKey) {
 // 现在：3 次指数退避重试 + 失败落盘队列（bridge 恢复后由 flushQQQueue 补发）。
 const QQ_QUEUE_FILE = path.join(HOMEOverride, 'qq-pending.json');
 async function qqPushDirect(message) {
-  // provider 无关：bridge / webhook / off（见 notify.mjs），默认关闭
+  // provider 无关：bridge / webhook / off（见 notify.mjs）；超长会按 notify.maxChars 截断
   const r = await sendText(CFG, message, { fs, timeoutMs: 8000 });
-  if (!r.ok && r.error !== 'off') log('通知发送失败:', r.error);
-  return r.ok;
+  if (!r.ok && r.error !== 'off') log('通知发送失败:', r.error, r.status ?? '');
+  return r;
 }
 function queueQQ(message) {
   try {
@@ -1234,10 +1234,17 @@ async function qqPush(wsKey, message) {
   if (notifyKind(CFG) === 'off') return;
   const full = `${qqTag(wsKey)}${message}`;
   for (let attempt = 1; attempt <= 3; attempt++) {
-    if (await qqPushDirect(full)) return;
-    if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 2000));
+    const r = await qqPushDirect(full);
+    if (r.ok) return;
+    // 4xx = 通知端明确拒绝（超长/未授权/策略拦截）：重试无益，记一笔就放弃
+    if (!isRetryable(r)) {
+      try { appendEvent(lastActiveWs, { t: 'qq.push-rejected', msg: String(r.error || '').slice(0, 80) }); } catch {}
+      log('通知被拒且不重试:', r.error);
+      return;
+    }
+    if (attempt < 3) await new Promise((res) => setTimeout(res, attempt * 2000));
   }
-  queueQQ(full); // 三次都失败：落盘，等 bridge 回来补发
+  queueQQ(full); // 三次网络类失败：落盘，等通知端恢复后补发
   log('qqPush 失败已入队（bridge 恢复后补发）');
   try { appendEvent(lastActiveWs, { t: 'qq.push-failed', msg: full.slice(0, 150) }); } catch {}
 }
@@ -1247,8 +1254,12 @@ setInterval(async () => {
   try { arr = JSON.parse(fs.readFileSync(QQ_QUEUE_FILE, 'utf8')); } catch { return; }
   if (!Array.isArray(arr) || !arr.length) return;
   const remain = [];
+  let dropped = 0;
   for (const item of arr) {
-    if (!(await qqPushDirect(item.message))) remain.push(item);
+    const r = await qqPushDirect(item.message);
+    if (r.ok) continue;
+    if (!isRetryable(r)) { dropped++; continue; } // 4xx：丢弃，别无限重试
+    remain.push(item);
   }
   try { fs.writeFileSync(QQ_QUEUE_FILE, JSON.stringify(remain, null, 1)); } catch {}
   if (remain.length < arr.length) log(`QQ 补发成功 ${arr.length - remain.length} 条，剩余 ${remain.length}`);
@@ -1730,10 +1741,12 @@ const server = http.createServer(async (req, res) => {
       const planN = state.plan ? parsePlan(state.plan).nodes.find((x) => x.id === node) : null;
       let files = [];
       let file = null;
+      // 注意：同目录还有同前缀的 .unit（单元名）/ .pid，只认 .log——否则排序后
+      // 会把 .unit 当成"最新文件"，读日志读到单元名（曾误导排查，以为 WSL 没抓到 stdout）
       if (planN?.shell === 'wsl') {
         const safe = wsKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-40);
         const wdir = wslUnc(`/home/${WSL_USER()}/quest-logs/${safe}`);
-        try { files = fs.readdirSync(wdir).filter((f) => f.startsWith(`${node}-`)).sort(); } catch {}
+        try { files = fs.readdirSync(wdir).filter((f) => f.startsWith(`${node}-`) && f.endsWith('.log')).sort(); } catch {}
         if (files.length) file = `${wdir}/${files[files.length - 1]}`;
       } else {
         const dir = dirOf(wsKey);

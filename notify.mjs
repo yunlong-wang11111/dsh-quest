@@ -5,6 +5,7 @@
 //
 //   notify: {
 //     kind: 'bridge' | 'webhook' | 'off',        // 缺省按 qqNotify 判定
+//     maxChars: 480,                             // 单条上限（超出截断）——通知端往往有硬限制
 //
 //     // kind='bridge'：任何实现了 POST /api/send/private 的通知端（例如 qq-bridge）
 //     bridgeUrl: 'http://127.0.0.1:3100',
@@ -29,6 +30,25 @@
 //   企业微信     POST https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>
 //              {"msgtype":"text","text":{"content":"{{message}}"}}
 
+/** 单条上限：通知端通常有硬限制（qq-bridge 默认 500 字，超了直接 400 拒绝）。 */
+export function maxCharsOf(cfg) {
+  const n = Number(cfg?.notify?.maxChars ?? cfg?.qqNotify?.maxChars);
+  // 默认给足：通知不花 token，通知端（如 qq-bridge）自身会按 IM 的硬上限拆条。
+  // 这里的截断只是防离谱超长（比如误把整份日志推进来）的兜底。
+  return Number.isFinite(n) && n > 0 ? n : 4000;
+}
+
+/** 超限截断（保留尾部信息量最大的说明不如保留头部：头部是任务线前缀+判定）。 */
+export function clampMessage(cfg, message) {
+  const max = maxCharsOf(cfg);
+  const s = String(message ?? '');
+  if (s.length <= max) return s;
+  // 头尾都留：头部是任务线前缀+判定，尾部往往是 worker 的结论（最该看到的部分）
+  const head = Math.floor((max - 14) * 0.6);
+  const tail = Math.max(1, max - 14 - head);
+  return s.slice(0, head) + '…（中段省略）…' + s.slice(-tail);
+}
+
 /**
  * 把消息填进模板。两种写法都接受：
  *   {"text":"{{message}}"}   占位符已带引号 → 填 JSON 内层转义（去外层引号）
@@ -41,7 +61,6 @@ export function renderBody(template, message) {
   const tpl = String(template);
   return tpl.split('{{message}}').map((chunk, i, arr) => {
     if (i === arr.length - 1) return chunk;
-    // 看占位符前一个非空字符是不是引号 → 决定用内层还是完整形式
     const before = chunk.replace(/\s+$/, '');
     const quoted = before.endsWith('"');
     return chunk + (quoted ? inner : escaped);
@@ -58,15 +77,23 @@ export function notifyKind(cfg) {
   return cfg?.qqNotify?.enabled ? 'bridge' : 'off';
 }
 
+/** 4xx（被拒）通常重试无益；网络错误与 5xx 才值得重试。 */
+export function isRetryable(result) {
+  if (result?.ok) return false;
+  if (result?.status == null) return true;          // 网络层错误
+  return result.status >= 500;                      // 5xx 可重试，4xx 不可
+}
+
 /**
- * 发一条文本通知。deps: { cfg, fs, signalMs }
- * @returns {Promise<{ok: boolean, error?: string}>}
+ * 发一条文本通知。deps: { fs, timeoutMs }
+ * @returns {Promise<{ok: boolean, status?: number, error?: string}>}
  */
 export async function sendText(cfg, message, deps) {
   const fsMod = deps.fs;
   const kind = notifyKind(cfg);
   if (kind === 'off') return { ok: false, error: 'off' };
 
+  const body = clampMessage(cfg, message);
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), Number(deps.timeoutMs) || 8000);
   try {
@@ -75,10 +102,10 @@ export async function sendText(cfg, message, deps) {
       const resp = await fetch(n.url, {
         method: n.method || 'POST',
         headers: n.headers || { 'content-type': 'application/json' },
-        body: renderBody(n.bodyTemplate || '{"text":{{message}}}', message),
+        body: renderBody(n.bodyTemplate || '{"text":{{message}}}', body),
         signal: ac.signal,
       });
-      return resp.ok ? { ok: true } : { ok: false, error: `HTTP ${resp.status}` };
+      return resp.ok ? { ok: true, status: resp.status } : { ok: false, status: resp.status, error: `HTTP ${resp.status}` };
     }
     // bridge 模式
     const q = cfg.qqNotify || {};
@@ -92,10 +119,10 @@ export async function sendText(cfg, message, deps) {
     const resp = await fetch(url.replace(/\/+$/, '') + '/api/send/private', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-console-token': token },
-      body: JSON.stringify({ userId, message }),
+      body: JSON.stringify({ userId, message: body }),
       signal: ac.signal,
     });
-    return resp.ok ? { ok: true } : { ok: false, error: `HTTP ${resp.status}` };
+    return resp.ok ? { ok: true, status: resp.status } : { ok: false, status: resp.status, error: `HTTP ${resp.status}` };
   } catch (e) {
     return { ok: false, error: String(e?.message || e).slice(0, 120) };
   } finally { clearTimeout(timer); }
@@ -123,7 +150,7 @@ export async function sendImage(cfg, imagePath, caption, deps) {
       body: JSON.stringify({ userId, imagePath, caption }),
       signal: ac.signal,
     });
-    return resp.ok ? { ok: true } : { ok: false, error: `HTTP ${resp.status}` };
+    return resp.ok ? { ok: true, status: resp.status } : { ok: false, status: resp.status, error: `HTTP ${resp.status}` };
   } catch (e) {
     return { ok: false, error: String(e?.message || e).slice(0, 120) };
   } finally { clearTimeout(timer); }
