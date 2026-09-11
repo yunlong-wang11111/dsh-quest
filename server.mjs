@@ -1613,6 +1613,10 @@ const server = http.createServer(async (req, res) => {
           entries.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
           return json(200, { path: p, entries });
         }
+        if (mode === 'stat') {
+          const st = fs.statSync(p);
+          return json(200, { stat: { size: st.size, mtimeMs: st.mtimeMs, dir: st.isDirectory(), file: st.isFile() } });
+        }
         if (mode === 'img') {
           const st = fs.statSync(p);
           if (st.size > 10 * 1024 * 1024) return json(413, { error: '图片超 10MB' });
