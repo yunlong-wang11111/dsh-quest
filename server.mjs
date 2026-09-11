@@ -284,7 +284,25 @@ function judge(node, exitCode, runSec, logFile) {
 }
 
 // ── 预检（语法错误拦截在运行前）────────────────────────────────────────
+/** 命令与 shell 车道不匹配时给出可操作的报错（替代含糊的 spawn ENOENT）。 */
+function shellMismatchHint(node) {
+  const first = String(node.command || '').trim().split(/\s+/)[0] || '';
+  const looksLikeLinuxPath = first.startsWith('/') && !first.startsWith('//');
+  const isWsl = node.shell === 'wsl';
+  if (looksLikeLinuxPath && !isWsl) {
+    return `命令用的是 Linux 路径（${first}），但该节点没有声明 WSL 车道。` +
+      '请二选一：① 加 shell: "wsl"（并在 plan/quest_run 里把 cwd 也写成 Linux 路径）；' +
+      '② 改用 Windows 路径的解释器（如 E:\\python_env\\pinn\\Scripts\\python.exe）。';
+  }
+  if (!looksLikeLinuxPath && isWsl && /^[A-Za-z]:[\\/]/.test(first)) {
+    return `节点声明了 WSL 车道，但解释器是 Windows 路径（${first}）。WSL 内应使用 Linux 路径（如 /home/<user>/envs/ml/bin/python）。`;
+  }
+  return null;
+}
+
 function preflight(node) {
+  const mism = shellMismatchHint(node);
+  if (mism) return Promise.resolve({ error: mism });
   const cmd = node.command;
   const pyFile = cmd.match(/\b([\w./\\:-]+\.py)\b/);
   if (!pyFile) return null; // 非 python 命令不预检

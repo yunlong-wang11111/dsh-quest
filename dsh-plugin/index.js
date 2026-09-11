@@ -104,6 +104,7 @@ function apply(ctx, config = {}) {
       expect_minutes: { type: 'string', description: '预计时长（分钟，超时=2倍）' },
       handoff: { type: 'string', description: '交接上下文：这个任务做什么、看什么指标、异常特征' },
       auto_fix: { type: 'string', description: '"true" = 失败后自动修复（默认关）' },
+      shell: { type: 'string', description: '"wsl" = 在 WSL(Ubuntu) 里执行（bash 语法 + Linux 路径的 cwd）；缺省 windows' },
       ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
     },
     output: {
@@ -118,6 +119,7 @@ function apply(ctx, config = {}) {
         title: String(args.title || args.command || 'quick'), expectMinutes: Number(args.expect_minutes) || 30,
         reason: String(args.reason || ''),
         handoff: String(args.handoff || ''), autoFix: args.auto_fix === 'true' || args.auto_fix === true,
+        shell: args.shell === 'wsl' ? 'wsl' : 'windows',
       }),
     }, 8000),
   }));
