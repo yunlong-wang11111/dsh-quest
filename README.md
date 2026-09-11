@@ -1,17 +1,39 @@
 # dsh-quest
 
-> 科研实验的任务线调度台 —— 让 AI 对话只负责"立项与验收"，长任务交给独立后台服务，结果自动推送 QQ。
-> A pipeline orchestrator for research experiments on DeepSeek Harness (DSH): dispatch long-running tasks to an independent background service, get judged results and AI-written summaries pushed to QQ — while your main conversation stays clean.
+> 科研实验的任务线调度台 —— 让 AI 只负责"立项与验收"，长任务交给独立后台服务，结果自动推送 IM。
+> An agent-agnostic pipeline orchestrator for research experiments: dispatch long-running tasks to an independent background service, get judged results and AI-written summaries pushed to your phone — while the agent conversation stays clean.
 
 ## 为什么做这个 / Why
 
-在 DSH（或任何 AI 对话客户端）里跑长实验有三个老毛病：
+在 AI 对话客户端里跑长实验有三个老毛病：
 
 1. **通知污染**：任务完成通知直接注入主对话（followup 模式），主对话越喂越大——一个 1049 轮的会话每轮要吃 44 万 token 上下文；
 2. **轮询风暴**：插件轮询进程表/会话文件做检测，拖垮宿主（我们在生产环境实测过 63% CPU 被 GC 吃掉的案例）；
 3. **单终端排队**：多个实验挤一个共享终端，互相阻塞。
 
 dsh-quest 用一套**事件驱动**架构解决：进程退出由操作系统事件感知（零轮询），AI 总结由**一次性 worker 会话**完成（用完归档，主对话零增长），失败由**带预算的 fixer 会话**自动修复（改前 .bak 备份 + 客观 diff 上报）。
+
+### 为什么不是用 agent 自带的后台就够了 / Why not just the agent's own background jobs
+
+Claude Code、Codex、ZCode 这类 agent 都自带后台执行（`run_in_background`、Bash 后台、Task 子代理）。**跑个命令过会儿回来看**这件事它们确实能办——但那个后台是**会话的私有财产**：
+
+| 维度 | agent 自带后台 | quest |
+|---|---|---|
+| **活多久** | 会话/CLI 结束即消失（或成无人管的孤儿进程） | 独立服务，**跨会话、跨 agent、跨进程重启**都在 |
+| **谁看护** | 没人——要模型自己 Sleep 轮询（假死根源） | 服务自己判：超时杀、失败修、跑完通知 |
+| **状态在哪** | 内存，会话一关就蒸发 | 账本 + plan.md + progress.md，全部落盘 |
+| **换 agent 之后** | 断片：Claude Code 的任务，Codex 完全不知道 | 同一份任务线，谁接手都看得见（见下文 MCP） |
+| **无人时** | 无任何机制 | 过夜跑、崩溃自愈、结果推手机 |
+| **判定与编排** | 无（靠模型现场判断） | 关键词/产物判定、条件分支 `when:`、带预算自动修复、断点续跑 |
+
+一句话分工：
+
+```
+活着的会话里、分钟级、人在旁边  →  agent 自带的后台就够了（更轻）
+跨会话 / 跨 agent / 过夜 / 人不在场  →  quest（账本 + 看护 + 通知）
+```
+
+换个说法：**agent 的后台是"内存里的待办"，quest 是"磁盘上的任务线"**——前者属于某一次对话，后者属于你的工作区。这也是它能被不同 agent 轮流驱动而状态连续的原因。
 
 ## 架构 / Architecture
 
@@ -35,9 +57,10 @@ dsh-quest 用一套**事件驱动**架构解决：进程退出由操作系统事
 - **五级判定**：`ok`（完成关键词/产物新鲜度）、`crashed`、`startup-failed`、`timeout`、`suspect`——纯代码判定，零 token
 - **DAG 依赖链**：节点声明 `after:` 上游，成功自动流转、失败自动冻结下游；重派上游自动解冻下游
 - **预检**：派发前 `py_compile` 拦截语法错误（编译器报错原文直推 QQ）
-- **worker 一次性会话**：任务结束 → 独立小会话读[交接上下文+日志尾]写 ≤10 行总结 → 归档。主对话零增长
-- **auto_fix 自动修复**（可选，节点级开关）：失败 → fixer 会话做**机械性最小修复**（显存调 batch / NaN 调 lr / 路径环境；**绝不碰实验逻辑**）→ `.bak` 备份 → py_compile 验证 → 自动重派。预算烧尽或判断需人工（FIX_GIVEUP）则停手告警。修复后服务端做**客观逐行 diff** 上报 QQ（不信任自述）
-- **QQ 推送**：经 bridge console 直发（纯 HTTP，不经过任何对话）；任务线收尾自动推总览
+- **worker 总结**：任务结束 → 独立一次性会话读[交接上下文+日志尾]写 ≤10 行总结 → 归档。主对话零增长。**后端可插拔（v0.5）**：DSH 会话 / OpenAI 兼容 API / headless CLI / 关闭（纯机械模式）
+- **auto_fix 自动修复**（可选，节点级开关）：失败 → fixer 做**机械性最小修复**（显存调 batch / NaN 调 lr / 路径环境；**绝不碰实验逻辑**）→ `.bak` 备份 → 语法验证 → 自动重派。预算烧尽或判断需人工（FIX_GIVEUP）则停手告警。修复后服务端做**客观逐行 diff** 上报 QQ（不信任自述）。后端同样可插拔
+- **跨 agent（MCP）**：8 个工具以标准 MCP 暴露，Claude Code / Codex / ZCode / Cursor 等可直接调用；quest 本体零模型依赖——执行、判定、指标、超时、重试、通知全程不需要 AI
+- **QQ 推送**：经 bridge console 直发（纯 HTTP，不经过任何对话）；任务线收尾自动推总览；推送带重试+落盘队列，失败不静默丢失
 - **外部进程接入**：手动启动的 python 进程（≥5 分钟）退出后由检测端转交同一管线
 - **崩溃韧性**：账本追加式 + 状态可重建；quest 自带守护循环重启脚本
 
