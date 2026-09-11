@@ -129,7 +129,26 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 
 **环境变量**：`QUEST_URL`（默认 `http://127.0.0.1:3110`）、`QUEST_TOKEN`（缺省读 `<QUEST_HOME>/.token`）、`QUEST_HOME`（默认 `~/.dsh/quests`）。
 
-> **绑定关系说明**：`worker`（子会话总结）与 `fixer`（自动修复）目前需要 DSH 提供会话能力；如果你的 agent 不是 DSH，把 `quest-config.json` 里的 `workersEnabled` 设为 `false` 即可退化为**纯机械模式**——判定、指标提取、超时、重试、通知全部照常，只是没有 AI 写的总结。执行与被编排的能力完全不受影响。
+> **绑定关系说明**：quest 的执行/判定/监控/通知**完全不依赖任何 agent**（零模型参与）。只有两件事需要模型——任务结束后的**总结**与失败后的**自动修复**——这两件事在 v0.5 起做成可插拔后端：
+
+```jsonc
+// quest-config.json
+{
+  "workerBackend": "dsh",       // dsh（默认）| openai | cli | off
+  "fixerBackend": "dsh",        // dsh（默认）| cli | off
+  "summarizer": { "baseUrl": "https://api.deepseek.com/v1", "apiKey": "", "model": "deepseek-chat" },
+  "fixer": { "command": "claude -p" }
+}
+```
+
+| 后端 | 总结（worker） | 修复（fixer） | 说明 |
+|---|---|---|---|
+| `dsh` | ✅ | ✅ | 开 DSH 子会话（默认，与 v0.4 行为一致） |
+| `openai` | ✅ | — | 任意 OpenAI 兼容 chat completions（官方 API / 兼容服务） |
+| `cli` | ✅ | ✅ | 调命令行 headless agent（`claude -p`、`codex exec -`…） |
+| `off` | — | — | **纯机械模式**：判定、指标提取、超时、重试、通知照常，只是没有 AI 写的总结 |
+
+实测（机械模式）：`python mech_test.py` → `completed | ok | finish-keyword`，loss 指标 `1.5 → 1.05` 自动提取——**全程零模型调用**。
 
 ## v0.4 新增
 

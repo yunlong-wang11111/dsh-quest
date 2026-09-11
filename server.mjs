@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // quest 服务 —— 任务线编排核心（P1：账本+作业执行+预检+判定器；P2：worker 子会话；P3：QQ 推送）
 //
-// 设计取舍见 DESIGN.md
+// 设计文档：__HOME__\dsh-plugins\QUEST_DESIGN.md
 // 数据目录：~/.dsh/quests/<wsKey>/（plan.md + ledger.jsonl + logs/ + state.json）
 // 端口：默认 3110，仅绑定 127.0.0.1；token 首启生成于 ~/.dsh/quests/.token
 //
@@ -14,6 +14,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { exportSessionArchive } from './session-export.mjs';
+import { completeText, workerViaBackend, fixerViaBackend, describeBackends } from './backends.mjs';
 
 const QUEST_HOME = path.join(os.homedir(), '.dsh', 'quests');
 
@@ -34,15 +35,15 @@ if (!fs.existsSync(CONFIG_PATH)) {
     // worker 会话目标：生产=http://127.0.0.1:3080（token 从 dsh-run.log 解析）
     // 沙盒=http://127.0.0.1:3090 + tokenLog 指向沙盒日志
     dshBaseUrl: 'http://127.0.0.1:3090',
-    dshTokenLog: '', // DSH 运行日志路径（用于解析 token）；留空则用 dshToken
+    dshTokenLog: '__HOME__/.dsh-test/sandbox-run3.log',
     dshToken: '',
     workerPreset: 'quest-worker',
     fixerPreset: 'quest-fixer',
     qqNotify: {
       enabled: false,
       bridgeUrl: 'http://127.0.0.1:3100',
-      tokenFile: '', // 通知端的控制台令牌文件路径
-      userId: 0, // 接收通知的账号 id
+      tokenFile: '__HOME__/qq-bridge/state/console-token',
+      userId: 0,
     },
   }, null, 2));
 }
@@ -997,6 +998,9 @@ async function adoptOrphan(wsKey, node, n) {
  * 纪律写死：只做机械性最小修复（显存/参数/路径/环境），改前先 .bak，不碰实验逻辑。
  */
 async function runFixer(wsKey, node, j, diagnosis) {
+  // 可插拔后端（v0.5）：非 dsh 时由 backends.mjs 处理（cli / off）
+  const _fAlt = await fixerViaBackend(wsKey, node, j, diagnosis, { cfg: CFG, completeText, readTail, log, qqPush, appendEvent, buildState, parsePlan, dispatchJob });
+  if (_fAlt) return;
   const state = buildState(wsKey);
   const st = state.nodes[node.id] ?? {};
   const attempt = (st.fixCount ?? 0) + 1;
@@ -1303,6 +1307,9 @@ async function getClient() {
 
 /** 一次性 worker：建会话 → 开工交接 →（判定后）总结 → 归档。返回总结文本。 */
 async function runWorker(wsKey, node, j, runSec) {
+  // 可插拔后端（v0.5）：非 dsh 时由 backends.mjs 处理（openai / cli / off）
+  const _wAlt = await workerViaBackend(wsKey, node, j, runSec, { cfg: CFG, completeText, readTail, formatDur, log });
+  if (_wAlt !== null) return _wAlt;
   const api = await getClient();
   const { createTurnCollector } = await import('./lib/dsh-client-v2.mjs');
   if (activeWorkers.size >= 2) return '（worker 并发上限，跳过总结）';
@@ -1808,6 +1815,7 @@ const readBody = (req) => new Promise((resolve, reject) => {
 server.listen(CFG.port || 3110, '127.0.0.1', () => {
   log(`quest 服务就绪 http://127.0.0.1:${CFG.port || 3110}（token: ${QUEST_TOKEN.slice(0, 6)}…）`);
   log(`worker 目标: ${CFG.dshBaseUrl}${CFG.workersEnabled === false ? '（worker 已禁用）' : ''}`);
+  try { const _b = describeBackends(CFG); log(`后端: worker=${_b.workerBackend} fixer=${_b.fixerBackend}${_b.notes.length ? ' · ' + _b.notes.join('；') : ''}`); } catch {}
   // 启动对账（2026-09-09 改版）：running 节点 = quest 重启前的活作业。
   // 句柄直挂后子进程不再随 quest 死亡：PID 存活（且命令行指纹匹配）→ 再认领接管；
   // 已消失 → 按产物/关键词证据落终态。两者都比"一律标 cancelled"保数据。
