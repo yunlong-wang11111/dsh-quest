@@ -238,6 +238,10 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 - 目前仅 Windows（taskkill 树杀、cmd /c 包装）；Linux/macOS 需替换进程管理部分
 - 经 `cmd /c` 派发的命令若含双引号段（嵌套引号、`$var`）会被 Windows 引号规则剥掉——命令请写成朴素形式（`python 脚本.py 参数`），复杂逻辑放进脚本文件
 
+## 上架 / Listing
+
+本仓库可作为一个 DSH 插件收录到社区目录（awesome-dsh-plugin）：投稿材料、要求对照与已知限制见 [docs/market-submission.md](docs/market-submission.md)。
+
 ## QQ 命令（搭配 qq-bridge 类通知端）
 
 > 这些命令由**通知端**实现（读 quest 的 HTTP API：零 token、不经过模型）；quest 本身只提供端点。下表是参考实现，通知端可自行增删。
