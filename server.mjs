@@ -186,6 +186,8 @@ function buildState(wsKey) {
       if (e.t === 'node.ready') { n.status = 'ready'; }
       if (e.t === 'node.unfrozen') { n.status = 'pending'; n.verdict = undefined; n.via = undefined; n.detail = undefined; }
       if (e.t === 'node.resumed') { n.resumeCount = (n.resumeCount ?? 0) + 1; }
+      if (e.t === 'node.interrupted') n.interrupted = true;        // 幂等：已提示过就不再提示
+      if (e.t === 'node.dispatched') n.interrupted = false;         // 重派后重新允许提示
       if (e.t === 'node.cancelled') { n.status = 'cancelled'; n.verdict = 'cancelled'; n.detail = e.reason; }
       if (e.t === 'node.skipped') { n.status = 'skipped'; n.detail = e.reason; }
       if (e.t === 'node.metrics') { n.metrics = e.metrics; }
@@ -923,6 +925,7 @@ async function adoptOrphan(wsKey, node, n) {
       if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
       const j = judge(node, 0, runSec, logFile);
       j.via = `${j.via}（quest 重启期间 WSL 进程已消失，按产物/关键词判定）`;
+      try { await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log }); } catch (e) { log('续跑检测失败:', e?.message); }
       appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
       await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
       return;
@@ -968,7 +971,7 @@ async function adoptOrphan(wsKey, node, n) {
     if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
     const j = judge(node, 0, runSec, logFile);
     j.via = `${j.via}（quest 重启期间进程已消失，按产物/关键词判定）`;
-    try { await offerResume(wsKey, node, j, n.resumeCount, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log }); } catch (e) { log('续跑检测失败:', e?.message); }
+    try { await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log }); } catch (e) { log('续跑检测失败:', e?.message); }
     appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
     await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
     return;

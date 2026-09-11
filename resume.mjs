@@ -27,8 +27,9 @@ function checkpointOf(node, deps) {
  * 返回 true 表示"已登记为可续跑并推送了提示"。
  * deps: { cfg, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log }
  */
-export async function offerResume(wsKey, node, j, resumeCount, deps) {
+export async function offerResume(wsKey, node, j, resumeCount, alreadyOffered, deps) {
   if (!node?.resumeOnBoot) return false;
+  if (alreadyOffered) return false; // 幂等：本次中断已经提示过（防止每次重启都轰炸）
   // 只有"关键词/声明判据确认完成"才算真完成；artifact-fresh / suspect 都可能是
   // "被杀前刚写了存档"——那正是断电中断的典型样子（实测：杀掉的任务因刚写过 .ckpt 被判 ok）。
   const strongOk = String(j.via || '').includes('finish-keyword') || String(j.via || '').includes('declared');
