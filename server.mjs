@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { exportSessionArchive } from './session-export.mjs';
 import { completeText, workerViaBackend, fixerViaBackend, describeBackends } from './backends.mjs';
+import { offerResume, markResumed } from './resume.mjs';
 
 const QUEST_HOME = path.join(os.homedir(), '.dsh', 'quests');
 
@@ -83,13 +84,13 @@ function parsePlan(markdown) {
     const m = line.match(/^---node:\s*(\S+)---\s*$/);
     if (m) {
       if (cur) nodes.push(cur);
-      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2, shell: '' };
+      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2, shell: '', resumeOnBoot: undefined };
       handoffMode = false;
       continue;
     }
     if (!cur) {
       const kv = line.match(/^([a-zA-Z_]+):\s*(.*)$/);
-      if (kv && ['workspace', 'title', 'shell'].includes(kv[1])) meta[kv[1]] = kv[2].trim();
+      if (kv && ['workspace', 'title', 'shell', 'resume_on_boot'].includes(kv[1])) meta[kv[1]] = kv[2].trim();
       // 没写 title: 时，取第一个 Markdown 一级标题当标题（模板惯例是 "# 任务线：<名字>"）
       const h = line.match(/^#\s+(.+)$/);
       if (h && !meta.heading) meta.heading = h[1].replace(/^\s*任务线[：:]\s*/, '').trim().slice(0, 40);
@@ -117,6 +118,7 @@ function parsePlan(markdown) {
       case 'max_log_mb': cur.maxLogMB = Number(v) || 0; break; // 0 = 默认 256MB
       case 'push_images': cur.pushImages = Number(v) || 0; break; // 成功后直推 QQ 的图片数上限，0 = 关
       case 'shell': cur.shell = v.trim().toLowerCase() === 'wsl' ? 'wsl' : 'windows'; break;
+      case 'resume_on_boot': cur.resumeOnBoot = v.trim() === 'true'; break; // 开机中断后允许一键续跑（默认关）
       case 'no_checkpoint': cur.noCheckpoint = v.trim() === 'true'; break; // 显式声明不需要断点（屏蔽第一二层提醒） // wsl = 在 WSL(Ubuntu) 里跑（bash 语法，Linux 路径）
       case 'when': cur.when = v.trim(); break;
       case 'watch_log': cur.watchLog = v.trim(); break;
@@ -142,6 +144,7 @@ function parsePlan(markdown) {
   meta.title = meta.title || meta.heading || '';
   // shell 解析优先级：节点级 > plan 级（meta）> windows。plan 头写一次 shell: wsl = 整条任务线默认进 WSL。
   for (const n of nodes) n.shell = n.shell === 'wsl' ? 'wsl' : (meta.shell === 'wsl' ? 'wsl' : 'windows');
+  for (const n of nodes) if (n.resumeOnBoot === undefined) n.resumeOnBoot = meta.resume_on_boot === 'true';
   for (const n of nodes) {
     if (!n.command) errors.push(`节点 ${n.id} 缺 command`);
     if (!n.cwd) n.cwd = meta.workspace || '';
@@ -182,6 +185,7 @@ function buildState(wsKey) {
       if (e.t === 'node.frozen') { n.status = 'frozen'; n.detail = e.reason; }
       if (e.t === 'node.ready') { n.status = 'ready'; }
       if (e.t === 'node.unfrozen') { n.status = 'pending'; n.verdict = undefined; n.via = undefined; n.detail = undefined; }
+      if (e.t === 'node.resumed') { n.resumeCount = (n.resumeCount ?? 0) + 1; }
       if (e.t === 'node.cancelled') { n.status = 'cancelled'; n.verdict = 'cancelled'; n.detail = e.reason; }
       if (e.t === 'node.skipped') { n.status = 'skipped'; n.detail = e.reason; }
       if (e.t === 'node.metrics') { n.metrics = e.metrics; }
@@ -964,6 +968,7 @@ async function adoptOrphan(wsKey, node, n) {
     if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
     const j = judge(node, 0, runSec, logFile);
     j.via = `${j.via}（quest 重启期间进程已消失，按产物/关键词判定）`;
+    try { await offerResume(wsKey, node, j, n.resumeCount, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log }); } catch (e) { log('续跑检测失败:', e?.message); }
     appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
     await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
     return;
@@ -1674,6 +1679,28 @@ const server = http.createServer(async (req, res) => {
       }
       appendEvent(wsKey, { t: 'flip.done', archived: results.archived.length, created: results.created });
       return json(200, { ok: results.errors.length === 0, ...results });
+    }
+    // v0.5 一键续跑：重派被中断的节点（dispatchJob 会自动注入 QUEST_RESUME_FROM 断点）
+    if (req.method === 'POST' && u.pathname === '/api/resume') {
+      const b = await readBody(req);
+      const state = buildState(wsKey);
+      const plan = state.plan ? parsePlan(state.plan) : null;
+      if (!plan) return json(404, { ok: false, error: '该工作区没有 plan.md' });
+      const targets = b.node
+        ? plan.nodes.filter((x) => x.id === b.node)
+        : plan.nodes.filter((x) => state.nodes[x.id]?.status === 'failed' && plan.nodes.find((y) => y.id === x.id)?.resumeOnBoot);
+      if (!targets.length) return json(404, { ok: false, error: '没有可续跑的节点（需 resume_on_boot: true 且当前为失败态）' });
+      const done = [];
+      for (const node of targets) {
+        try {
+          markResumed(wsKey, node.id, appendEvent);
+          appendEvent(wsKey, { t: 'node.unfrozen', node: node.id });
+          dispatchJob(wsKey, node).catch(() => {});
+          done.push(node.id);
+        } catch (e) { log('续跑失败:', node.id, e?.message); }
+      }
+      appendEvent(wsKey, { t: 'resume.dispatched', nodes: done });
+      return json(200, { ok: true, resumed: done });
     }
     // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
     if (req.method === 'POST' && u.pathname === '/api/cancel') {
