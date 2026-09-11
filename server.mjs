@@ -1012,7 +1012,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
   const { createTurnCollector } = await import('./lib/dsh-client-v2.mjs');
   let sessionId = null;
   try {
-    const created = await api.sessions.create({ cwd: node.cwd || os.homedir(), agentPreset: CFG.fixerPreset || 'quest-fixer' });
+    const created = await api2.sessions.create({ cwd: node.cwd || os.homedir(), agentPreset: CFG.fixerPreset || 'quest-fixer' });
     if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 120));
     sessionId = created.result.value.sessionId;
     activeWorkers.add(sessionId);
@@ -1027,7 +1027,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
     })();
     const script = String(node.command || '').match(/\b([\w.\-]+\.py)\b/)?.[1] || '';
 
-    await api.sessions.prompt({
+    await api2.sessions.prompt({
       sessionId, mode: 'queue',
       content: [{ type: 'text', text: `【自动修复任务】节点 ${node.id} 第 ${attempt}/${node.fixBudget ?? 2} 次尝试失败，请你做最小修复。
 
@@ -1093,7 +1093,7 @@ ${diff}` : ''}`.slice(0, 900)).catch(() => {});
     if (sessionId) {
       activeWorkers.delete(sessionId);
       workerCollectors.delete(sessionId);
-      try { await api.workspace.archiveSession({ sessionId }); } catch {}
+      try { await api2.workspace.archiveSession({ sessionId }); } catch {}
     }
   }
 }
@@ -1601,9 +1601,11 @@ const server = http.createServer(async (req, res) => {
           results.exported = await exportSessionArchive(b.ws, wsItems, wsKeyOf);
         }
       } catch (e) { results.errors.push('export: ' + e.message); }
+      // 0.5) 重建 API 连接（导出大文件耗时，旧连接可能已断——0.1.5 实测踩过）
+      const api2 = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
       // 1) 归档旧会话（该工作区下所有会话）
       try {
-        const lr = await api.sessions.list({});
+        const lr = await api2.sessions.list({});
         if (lr.result.ok) {
           for (const item of lr.result.value?.items ?? []) {
             if (String(item.cwd ?? '').replace(/\\/g, '/') === String(b.ws ?? '').replace(/\\/g, '/')) {
