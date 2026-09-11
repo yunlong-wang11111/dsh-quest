@@ -85,6 +85,45 @@ node server.mjs          # 端口 3110；token 自动生成于 ~/.dsh/quests/.to
 # 5. 在 DSH 对话里说："用 quest 建任务线跑 xxx，然后派发"
 ```
 
+## 通知出口（可选，provider 无关） / Notification sink
+
+**quest 不依赖任何 IM 桥**：它对外只有"发通知"这一个 HTTP 调用，**默认关闭**（`notify.kind` 缺省即 off），失败也绝不影响任务流转。
+
+```jsonc
+// quest-config.json
+{
+  "notify": {
+    "kind": "off"            // 默认：不通知，查仪表盘或 API
+    // "kind": "bridge"      // 任何实现了 POST /api/send/private 的通知端
+    // "kind": "webhook"     // 任何 HTTP 端点（Telegram / 钉钉 / 飞书 / 企业微信 / 自建）
+  }
+}
+```
+
+<details><summary><b>webhook 模式：常见服务商模板</b></summary>
+
+```jsonc
+{
+  "notify": {
+    "kind": "webhook",
+    "url": "https://api.telegram.org/bot<BOT_TOKEN>/sendMessage",
+    "bodyTemplate": "{\"chat_id\":\"<CHAT_ID>\",\"text\":\"{{message}}\"}"
+  }
+}
+```
+
+| 服务 | url | bodyTemplate |
+|---|---|---|
+| Telegram | `https://api.telegram.org/bot<BOT_TOKEN>/sendMessage` | `{"chat_id":"<CHAT_ID>","text":"{{message}}"}` |
+| 钉钉机器人 | `https://oapi.dingtalk.com/robot/send?access_token=<TOKEN>` | `{"msgtype":"text","text":{"content":"{{message}}"}}` |
+| 飞书机器人 | `https://open.feishu.cn/open-apis/bot/v2/hook/<TOKEN>` | `{"msg_type":"text","content":{"text":"{{message}}"}}` |
+| 企业微信 | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>` | `{"msgtype":"text","text":{"content":"{{message}}"}}` |
+
+`{{message}}` 两种写法都支持：**带引号**（`"{{message}}"`，填 JSON 内层转义）或**裸放**（`{{message}}`，填完整 JSON 串）。照服务商文档抄哪种都对。消息里的引号、换行、反斜杠都会正确转义。
+
+</details>
+
+> **图片产物直推**目前只在 `bridge` 模式可用（webhook 模式会明确提示不支持，而不是静默丢弃）。
 ## 让它常驻（监督器） / Keep it running
 
 **quest 是一个服务，而服务无法监督自己**——进程死了就没人再判定、通知、认领。任务侧的崩溃存活（句柄直挂 / systemd 认养 / 重启后按账本认领）是 quest 自己的机制，不需要外部帮忙；但 quest 进程本身必须由外部拉起来。

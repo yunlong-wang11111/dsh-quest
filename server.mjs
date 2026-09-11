@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { exportSessionArchive } from './session-export.mjs';
 import { completeText, workerViaBackend, fixerViaBackend, describeBackends } from './backends.mjs';
+import { sendText, sendImage, notifyKind } from './notify.mjs';
 import { offerResume, markResumed } from './resume.mjs';
 
 const QUEST_HOME = path.join(os.homedir(), '.dsh', 'quests');
@@ -761,7 +762,7 @@ function handleNodeExit(wsKey, node, ctx) {
   if (job.cancelledByHuman) {
     appendEvent(wsKey, { t: 'node.cancelled', node: node.id, reason: job.cancelledByHuman });
     pushInbox({ node: node.id, verdict: 'cancelled' });
-    if (!node.quiet && CFG.qqNotify?.enabled) qqPush(wsKey, `[🛑 人工终止] ${node.id} · 已跑 ${formatDur(runSec)}\n原因：${job.cancelledByHuman}\n（不触发自动修复）`.slice(0, 400)).catch(() => {});
+    if (!node.quiet && notifyKind(CFG) !== 'off') qqPush(wsKey, `[🛑 人工终止] ${node.id} · 已跑 ${formatDur(runSec)}\n原因：${job.cancelledByHuman}\n（不触发自动修复）`.slice(0, 400)).catch(() => {});
     orchestrate(wsKey).catch(() => {});
     return;
   }
@@ -794,7 +795,7 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   const ok = j.verdict === 'ok';
   try { appendEvent(wsKey, { t: ok ? 'node.completed' : 'node.failed', node: node.id, verdict: j.verdict }); } catch (e) { log('落账本失败:', e?.message); }
   try { pushInbox({ node: node.id, verdict: j.verdict, summary }); } catch {}
-  if (!node.quiet && !node.__suppressFinishPush && CFG.qqNotify?.enabled) {
+  if (!node.quiet && !node.__suppressFinishPush && notifyKind(CFG) !== 'off') {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
     qqPush(wsKey, `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || (j.error || j.via || '')}`.slice(0, 600)).catch((e) => log('qqPush 异常:', e?.message));
   }
@@ -1084,7 +1085,7 @@ ${logTail}
     const giveup = /FIX_GIVEUP/i.test(reply.slice(-200));
     const okFix = /FIX_OK/i.test(reply.slice(-200));
     appendEvent(wsKey, { t: 'fix.reported', node: node.id, changes: reply.slice(0, 600), diff: diff || '(无文件改动)' });
-    if (!node.quiet && CFG.qqNotify?.enabled) {
+    if (!node.quiet && notifyKind(CFG) !== 'off') {
       qqPush(wsKey, `[🔧 自动修复 ${giveup ? '放弃' : okFix ? '完成' : '未知'}] ${node.id} 第${attempt}次
 ${reply.slice(0, 250)}${diff ? `
 ── 实际改动 ──
@@ -1193,7 +1194,7 @@ async function orchestrate(wsKey) {
         log('research-state.md 已追加:', stateFile);
       }
     } catch (e) { log('research-state 追加失败:', e?.message); }
-    if (CFG.qqNotify?.enabled) {
+    if (notifyKind(CFG) !== 'off') {
       qqPush(wsKey, `[🏁 任务线结束] ${plan.nodes.length} 段：${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(' / ')}${parts.length ? '\n' + parts.join('\n') : '\n全绿 ✅'}`.slice(0, 500)).catch(() => {});
     }
     pushInbox({ node: '(line)', verdict: 'concluded', summary: JSON.stringify(counts) });
@@ -1217,23 +1218,10 @@ function qqTag(wsKey) {
 // 现在：3 次指数退避重试 + 失败落盘队列（bridge 恢复后由 flushQQQueue 补发）。
 const QQ_QUEUE_FILE = path.join(HOMEOverride, 'qq-pending.json');
 async function qqPushDirect(message) {
-  const q = CFG.qqNotify;
-  if (!q?.enabled) return false;
-  let token = '';
-  try { token = fs.readFileSync(q.tokenFile, 'utf8').trim(); } catch { return false; }
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), 8000);
-  try {
-    const resp = await fetch(`${q.bridgeUrl}/api/send/private`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-console-token': token },
-      body: JSON.stringify({ userId: q.userId, message }),
-      signal: ac.signal,
-    });
-    return resp.ok;
-  } catch {
-    return false;
-  } finally { clearTimeout(t); }
+  // provider 无关：bridge / webhook / off（见 notify.mjs），默认关闭
+  const r = await sendText(CFG, message, { fs, timeoutMs: 8000 });
+  if (!r.ok && r.error !== 'off') log('通知发送失败:', r.error);
+  return r.ok;
 }
 function queueQQ(message) {
   try {
@@ -1243,6 +1231,7 @@ function queueQQ(message) {
   } catch {}
 }
 async function qqPush(wsKey, message) {
+  if (notifyKind(CFG) === 'off') return;
   const full = `${qqTag(wsKey)}${message}`;
   for (let attempt = 1; attempt <= 3; attempt++) {
     if (await qqPushDirect(full)) return;
@@ -1267,24 +1256,9 @@ setInterval(async () => {
 
 /** 产物图直推：把节点刚产出的 png/jpg 发 owner QQ（bridge /api/send/private-image，base64 image 段）。 */
 async function qqPushImage(wsKey, imagePath, caption) {
-  const q = CFG.qqNotify;
-  if (!q?.enabled) return false;
-  let token = '';
-  try { token = fs.readFileSync(q.tokenFile, 'utf8').trim(); } catch { return false; }
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), 20000);
-  try {
-    const resp = await fetch(`${q.bridgeUrl}/api/send/private-image`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-console-token': token },
-      body: JSON.stringify({ userId: q.userId, imagePath, caption: `${qqTag(wsKey)}${caption}` }),
-      signal: ac.signal,
-    });
-    return resp.ok;
-  } catch (e) {
-    log('qqPushImage 失败:', String(e?.message || e).slice(0, 120));
-    return false;
-  } finally { clearTimeout(t); }
+  const r = await sendImage(CFG, imagePath, `${qqTag(wsKey)}${caption}`, { fs, timeoutMs: 20000 });
+  if (!r.ok && r.error !== 'off') log('图片直推失败:', r.error);
+  return r.ok;
 }
 
 // ── worker 子会话（P2：复用 dsh-client-v2）──────────────────────────────
@@ -1855,6 +1829,7 @@ const readBody = (req) => new Promise((resolve, reject) => {
 server.listen(CFG.port || 3110, '127.0.0.1', () => {
   log(`quest 服务就绪 http://127.0.0.1:${CFG.port || 3110}（token: ${QUEST_TOKEN.slice(0, 6)}…）`);
   log(`worker 目标: ${CFG.dshBaseUrl}${CFG.workersEnabled === false ? '（worker 已禁用）' : ''}`);
+  try { log('通知出口:', notifyKind(CFG)); } catch {}
   try { const _b = describeBackends(CFG); log(`后端: worker=${_b.workerBackend} fixer=${_b.fixerBackend}${_b.notes.length ? ' · ' + _b.notes.join('；') : ''}`); } catch {}
   // 启动对账（2026-09-09 改版）：running 节点 = quest 重启前的活作业。
   // 句柄直挂后子进程不再随 quest 死亡：PID 存活（且命令行指纹匹配）→ 再认领接管；
