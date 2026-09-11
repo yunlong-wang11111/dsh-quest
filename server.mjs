@@ -785,13 +785,13 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
     try { summary = await runWorker(wsKey, node, j, runSec); } catch (e) { log('worker 失败:', e.message); }
   }
   const ok = j.verdict === 'ok';
-  appendEvent(wsKey, { t: ok ? 'node.completed' : 'node.failed', node: node.id, verdict: j.verdict });
-  pushInbox({ node: node.id, verdict: j.verdict, summary });
+  try { appendEvent(wsKey, { t: ok ? 'node.completed' : 'node.failed', node: node.id, verdict: j.verdict }); } catch (e) { log('落账本失败:', e?.message); }
+  try { pushInbox({ node: node.id, verdict: j.verdict, summary }); } catch {}
   if (!node.quiet && CFG.qqNotify?.enabled) {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
-    qqPush(wsKey, `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || (j.error || j.via || '')}`.slice(0, 600)).catch(() => {});
+    qqPush(wsKey, `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || (j.error || j.via || '')}`.slice(0, 600)).catch((e) => log('qqPush 异常:', e?.message));
   }
-  writeProgress(wsKey);
+  try { writeProgress(wsKey); } catch (e) { log('writeProgress 失败:', e?.message); }
   // 产物图直推（2026-09-09）：成功节点把运行窗口内新产出的 png/jpg（≤push_images 张，默认 2）发 owner QQ
   if (ok && (node.pushImages ?? 2) > 0 && !node.quiet) pushArtifactImages(wsKey, node, startedAt).catch(() => {});
   // 依赖编排：成功续链 / 失败冻结下游 / 全线落定推收尾铃
@@ -1232,6 +1232,7 @@ async function qqPush(wsKey, message) {
   }
   queueQQ(full); // 三次都失败：落盘，等 bridge 回来补发
   log('qqPush 失败已入队（bridge 恢复后补发）');
+  try { appendEvent(lastActiveWs, { t: 'qq.push-failed', msg: full.slice(0, 150) }); } catch {}
 }
 // 补发队列：每 2 分钟试一次，成功即清空
 setInterval(async () => {
