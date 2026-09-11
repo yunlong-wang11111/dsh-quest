@@ -13,6 +13,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
+import { exportSessionArchive } from './session-export.mjs';
 
 const QUEST_HOME = path.join(os.homedir(), '.dsh', 'quests');
 
@@ -1582,13 +1583,24 @@ const server = http.createServer(async (req, res) => {
         night: { active: isNightNow(), quotaLeft: nightQuotaLeft(), quota: runGateCfg.nightQuota },
       });
     }
+
     // P4：翻篇（flip）——归档当前会话 + 开新会话 + 种子消息（读 research-state.md 恢复上下文）
     // 流程：AI 先写好 research-state.md → 调本端点 → 本端点做会话切换
     if (req.method === 'POST' && u.pathname === '/api/flip') {
       const b = await readBody(req);
       const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
       const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
-      const results = { archived: [], created: null, errors: [] };
+      const results = { archived: [], created: null, errors: [], exported: null };
+      // 0) 导出旧会话为可搜索的 markdown（AI 的冷存储——翻页后仍可 grep 查旧细节）
+      try {
+        const lr0 = await api.sessions.list({});
+        const wsItems = lr0.result.ok
+          ? (lr0.result.value?.items ?? []).filter((it) => String(it.cwd ?? '').replace(/\\/g, '/') === String(b.ws ?? '').replace(/\\/g, '/'))
+          : [];
+        if (wsItems.length) {
+          results.exported = await exportSessionArchive(b.ws, wsItems, wsKeyOf);
+        }
+      } catch (e) { results.errors.push('export: ' + e.message); }
       // 1) 归档旧会话（该工作区下所有会话）
       try {
         const lr = await api.sessions.list({});
@@ -1614,7 +1626,7 @@ const server = http.createServer(async (req, res) => {
         try {
           await api.sessions.prompt({
             sessionId: results.created, mode: 'queue',
-            content: [{ type: 'text', text: `【翻篇恢复】工作区刚完成一次翻篇归档。请先读取 ${path.join(b.ws, 'research-state.md')} 恢复研究上下文（历史结论、参数基线、待办），读完后回复"上下文已恢复"并简述当前状态（3 行以内）。之后等待用户指示。` }],
+            content: [{ type: 'text', text: `【翻篇恢复】工作区刚完成一次翻篇归档。请先读取 ${path.join(b.ws, 'research-state.md')} 恢复研究上下文（历史结论、参数基线、待办），读完后回复"上下文已恢复"并简述当前状态（3 行以内）。历史对话全文在 archive/flip-*.md（工具输出已修剪），需要查旧细节时用 grep 搜索此文件，不要整读。之后等待用户指示。` }],
           });
         } catch (e) { results.errors.push(`seed: ${e.message}`); }
       }
