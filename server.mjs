@@ -794,7 +794,7 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   const ok = j.verdict === 'ok';
   try { appendEvent(wsKey, { t: ok ? 'node.completed' : 'node.failed', node: node.id, verdict: j.verdict }); } catch (e) { log('落账本失败:', e?.message); }
   try { pushInbox({ node: node.id, verdict: j.verdict, summary }); } catch {}
-  if (!node.quiet && CFG.qqNotify?.enabled) {
+  if (!node.quiet && !node.__suppressFinishPush && CFG.qqNotify?.enabled) {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
     qqPush(wsKey, `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || (j.error || j.via || '')}`.slice(0, 600)).catch((e) => log('qqPush 异常:', e?.message));
   }
@@ -925,7 +925,10 @@ async function adoptOrphan(wsKey, node, n) {
       if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
       const j = judge(node, 0, runSec, logFile);
       j.via = `${j.via}（quest 重启期间 WSL 进程已消失，按产物/关键词判定）`;
-      try { await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log }); } catch (e) { log('续跑检测失败:', e?.message); }
+      try {
+              node.__startedAt = n.startedAt;
+              if (await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log })) node.__suppressFinishPush = true;
+            } catch (e) { log('续跑检测失败:', e?.message); }
       appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
       await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
       return;
@@ -971,7 +974,10 @@ async function adoptOrphan(wsKey, node, n) {
     if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
     const j = judge(node, 0, runSec, logFile);
     j.via = `${j.via}（quest 重启期间进程已消失，按产物/关键词判定）`;
-    try { await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log }); } catch (e) { log('续跑检测失败:', e?.message); }
+    try {
+              node.__startedAt = n.startedAt;
+              if (await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log })) node.__suppressFinishPush = true;
+            } catch (e) { log('续跑检测失败:', e?.message); }
     appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
     await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
     return;
