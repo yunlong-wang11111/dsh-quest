@@ -82,6 +82,55 @@ handoff: |                   # 给 worker 的交接上下文（决定总结质�
 
 完整字段说明与五段科研流水（生成→训练→后处理→评估→可视化）标准骨架见 [PLAN-TEMPLATE.md](PLAN-TEMPLATE.md)，设计取舍见 [DESIGN.md](DESIGN.md)。
 
+## 跨 Agent 使用（MCP） / Agent-agnostic via MCP
+
+quest 本体不绑定任何 AI 工具——它自己派进程、判定、重试、通知，全部零模型参与。因此**任何**能发 HTTP 的 agent（Claude Code、Codex、ZCode、Cursor、一段脚本）都能驱动它；仓库里的 `mcp-server.mjs` 进一步把这套能力做成标准 **MCP 工具**，模型不用再自己拼 curl。
+
+```bash
+# 依赖：node ≥ 20
+npm install            # 安装 @modelcontextprotocol/sdk / zod / fzstd
+node server.mjs        # 启动 quest 服务（3110）
+node mcp-server.mjs    # MCP 服务器（stdio，由 agent 拉起，无需手动运行）
+```
+
+暴露 8 个工具：`quest_plan` `quest_dispatch` `quest_run` `quest_status` `quest_log` `quest_probe` `quest_files` `quest_cancel`。
+
+**接入方式**（把路径换成你的实际路径）：
+
+<details><summary>Claude Code（.mcp.json 或 ~/.claude.json）</summary>
+
+```json
+{
+  "mcpServers": {
+    "quest": {
+      "command": "node",
+      "args": ["/path/to/quest/mcp-server.mjs"],
+      "env": { "QUEST_URL": "http://127.0.0.1:3110" }
+    }
+  }
+}
+```
+</details>
+
+<details><summary>Codex（~/.codex/config.toml）</summary>
+
+```toml
+[mcp_servers.quest]
+command = "node"
+args = ["/path/to/quest/mcp-server.mjs"]
+env = { QUEST_URL = "http://127.0.0.1:3110" }
+```
+</details>
+
+<details><summary>其它 MCP 客户端（ZCode / Cursor / …）</summary>
+
+在客户端的 MCP 配置里新增一个 stdio server：命令 `node`，参数 `["/path/to/quest/mcp-server.mjs"]`，环境变量同上。
+</details>
+
+**环境变量**：`QUEST_URL`（默认 `http://127.0.0.1:3110`）、`QUEST_TOKEN`（缺省读 `<QUEST_HOME>/.token`）、`QUEST_HOME`（默认 `~/.dsh/quests`）。
+
+> **绑定关系说明**：`worker`（子会话总结）与 `fixer`（自动修复）目前需要 DSH 提供会话能力；如果你的 agent 不是 DSH，把 `quest-config.json` 里的 `workersEnabled` 设为 `false` 即可退化为**纯机械模式**——判定、指标提取、超时、重试、通知全部照常，只是没有 AI 写的总结。执行与被编排的能力完全不受影响。
+
 ## v0.4 新增
 
 - **WSL(Ubuntu) 车道**：plan 头部写一行 `shell: wsl`，整条任务线跑进 WSL——bash 语法、Linux 路径、不经 cmd.exe（无引号剥离）、GPU 直通。负载由 systemd transient service 认养（会话清理与 VM 空闲关停都杀不死）+ 宿主侧 keepalive 保活会话——**quest 崩溃时 Linux 训练进程继续跑，quest 重启后按单元名自动接管**。日志写 WSL 内部、经 UNC 读取，判定/watch/产物全部适配
