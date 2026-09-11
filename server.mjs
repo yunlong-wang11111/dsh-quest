@@ -300,6 +300,21 @@ function shellMismatchHint(node) {
   return null;
 }
 
+/**
+ * 车道绕行检测：Windows 车道的命令手工包了 wsl（`wsl -d Ubuntu -- ...`）。
+ * 能跑，但失去了 shell: wsl 的全部保障——崩溃存活（systemd 认养 + keepalive）、
+ * 重启后按单元名认领、不经 cmd.exe 的引号安全。所以给一次明确提醒，但不阻断。
+ */
+function laneBypassWarning(node) {
+  if (node.shell === 'wsl') return null;
+  const first = String(node.command || '').trim().split(/\s+/)[0].replace(/^"|"$/g, '');
+  const base = first.split(/[\\/]/).pop().toLowerCase();
+  if (base !== 'wsl' && base !== 'wsl.exe') return null;
+  return `手工包装了 wsl（${first}）：命令能跑，但**失去 shell: wsl 车道的保障**——` +
+    'quest 崩溃时该负载会随会话被清理（不会被 systemd 认养）、重启后无法按单元认领、且引号要过 cmd.exe。' +
+    '建议改用 shell: "wsl"（命令直接写 bash 语句、cwd 用 Linux 路径）。';
+}
+
 function preflight(node) {
   const mism = shellMismatchHint(node);
   if (mism) return Promise.resolve({ error: mism });
@@ -618,6 +633,15 @@ function dispatchJob(wsKey, node, body = {}) {
         } catch {}
       }
     }
+    // 车道绕行提醒（不阻断）：能跑，但保障没了——让人和 AI 都知道
+    try {
+      const bypass = laneBypassWarning(node);
+      if (bypass) {
+        appendEvent(wsKey, { t: 'node.lane-bypass', node: node.id, why: bypass.slice(0, 200) });
+        pushInbox({ node: node.id, verdict: 'lane-bypass', detail: bypass });
+        if (!node.quiet) qqPush(wsKey, `[⚠️ 车道绕行] ${node.id}` + String.fromCharCode(10) + bypass).catch(() => {});
+      }
+    } catch (e) { log('车道检测失败:', e?.message); }
     const jobId = `j-${++jobSeq}-${Date.now().toString(36)}`;
     const logTs = new Date().toISOString().replace(/[:.]/g, '-');
     const startedAt = Date.now();
