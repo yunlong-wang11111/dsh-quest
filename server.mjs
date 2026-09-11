@@ -1516,6 +1516,13 @@ const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, 'http://localhost');
     // 仪表盘页面本体免头认证（页面自己管 token：URL 参数/localStorage/弹窗）——所有数据 API 仍需 token
+    // v2 控制台（并列试验页，/dashboard 不动）：写操作按钮 + 事件驱动实时 + 日志/loss 曲线
+    if (req.method === 'GET' && (u.pathname === '/dashboard-v2' || u.pathname === '/dashboard-v2/')) {
+      const html2 = fs.readFileSync(path.join(import.meta.dirname, 'dashboard-v2.html'));
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(html2);
+      return;
+    }
     if (req.method === 'GET' && (u.pathname === '/dashboard' || u.pathname === '/dashboard/')) {
       const html = fs.readFileSync(path.join(import.meta.dirname, 'dashboard.html'));
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });

@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quest 控制台 v2</title>
+<style>
+  :root { --bg:#0f1216; --card:#171c23; --line:#252c36; --fg:#d8dee6; --dim:#7c8794;
+          --ok:#3fb96f; --run:#4a9eff; --bad:#e0563f; --warn:#d9a038; --acc:#7c5cff; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:13px/1.55 "Segoe UI",system-ui,sans-serif; padding:12px; }
+  header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:10px; }
+  h1 { font-size:16px; font-weight:600; margin-right:auto; }
+  h1 small { color:var(--dim); font-weight:400; margin-left:8px; font-size:12px; }
+  nav { display:flex; gap:4px; margin-bottom:10px; flex-wrap:wrap; }
+  nav button { background:var(--card); border:1px solid var(--line); color:var(--dim); padding:6px 13px; border-radius:8px; cursor:pointer; font-size:13px; }
+  nav button.on { color:var(--fg); border-color:var(--acc); background:#1c2130; }
+  section { display:none; } section.on { display:block; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:11px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:9px; }
+  select, input[type=text], button.act { background:#0b0e12; border:1px solid var(--line); color:var(--fg); border-radius:7px; padding:5px 9px; font-size:12px; }
+  button.act { cursor:pointer; } button.act:hover { border-color:var(--acc); }
+  button.act.danger:hover { border-color:var(--bad); color:var(--bad); }
+  button.act:disabled { opacity:.4; cursor:default; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { text-align:left; padding:6px 7px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:500; }
+  .st { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
+  .st.completed{background:var(--ok)} .st.running{background:var(--run);animation:p 1s infinite alternate}
+  .st.failed,.st.timeout{background:var(--bad)} .st.cancelled{background:var(--dim)}
+  .st.pending,.st.frozen,.st.skipped,.st.ready{background:var(--warn)}
+  @keyframes p { to{opacity:.3} }
+  .mut { color:var(--dim); }
+  .mono { font-family:ui-monospace,Consolas,monospace; }
+  pre { background:#0b0e12; border:1px solid var(--line); border-radius:8px; padding:9px; overflow:auto; max-height:56vh; white-space:pre-wrap; font-size:11.5px; }
+  .gate-item { border:1px solid var(--line); border-radius:9px; padding:10px; margin-bottom:8px; }
+  .gate-item code { display:block; background:#0b0e12; padding:6px 8px; border-radius:7px; margin:6px 0; font-size:11.5px; word-break:break-all; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:20px; font-size:11px; border:1px solid var(--line); color:var(--dim); }
+  .spark { vertical-align:middle; }
+  #tokbar { position:fixed; right:12px; bottom:12px; background:var(--card); border:1px solid var(--line); border-radius:9px; padding:9px; display:flex; gap:6px; }
+  .toast { position:fixed; left:50%; transform:translateX(-50%); bottom:16px; background:#1c2130; border:1px solid var(--acc); border-radius:8px; padding:8px 14px; font-size:12.5px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>quest 控制台 <small id="ver"></small></h1>
+  <span class="pill" id="live">● 实时</span>
+  <span class="mut" id="wslhint"></span>
+  <button class="act" onclick="refreshAll()">刷新</button>
+</header>
+<nav>
+  <button data-t="tasks" class="on">任务线</button>
+  <button data-t="gate">门禁 <span id="gateN" class="mut"></span></button>
+  <button data-t="logs">日志</button>
+  <button data-t="files">文件</button>
+</nav>
+
+<section id="tasks" class="on">
+  <div class="card">
+    <div class="row">
+      <select id="ws"></select>
+      <span class="mut" id="wsmeta"></span>
+    </div>
+    <table>
+      <thead><tr><th>节点</th><th>状态</th><th>判定</th><th>耗时</th><th>指标</th><th>操作</th></tr></thead>
+      <tbody id="nodes"></tbody>
+    </table>
+  </div>
+</section>
+
+<section id="gate">
+  <div class="card" id="gateBody"><span class="mut">加载中…</span></div>
+</section>
+
+<section id="logs">
+  <div class="card">
+    <div class="row">
+      <select id="logNode"></select>
+      <button class="act" onclick="loadLog()">读取</button>
+      <label class="mut"><input type="checkbox" id="logAuto" checked> 运行中自动刷新</label>
+      <span class="mut" id="logMeta"></span>
+    </div>
+    <div id="sparkWrap"></div>
+    <pre id="logText">选择一个节点…</pre>
+  </div>
+</section>
+
+<section id="files">
+  <div class="card">
+    <div class="row">
+      <input type="text" id="fpath" style="flex:1;min-width:240px" placeholder="绝对路径（Windows 或 \\wsl$\Ubuntu\...）">
+      <button class="act" onclick="go($('#fpath').value)">前往</button>
+      <button class="act" onclick="go(wslHome())">WSL 家目录</button>
+    </div>
+    <table><tbody id="flist"></tbody></table>
+    <div id="viewer"></div>
+  </div>
+</section>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let TOKEN = new URLSearchParams(location.search).get('token') || localStorage.getItem('questTok') || '';
+function showTokbar() {
+  if (document.getElementById('tokbar')) return;
+  const b = document.createElement('div'); b.id = 'tokbar';
+  b.innerHTML = '<input id="tokin" placeholder="quest token（~/.dsh/quests/.token）"><button class="act" onclick="saveTok()">保存</button>';
+  document.body.appendChild(b);
+}
+function saveTok() {
+  TOKEN = (document.getElementById('tokin').value || '').trim();
+  localStorage.setItem('questTok', TOKEN);
+  document.getElementById('tokbar').remove();
+  refreshAll();
+}
+if (!TOKEN) showTokbar();
+
+async function api(path, opt) {
+  const r = await fetch(path, { ...(opt || {}), headers: { 'x-quest-token': TOKEN, ...((opt && opt.headers) || {}) } });
+  if (r.status === 401) { showTokbar(); throw new Error('token 无效'); }
+  const txt = await r.text();
+  let j; try { j = JSON.parse(txt); } catch { j = { raw: txt.slice(0, 300) }; }
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+const post = (p, body) => api(p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+const fmtSize = (n) => n > 1048576 ? (n/1048576).toFixed(1)+'MB' : n > 1024 ? (n/1024).toFixed(0)+'KB' : n+'B';
+const wslHome = () => '\\\\wsl$\\Ubuntu\\home\\solanine';
+$('#wslhint').textContent = 'WSL: ' + wslHome();
+let toastT = null;
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toastT); toastT = setTimeout(() => t.style.display = 'none', 2600); }
+
+let curWs = '';
+document.querySelectorAll('nav button').forEach((b) => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach((x) => x.classList.remove('on'));
+  document.querySelectorAll('section').forEach((x) => x.classList.remove('on'));
+  b.classList.add('on'); $('#' + b.dataset.t).classList.add('on');
+  if (b.dataset.t === 'gate') loadGate();
+  if (b.dataset.t === 'logs') fillLogNodes();
+});
+
+async function loadWs() {
+  const d = await api('/api/workspaces');
+  const sel = $('#ws'); sel.innerHTML = '';
+  for (const w of d.workspaces) {
+    const o = document.createElement('option');
+    o.value = w.wsKey; o.textContent = (w.running ? '▶ ' : '') + (w.title || w.wsKey);
+    sel.appendChild(o);
+  }
+  const q = new URLSearchParams(location.search).get('ws');
+  if (q) sel.value = q;
+  curWs = sel.value;
+  sel.onchange = () => { curWs = sel.value; loadTasks(); fillLogNodes(); };
+}
+
+let nodesCache = [];
+async function loadTasks() {
+  if (!curWs) return;
+  const d = await api('/api/status?ws=' + encodeURIComponent(curWs));
+  $('#ver').textContent = d.questVersion || '';
+  $('#wsmeta').textContent = d.plan?.workspace || '';
+  nodesCache = d.plan?.nodes || [];
+  $('#nodes').innerHTML = nodesCache.map((n) => {
+    const canDispatch = ['failed','timeout','cancelled','pending','skipped','ready','frozen'].includes(n.status);
+    const canCancel = n.status === 'running';
+    const resumable = n.status === 'failed' && (n.interrupted || n.verdict === 'suspect' || n.verdict === 'crashed' || n.verdict === 'timeout');
+    return `<tr>
+      <td class="mono">${esc(n.id)}</td>
+      <td><span class="st ${esc(n.status)}"></span>${esc(n.status)}</td>
+      <td>${esc(n.verdict || '')}${n.via ? ' <span class="mut">' + esc(n.via) + '</span>' : ''}</td>
+      <td>${n.runSeconds != null ? Math.round(n.runSeconds/60) + '分' : ''}</td>
+      <td>${n.metrics?.loss_last != null ? 'loss ' + esc(n.metrics.loss_last) + (n.metrics.loss_slope_10ep != null ? ' · 斜率 ' + esc(n.metrics.loss_slope_10ep) : '') : ''}</td>
+      <td>
+        ${canDispatch ? `<button class="act" onclick="act('dispatch','${esc(n.id)}')">派发</button> ` : ''}
+        ${canCancel ? `<button class="act danger" onclick="act('cancel','${esc(n.id)}')">终止</button> ` : ''}
+        ${resumable ? `<button class="act" onclick="act('resume','${esc(n.id)}')">续跑</button> ` : ''}
+        <button class="act" onclick="openLog('${esc(n.id)}')">日志</button>
+      </td>
+    </tr>`;
+  }).join('');
+  if (!$('#logs').classList.contains('on')) return;
+}
+
+async function act(kind, node) {
+  try {
+    if (kind === 'dispatch') {
+      if (!confirm(`派发节点「${node}」？\n\n会立即在后台执行，完成后通知。`)) return;
+      const r = await post('/api/dispatch?ws=' + encodeURIComponent(curWs), { node });
+      toast(r.ok ? `已派发 ${node}` : `失败：${r.error}`);
+    } else if (kind === 'cancel') {
+      const why = prompt(`终止「${node}」——会杀整棵进程树，并记为 cancelled（不触发自动修复）。\n\n原因（可留空）：`, '控制台人工终止');
+      if (why === null) return;
+      const r = await post('/api/cancel?ws=' + encodeURIComponent(curWs), { node, reason: why || '控制台人工终止' });
+      toast(r.ok ? `已终止 ${node}` : `失败：${r.error}`);
+    } else if (kind === 'resume') {
+      if (!confirm(`从断点续跑「${node}」？\n\n会自动注入最新存档（QUEST_RESUME_FROM）。若该任务不可断点续跑，等于重跑一遍。`)) return;
+      const r = await post('/api/resume?ws=' + encodeURIComponent(curWs), { node });
+      toast(r.ok ? `已续跑：${(r.resumed || []).join('、')}` : `失败：${r.error}`);
+    }
+    await loadTasks();
+  } catch (e) { toast('操作失败：' + (e.message || e)); }
+}
+
+async function loadGate() {
+  try {
+    const d = await api('/api/gate/list');
+    const night = d.night?.active ? `🌙 夜间自批中 · 剩余额度 ${d.night.quotaLeft}/${d.night.quota}` : '☀️ 白天模式（夜间窗口自批）';
+    $('#gateN').textContent = (d.pending || []).length ? `(${d.pending.length})` : '';
+    const items = (d.pending || []).map((g) => `<div class="gate-item">
+      <b class="mono">${esc(g.id)}</b> <span class="mut">${new Date(g.createdAt).toLocaleString('zh-CN',{hour12:false})} · ${esc(g.why)}</span>
+      <code>${esc(g.command)}</code>
+      <div class="mut">AI 理由：${esc(g.reason || '（未给）')}</div>
+      <div class="row" style="margin-top:8px">
+        <button class="act" onclick="gateDecide('${esc(g.id)}',true)">放行</button>
+        <button class="act danger" onclick="gateDecide('${esc(g.id)}',false)">作废</button>
+      </div></div>`).join('');
+    $('#gateBody').innerHTML = `<div class="row">${night}</div>` + (items || '<span class="mut">没有挂起的命令</span>');
+  } catch (e) { $('#gateBody').innerHTML = `<span class="mut">读取失败：${esc(e.message)}</span>`; }
+}
+async function gateDecide(id, approve) {
+  if (!confirm(approve ? `放行 ${id}？命令将立即执行。` : `作废 ${id}？命令从未执行过。`)) return;
+  try { const r = await post('/api/gate/decide', { id, approve }); toast(r.ok ? (approve ? '已放行' : '已作废') : ('失败：' + r.error)); }
+  catch (e) { toast('失败：' + e.message); }
+  loadGate();
+}
+
+function fillLogNodes() {
+  const sel = $('#logNode');
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = nodesCache.map((n) => `<option value="${esc(n.id)}">${esc(n.id)} · ${esc(n.status)}</option>`).join('');
+  if (cur) sel.value = cur;
+}
+function openLog(node) {
+  document.querySelectorAll('nav button').forEach((x) => x.classList.remove('on'));
+  document.querySelectorAll('section').forEach((x) => x.classList.remove('on'));
+  document.querySelector('nav button[data-t="logs"]').classList.add('on');
+  $('#logs').classList.add('on');
+  fillLogNodes();
+  $('#logNode').value = node;
+  loadLog();
+}
+async function loadLog() {
+  const node = $('#logNode').value;
+  if (!node) return;
+  try {
+    const d = await api('/api/log?ws=' + encodeURIComponent(curWs) + '&node=' + encodeURIComponent(node) + '&tail=60000');
+    const text = d.log || '(空)';
+    $('#logText').textContent = text;
+    $('#logMeta').textContent = (d.file || '').split(/[\\/]/).pop() + ' · ' + text.length + ' 字符';
+    drawSpark(text);
+  } catch (e) { $('#logText').textContent = '读取失败：' + e.message; $('#sparkWrap').innerHTML = ''; }
+}
+// 从日志里抠 loss 序列画迷你曲线（数据来自任务自己打印的日志，不是模型猜测）
+function drawSpark(text) {
+  const vals = [...text.matchAll(/\b(?:val_)?loss\D{0,4}(\d+(?:\.\d+)?(?:e[+-]?\d+)?)/gi)]
+    .map((m) => Number(m[1])).filter((v) => Number.isFinite(v) && v >= 0);
+  if (vals.length < 3) { $('#sparkWrap').innerHTML = ''; return; }
+  const W = 640, H = 90, pad = 6;
+  const min = Math.min(...vals), max = Math.max(...vals), span = (max - min) || 1;
+  const pts = vals.map((v, i) => {
+    const x = pad + (W - 2*pad) * (i / (vals.length - 1));
+    const y = pad + (H - 2*pad) * (1 - (v - min) / span);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  $('#sparkWrap').innerHTML = `<div class="mut" style="margin-bottom:4px">loss 曲线（${vals.length} 个采样 · ${min} → ${max}）</div>
+    <svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+      <rect x="0" y="0" width="${W}" height="${H}" fill="#0b0e12" rx="8"/>
+      <polyline points="${pts}" fill="none" stroke="#4a9eff" stroke-width="1.6"/>
+    </svg>`;
+}
+
+async function go(p) {
+  p = (p || '').trim(); if (!p) return;
+  $('#fpath').value = p; $('#viewer').innerHTML = '';
+  try {
+    const d = await api('/api/files?mode=list&path=' + encodeURIComponent(p));
+    $('#flist').innerHTML = d.entries.map((e) => `<tr class="${e.dir ? 'dir' : ''}" onclick="clickE('${esc(e.name).replace(/'/g, "\\'")}', ${e.dir})">
+      <td>${e.dir ? '📁' : '📄'} ${esc(e.name)}</td>
+      <td class="mut">${e.dir ? '' : fmtSize(e.size)}</td>
+      <td class="mut">${e.mtime ? new Date(e.mtime).toLocaleString('zh-CN',{hour12:false}) : ''}</td></tr>`).join('');
+  } catch (e) { $('#flist').innerHTML = `<tr><td class="mut">${esc(e.message)}</td></tr>`; }
+}
+async function clickE(name, isDir) {
+  const base = ($('#fpath').value || '').replace(/[\\/]+$/, '');
+  const full = base + '\\' + name;
+  if (isDir) return go(full);
+  if (/\.(png|jpe?g|gif|webp)$/i.test(name)) {
+    const d = await api('/api/files?mode=img&path=' + encodeURIComponent(full));
+    $('#viewer').innerHTML = d.error ? `<pre>${esc(d.error)}</pre>` : `<img src="${d.dataUrl}" style="max-width:100%;border-radius:8px">`;
+    return;
+  }
+  const d = await api('/api/files?mode=read&path=' + encodeURIComponent(full));
+  $('#viewer').innerHTML = `<div class="mut">${esc(name)}${d.truncated ? '（已截尾）' : ''}</div><pre>${esc(d.text)}</pre>`;
+}
+
+// ── 实时：长轮询 /api/events（事件驱动，替代固定 10 秒刷新）──
+let lastEvt = '';
+async function pump() {
+  for (;;) {
+    try {
+      const d = await api('/api/events?since=' + encodeURIComponent(lastEvt) + '&wait=25');
+      const evs = d.events || [];
+      if (evs.length) {
+        lastEvt = evs[evs.length - 1].at || lastEvt;
+        $('#live').style.color = 'var(--ok)';
+        await loadTasks();
+        if ($('#gate').classList.contains('on')) loadGate();
+        if ($('#logs').classList.contains('on') && $('#logAuto').checked) loadLog();
+      }
+    } catch { $('#live').style.color = 'var(--bad)'; await new Promise((r) => setTimeout(r, 4000)); }
+  }
+}
+async function refreshAll() {
+  try { await loadWs(); await loadTasks(); fillLogNodes(); if ($('#gate').classList.contains('on')) loadGate(); toast('已刷新'); }
+  catch (e) { toast('刷新失败：' + e.message); }
+}
+loadWs().then(() => { loadTasks(); fillLogNodes(); pump(); });
+setInterval(() => { if ($('#logs').classList.contains('on') && $('#logAuto').checked) loadLog(); }, 8000);
+</script>
+</body>
+</html>
