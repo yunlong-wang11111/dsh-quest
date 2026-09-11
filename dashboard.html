@@ -52,6 +52,7 @@
     <div class="row">
       <select id="ws"></select>
       <button class="act" onclick="loadTasks()">刷新</button>
+      <button class="act" id="flipBtn" onclick="flipWs()" title="翻页：归档旧会话+导出+开新会话" style="color:var(--warn)">🔄</button>
       <span class="note" id="ws-title"></span>
     </div>
     <table><thead><tr><th>节点</th><th>状态</th><th>判定</th><th>耗时</th><th>指标</th></tr></thead><tbody id="nodes"></tbody></table>
@@ -150,6 +151,31 @@ async function clickE(name, isDir) {
   }
   const d = await api('/api/files?mode=read&path=' + encodeURIComponent(full));
   $('#viewer').innerHTML = `<div class="note">${esc(name)}${d.truncated ? '（文件 ' + fmtSize(d.size) + '，只显示尾部 256KB）' : ''}</div><pre>${esc(d.text)}</pre>`;
+}
+
+async function flipWs() {
+  const wsKey = document.querySelector('#ws').value;
+  if (!wsKey) return alert('先选一个工作区');
+  const title = document.querySelector('#ws option:checked')?.textContent || wsKey;
+  const btn = document.getElementById('flipBtn');
+  if (!confirm('翻页「' + title + '」？
+
+会做三件事：
+1. 导出旧会话为 archive/flip-*.md（可搜索）
+2. 归档全部旧会话
+3. 开新会话（从 research-state.md 恢复）
+
+确定？')) return;
+  btn.textContent = '⏳'; btn.disabled = true;
+  try {
+    const r = await api('/api/flip?ws=' + encodeURIComponent(wsKey), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
+    alert('翻页完成
+导出: ' + (r.exported ? r.exported.sizeMB + 'MB / ' + r.exported.messages + ' 条消息' : '无') + '
+归档: ' + (r.archived ? r.archived.length : 0) + ' 个会话
+新会话: ' + (r.created ? '已创建' : '失败'));
+    loadWs().then(loadTasks);
+  } catch (e) { alert('翻页失败: ' + (e.message || e)); }
+  btn.textContent = '🔄'; btn.disabled = false;
 }
 
 async function loadGate() {
