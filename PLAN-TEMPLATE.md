@@ -1,6 +1,6 @@
 # quest_plan 模板与写法指南（AI 写任务线前先读本文件）
 
-> 位置固定：`__HOME__\dsh-plugins\quest\PLAN-TEMPLATE.md`
+> 位置：quest 插件目录下的 PLAN-TEMPLATE.md
 > `quest_plan` 工具的 markdown 参数按本模板写。写作原则：**handoff 是 worker 总结质量的上限**——
 > worker 只能看到 handoff + 日志尾部，看不到你们的研究语境，所以要在这里替它把语境补齐。
 

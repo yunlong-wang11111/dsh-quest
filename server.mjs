@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // quest 服务 —— 任务线编排核心（P1：账本+作业执行+预检+判定器；P2：worker 子会话；P3：QQ 推送）
 //
-// 设计文档：__HOME__\dsh-plugins\QUEST_DESIGN.md
+// 设计取舍见 DESIGN.md
 // 数据目录：~/.dsh/quests/<wsKey>/（plan.md + ledger.jsonl + logs/ + state.json）
 // 端口：默认 3110，仅绑定 127.0.0.1；token 首启生成于 ~/.dsh/quests/.token
 //
@@ -34,15 +34,15 @@ if (!fs.existsSync(CONFIG_PATH)) {
     // worker 会话目标：生产=http://127.0.0.1:3080（token 从 dsh-run.log 解析）
     // 沙盒=http://127.0.0.1:3090 + tokenLog 指向沙盒日志
     dshBaseUrl: 'http://127.0.0.1:3090',
-    dshTokenLog: '__HOME__/.dsh-test/sandbox-run3.log',
+    dshTokenLog: '', // DSH 运行日志路径（用于解析 token）；留空则用 dshToken
     dshToken: '',
     workerPreset: 'quest-worker',
     fixerPreset: 'quest-fixer',
     qqNotify: {
       enabled: false,
       bridgeUrl: 'http://127.0.0.1:3100',
-      tokenFile: '__HOME__/qq-bridge/state/console-token',
-      userId: 0,
+      tokenFile: '', // 通知端的控制台令牌文件路径
+      userId: 0, // 接收通知的账号 id
     },
   }, null, 2));
 }
