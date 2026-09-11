@@ -67,13 +67,17 @@ Claude Code、Codex、ZCode 这类 agent 都自带后台执行（`run_in_backgro
 
 ## 快速上手 / Quick Start
 
-要求：Windows + Node.js ≥ 20 + [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 0.1.2+
+要求：Node.js ≥ 20。**DSH 不是必需的**——quest 可独立运行（纯机械模式），DSH 只用于可选的任务总结与自动修复；Windows 与 Linux 都能跑（WSL 执行车道为 Windows 专属）。
 
 ```bash
-# 1. 启动服务（数据目录 ~/.dsh/quests/ 自动创建）
-git clone https://github.com/yunlong-wang11111/dsh-quest.git
-cd dsh-quest
-node server.mjs          # 端口 3110；token 自动生成于 ~/.dsh/quests/.token
+# 1. 启动服务（一行；数据目录 ~/.dsh/quests/ 与令牌自动生成）
+npx dsh-quest-service
+
+#    不想用 npx？从源码起也一样：
+#    git clone https://github.com/yunlong-wang11111/dsh-quest.git && cd dsh-quest && node server.mjs
+
+#    服务起来后：仪表盘 http://127.0.0.1:3110/dashboard
+#              MCP 服务器 npx dsh-quest-service mcp（接 Claude Code / Codex / ZCode）
 
 # 2. 编辑 ~/.dsh/quests/quest-config.json（QQ 推送等），重启服务生效
 

@@ -3,3 +3,6 @@ node_modules/
 .dsh/
 quest-config.json
 .token
+
+# npm pack 产物（本地校验用，不进仓库）
+*.tgz
