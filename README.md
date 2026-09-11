@@ -85,6 +85,20 @@ node server.mjs          # 端口 3110；token 自动生成于 ~/.dsh/quests/.to
 # 5. 在 DSH 对话里说："用 quest 建任务线跑 xxx，然后派发"
 ```
 
+## 让它常驻（监督器） / Keep it running
+
+**quest 是一个服务，而服务无法监督自己**——进程死了就没人再判定、通知、认领。任务侧的崩溃存活（句柄直挂 / systemd 认养 / 重启后按账本认领）是 quest 自己的机制，不需要外部帮忙；但 quest 进程本身必须由外部拉起来。
+
+**Linux / macOS（推荐，用 systemd 而不是自己写守护）**：'guard/quest.service' 是现成的用户级单元（`Restart=always` + 重启风暴保护 + 日志落盘）。装法见文件头注释，四行命令。
+
+**Windows（没有 systemd，用计划任务）**：`guard/quest-guard.ps1` 是 40 行的最小监督器——探活 `/api/status`（任何 HTTP 响应都算活着，含 401），000 才判定为死并拉起，全程记日志。注册成每 5 分钟一次：
+
+```bat
+schtasks /Create /TN "quest-guard" /SC MINUTE /MO 5 /RL HIGHEST ^
+  /TR "powershell -NoProfile -ExecutionPolicy Bypass -File C:\path\to\quest-guard.ps1" /F
+```
+
+> 注意：监督器只管 **quest 进程**。它不负责"任务不要中断"——那是 quest 自己的事（见「崩溃韧性」与「中断恢复」）。二者互不替代。
 ## 任务线格式 / Plan Format
 
 ```markdown
