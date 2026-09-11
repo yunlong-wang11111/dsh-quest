@@ -1195,24 +1195,56 @@ function qqTag(wsKey) {
   } catch { return `[${wsKey}] `; }
 }
 
-async function qqPush(wsKey, message) {
+// QQ 推送（2026-09-11 加重试）：bridge 重启窗口内的推送会失败，之前静默丢弃。
+// 现在：3 次指数退避重试 + 失败落盘队列（bridge 恢复后由 flushQQQueue 补发）。
+const QQ_QUEUE_FILE = path.join(HOMEOverride, 'qq-pending.json');
+async function qqPushDirect(message) {
   const q = CFG.qqNotify;
-  if (!q?.enabled) return;
+  if (!q?.enabled) return false;
   let token = '';
-  try { token = fs.readFileSync(q.tokenFile, 'utf8').trim(); } catch { return; }
+  try { token = fs.readFileSync(q.tokenFile, 'utf8').trim(); } catch { return false; }
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), 5000);
+  const t = setTimeout(() => ac.abort(), 8000);
   try {
-    await fetch(`${q.bridgeUrl}/api/send/private`, {
+    const resp = await fetch(`${q.bridgeUrl}/api/send/private`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-console-token': token },
-      body: JSON.stringify({ userId: q.userId, message: `${qqTag(wsKey)}${message}` }),
+      body: JSON.stringify({ userId: q.userId, message }),
       signal: ac.signal,
     });
-  } catch (e) {
-    log('qqPush 失败:', String(e?.message || e).slice(0, 120)); // 2026-09-08：静默吞错导致 15:20 漏推无从查起
+    return resp.ok;
+  } catch {
+    return false;
   } finally { clearTimeout(t); }
 }
+function queueQQ(message) {
+  try {
+    const arr = fs.existsSync(QQ_QUEUE_FILE) ? JSON.parse(fs.readFileSync(QQ_QUEUE_FILE, 'utf8')) : [];
+    arr.push({ ts: Date.now(), message });
+    fs.writeFileSync(QQ_QUEUE_FILE, JSON.stringify(arr.slice(-60), null, 1));
+  } catch {}
+}
+async function qqPush(wsKey, message) {
+  const full = `${qqTag(wsKey)}${message}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (await qqPushDirect(full)) return;
+    if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 2000));
+  }
+  queueQQ(full); // 三次都失败：落盘，等 bridge 回来补发
+  log('qqPush 失败已入队（bridge 恢复后补发）');
+}
+// 补发队列：每 2 分钟试一次，成功即清空
+setInterval(async () => {
+  let arr;
+  try { arr = JSON.parse(fs.readFileSync(QQ_QUEUE_FILE, 'utf8')); } catch { return; }
+  if (!Array.isArray(arr) || !arr.length) return;
+  const remain = [];
+  for (const item of arr) {
+    if (!(await qqPushDirect(item.message))) remain.push(item);
+  }
+  try { fs.writeFileSync(QQ_QUEUE_FILE, JSON.stringify(remain, null, 1)); } catch {}
+  if (remain.length < arr.length) log(`QQ 补发成功 ${arr.length - remain.length} 条，剩余 ${remain.length}`);
+}, 2 * 60 * 1000);
 
 /** 产物图直推：把节点刚产出的 png/jpg 发 owner QQ（bridge /api/send/private-image，base64 image 段）。 */
 async function qqPushImage(wsKey, imagePath, caption) {
