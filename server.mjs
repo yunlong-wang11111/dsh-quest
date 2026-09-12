@@ -65,7 +65,16 @@ process.on('uncaughtException', (e) => { log('uncaughtException（已拦截，�
 
 
 // ── 账本 ────────────────────────────────────────────────────────────────
-const wsKeyOf = (ws) => String(ws || '').replace(/\\/g, '/').replace(/\/+$/, '').replace(/[:/]/g, (c) => (c === ':' ? '' : '-'));
+// /mnt/c/Users/x（WSL 视角）与 C:\\Users\\x（Windows 视角）是同一个目录——
+// 若不归一，同一条任务线会分裂成两个工作区（曾表现为"任务被吞"：quick 任务落在 /mnt/c 的 wsKey 下，
+// 而主对话查的是 Windows 路径的 wsKey，看不见）。
+const normalizeWs = (ws) => {
+  let s = String(ws || '').trim();
+  const m = s.match(/^\/mnt\/([a-zA-Z])(\/.*)?$/);
+  if (m) s = m[1].toUpperCase() + ':' + (m[2] || '/');
+  return s;
+};
+const wsKeyOf = (ws) => normalizeWs(ws).replace(/\\/g, '/').replace(/\/+$/, '').replace(/[:/]/g, (c) => (c === ':' ? '' : '-'));
 
 function dirOf(wsKey) {
   const d = path.join(HOMEOverride, wsKey);
@@ -249,6 +258,14 @@ const FINISH_KEYWORDS = ['训练完成', '训练结束', '训练成功', '训练
 const TEXT_EXTS = ['.log', '.txt', '.out', '.md', '.json', '.csv'];
 const ARTIFACT_EXTS = ['.pt', '.npz', '.pth', '.ckpt', '.png', '.jpg', '.h5', '.npy', '.bin'];
 
+/** 从日志尾恢复真实退出码（WSL 包装器写的 EXIT_CODE:<n>）；拿不到返回 null。 */
+function recoverExitCode(logFile) {
+  try {
+    const m = readTail(logFile, 2048).match(/EXIT_CODE:\s*(\d+)/);
+    return m ? Number(m[1]) : null;
+  } catch { return null; }
+}
+
 function judge(node, exitCode, runSec, logFile) {
   // 超时由外层标记，这里只判退出路径
   if (exitCode !== 0) {
@@ -258,6 +275,12 @@ function judge(node, exitCode, runSec, logFile) {
   // 查输出证据：cwd 常见目录 + 任务运行窗口内的文件
   const tail = readTail(logFile, 4096).toLowerCase();
   if (FINISH_KEYWORDS.some((k) => tail.includes(k.toLowerCase()))) return { verdict: 'ok', via: 'finish-keyword' };
+  // WSL 节点的包装器会在日志尾写 EXIT_CODE:<n>——那是真实退出码，比「产物新鲜」更硬
+  const ec = tail.match(/exit_code:\s*(\d+)/);
+  if (ec) {
+    if (ec[1] === '0') return { verdict: 'ok', via: 'exit-code-0' };
+    return { verdict: 'crashed', via: `exit-code-${ec[1]}` };
+  }
   const dirs = node.shell === 'wsl'
     ? [node.cwd, `${node.cwd}/out`, `${node.cwd}/logs`, `${node.cwd}/output`, `${node.cwd}/results`, `${node.cwd}/runs`].filter(Boolean).map(wslUnc)
     : [node.cwd, path.join(node.cwd, 'out'), path.join(node.cwd, 'logs'), path.join(node.cwd, 'output'), path.join(node.cwd, 'results'), path.join(node.cwd, 'runs')];
@@ -966,7 +989,8 @@ async function adoptOrphan(wsKey, node, n) {
       const runSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
       const metrics = extractMetrics(logFile);
       if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
-      const j = judge(node, 0, runSec, logFile);
+      const recovered = recoverExitCode(logFile);
+    const j = judge(node, recovered == null ? 0 : recovered, runSec, logFile);
       j.via = `${j.via}（quest 重启期间 WSL 进程已消失，按产物/关键词判定）`;
       try {
               node.__startedAt = n.startedAt;
@@ -1015,7 +1039,8 @@ async function adoptOrphan(wsKey, node, n) {
     const runSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     const metrics = extractMetrics(logFile);
     if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
-    const j = judge(node, 0, runSec, logFile);
+    const recovered = recoverExitCode(logFile);
+    const j = judge(node, recovered == null ? 0 : recovered, runSec, logFile);
     j.via = `${j.via}（quest 重启期间进程已消失，按产物/关键词判定）`;
     try {
               node.__startedAt = n.startedAt;
@@ -1753,7 +1778,33 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && u.pathname === '/api/cancel') {
       const body = await readBody(req);
       const job = activeJobs.get(`${wsKey}|${body.node}`);
-      if (!job) return json(404, { ok: false, error: `节点 ${body.node} 不在运行` });
+      if (!job) {
+        // 账本说它已终结，但进程可能还活着——例如重启后认领之前的窗口，
+        // 或外层 wsl.exe 被杀而 systemd 单元仍在跑（判 timeout 后负载继续）。
+        // 按账本记录的 logTs/pid 兜底杀一次，并如实说明是哪种情况。
+        const st0 = buildState(wsKey);
+        const rec = st0.nodes[body.node] || {};
+        let killed = false;
+        const unitGuess = rec.logTs
+          ? `quest-${String(body.node).replace(/[^a-zA-Z0-9_.-]/g, '_')}-${rec.logTs}`.slice(0, 90)
+          : null;
+        if (unitGuess) {
+          try {
+            await new Promise((r) => execFile("wsl.exe",
+              ["-d", WSL_DISTRO(), "-u", "root", "--exec", "systemctl", "kill", unitGuess, "--signal=SIGKILL", "--kill-whom=all"], () => r()));
+            killed = true;
+          } catch {}
+        }
+        if (rec.pid) { try { execFile("taskkill", ["/PID", String(rec.pid), "/T", "/F"], () => {}); killed = true; } catch {} }
+        appendEvent(wsKey, { t: 'cancel.fallback', node: body.node, unit: unitGuess || undefined, pid: rec.pid });
+        return json(200, {
+          ok: true,
+          node: body.node,
+          note: killed
+            ? '账本里该节点已终结（不在活动作业表），已按其单元名/PID 兜底发出杀树指令'
+            : '账本里该节点已终结，且没有可用的 pid/单元名兜底；若仍见进程存活请手动清理',
+        });
+      }
       job.cancelledByHuman = String(body.reason || '人工终止').slice(0, 200);
       killJobTree(job, job.child.pid);
       return json(200, { ok: true, node: body.node, note: '已杀树，等待退出事件落账（cancelled 终态，不触发自动修复）' });

@@ -202,7 +202,9 @@ function apply(ctx, config = {}) {
           questVersion: { type: 'string' },
           plan: { type: 'object', additionalProperties: true, properties: { workspace: { type: 'string' }, nodes: { type: 'array', items: { type: 'object', additionalProperties: true, properties: {
             id: { type: 'string' }, status: { type: 'string' }, verdict: { type: 'string' }, via: { type: 'string' },
-            runSeconds: { type: 'number' }, exitCode: { type: 'number' }, summary: { type: 'string' }, jobId: { type: 'string' },
+            // 注意：exitCode / file / metrics 可能为 null（例如重启后认领的节点拿不到退出码）。
+            // 这里不声明它们——additionalProperties:true 会原样透传；一旦声明成 number，null 会毒死整个响应。
+            summary: { type: 'string' }, jobId: { type: 'string' },
             detail: { type: 'string' },
           } } } } },
           unread: { type: 'array', items: { type: 'object', additionalProperties: true, properties: { node: { type: 'string' }, verdict: { type: 'string' }, summary: { type: 'string' }, ts: { type: 'number' } } } },
