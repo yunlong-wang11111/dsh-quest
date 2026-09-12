@@ -327,6 +327,17 @@ function shellMismatchHint(node) {
   if (!looksLikeLinuxPath && isWsl && /^[A-Za-z]:[\\/]/.test(first)) {
     return `节点声明了 WSL 车道，但解释器是 Windows 路径（${first}）。WSL 内应使用 Linux 路径（如 /home/<user>/envs/ml/bin/python）。`;
   }
+  // cwd 的车道不匹配（2026-09-12 补）：只查命令首 token 会漏掉"声明了 wsl 但 cwd 忘改"，
+  // 那种情况 WSL 里 cd 失败，报出来的是 bash 原文而不是该怎么做。
+  const cwdStr = String(node.cwd || '');
+  if (isWsl && (/^[A-Za-z]:[\\/]/.test(cwdStr) || cwdStr.startsWith('\\\\'))) {
+    const drive = cwdStr.slice(0, 1).toLowerCase();
+    const rest = cwdStr.slice(2).replace(/^[\\/]+/, '').replace(/\\/g, '/');
+    return `节点声明了 WSL 车道，但 cwd 是 Windows 路径（${cwdStr}）。WSL 里要用 Linux 路径——Windows 盘上的目录在 WSL 下是 /mnt/<盘符小写>/...，本例应写 /mnt/${drive}/${rest}。`;
+  }
+  if (!isWsl && /^\/(?!\/)/.test(cwdStr)) {
+    return `节点没有声明 WSL 车道，但 cwd 是 Linux 路径（${cwdStr}）。Windows 车道要用 Windows 路径（C:\\...），或给该节点加 shell: "wsl"（命令也用 Linux 解释器）。`;
+  }
   return null;
 }
 
@@ -645,7 +656,7 @@ function dispatchJob(wsKey, node, body = {}) {
       appendEvent(wsKey, { t: 'node.preflight-failed', node: node.id, error: pf.error });
       if (!node.quiet) qqPush(wsKey, `[❌ 预检失败] ${node.id}\n${pf.error.slice(0, 300)}`).catch(() => {});
       pushInbox({ node: node.id, verdict: 'preflight-failed' });
-      resolve({ ok: false, error: 'preflight-failed' });
+      resolve({ ok: false, kind: 'preflight-failed', error: pf.error });
       return;
     }
     // 断点第一层（防忘）：长任务脚本无存档模式 → 警告不拦截（拦截会冻结无人值守任务线）
@@ -1515,7 +1526,7 @@ function classifyRunCommand(command, cwd) {
 }
 
 /** 快速单发统一入口：写 plan 头 + 账本 + 派发（白名单/自批/人工放行共用）。 */
-function launchQuickRun(wsKey, node, extra = {}) {
+async function launchQuickRun(wsKey, node, extra = {}) {
   try {
     const dir2 = dirOf(wsKey);
     if (!fs.existsSync(path.join(dir2, 'plan.md'))) {
@@ -1523,7 +1534,7 @@ function launchQuickRun(wsKey, node, extra = {}) {
     }
   } catch {}
   appendEvent(wsKey, { t: 'plan.created', nodes: [node.id] });
-  dispatchJob(wsKey, node).catch(() => {});
+  return dispatchJob(wsKey, node);
 }
 
 function submitRunForConfirm(wsKey, node, b, cls) {
@@ -1658,7 +1669,8 @@ const server = http.createServer(async (req, res) => {
       if (cls.level !== 'ok') {
         const night = tryNightSelfApprove(wsKey2, node, b);
         if (night?.approved) {
-          launchQuickRun(wsKey2, node, b);
+          const rN = await launchQuickRun(wsKey2, node, b);
+          if (rN && rN.ok === false) return json(200, { ok: false, error: rN.error });
           return json(200, { ok: true, nodeId: node.id, gate: 'night-self-approved' });
         }
         const rec = submitRunForConfirm(wsKey2, node, b, cls);
@@ -1667,7 +1679,8 @@ const server = http.createServer(async (req, res) => {
           note: night?.blocked || `命令不在白名单（${cls.why}），已推送 owner QQ 等确认，${runGateCfg.dayTimeoutMinutes} 分钟不确认自动作废。改写成白名单形式（解释器跑工作区内脚本）可直接跑。`,
         });
       }
-      launchQuickRun(wsKey2, node, b);
+      const rW = await launchQuickRun(wsKey2, node, b);
+      if (rW && rW.ok === false) return json(200, { ok: false, error: rW.error });
       return json(200, { ok: true, nodeId: node.id, gate: 'whitelist' });
     }
     // v0.3 门禁裁决：/q确认 /q拒绝 的后端
@@ -1681,7 +1694,8 @@ const server = http.createServer(async (req, res) => {
         appendEvent(rec.wsKey, { t: 'gate.approved', node: rec.node.id, gateId: rec.id });
         pushInbox({ node: rec.node.id, verdict: 'gate-approved', gateId: rec.id });
         qqPush(rec.wsKey, `[✅ 已放行] ${rec.node.id}（${rec.id}）\n命令：${rec.command.slice(0, 200)}\n开始执行，照常走判定/总结/通知`.slice(0, 500)).catch(() => {});
-        launchQuickRun(rec.wsKey, rec.node, { title: rec.title });
+        const rA = await launchQuickRun(rec.wsKey, rec.node, { title: rec.title });
+        if (rA && rA.ok === false) return json(200, { ok: false, action: 'preflight-failed', error: rA.error });
         return json(200, { ok: true, action: 'dispatched', nodeId: rec.node.id });
       }
       rec.status = 'rejected'; saveRunGate();
@@ -1816,16 +1830,18 @@ const server = http.createServer(async (req, res) => {
         : plan.nodes.filter((x) => state.nodes[x.id]?.status === 'failed' && plan.nodes.find((y) => y.id === x.id)?.resumeOnBoot);
       if (!targets.length) return json(404, { ok: false, error: '没有可续跑的节点（需 resume_on_boot: true 且当前为失败态）' });
       const done = [];
+      const failed = [];
       for (const node of targets) {
         try {
           markResumed(wsKey, node.id, appendEvent);
           appendEvent(wsKey, { t: 'node.unfrozen', node: node.id });
-          dispatchJob(wsKey, node).catch(() => {});
+          const rr = await dispatchJob(wsKey, node);
+          if (rr && rr.ok === false) { failed.push({ node: node.id, error: rr.error }); continue; }
           done.push(node.id);
         } catch (e) { log('续跑失败:', node.id, e?.message); }
       }
-      appendEvent(wsKey, { t: 'resume.dispatched', nodes: done });
-      return json(200, { ok: true, resumed: done });
+      appendEvent(wsKey, { t: 'resume.dispatched', nodes: done, failed });
+      return json(200, { ok: failed.length === 0, resumed: done, ...(failed.length ? { failed } : {}) });
     }
     // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
     if (req.method === 'POST' && u.pathname === '/api/cancel') {

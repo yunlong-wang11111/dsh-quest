@@ -75,18 +75,18 @@ function apply(ctx, config = {}) {
 
   ctx.tools.register(defineTool({
     name: 'quest_dispatch',
-    description: '派发任务线里的一个节点（预检→后台执行→自动判定→worker 总结→QQ 推送）。派发立即返回，用 quest_status 查进展。',
+    description: '派发任务线里的一个节点（预检→后台执行→自动判定→worker 总结→QQ 推送）。派发是同步等预检的：预检不过会当场返回原因（如命令用 Linux 路径但没声明 shell: wsl），不会"看起来派发成功其实没跑"。',
     parameters: {
       node: { type: 'string', description: '节点 id（plan.md 里 ---node: <id>--- 定义的那个）' },
       ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd，一般不用传）' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean' }, jobId: { type: 'string' }, error: { type: 'string' } } },
-      render: (_a, v) => [{ type: 'text', text: v.error ? `派发失败：${v.error}` : `已派发 ${v.jobId}（后台执行中，完成后自动通知）` }],
+      schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean' }, jobId: { type: 'string' }, error: { type: 'string' }, hint: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 未派发：${v.error}${v.hint ? `\n${v.hint}` : ''}` : `已派发 ${v.jobId}（后台执行中，完成后自动通知）` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/dispatch?ws=${encodeURIComponent(wsOf(args, exec))}`, {
       method: 'POST', body: JSON.stringify({ node: String(args.node || '') }),
-    }),
+    }, 25000),
   }));
 
   ctx.tools.register(defineTool({
@@ -98,6 +98,7 @@ function apply(ctx, config = {}) {
       '**跨平台**：节点字段 shell: wsl 可让该节点跑进 WSL(Ubuntu)——bash 语法、cwd 用 Linux 路径（/home/xxx/...）、不经 cmd.exe（无引号问题）、quest 崩溃照常跑。适合重训练和数据管线密集的任务；文件需在 WSL 内（ext4），别用 /mnt/c 跑训练。缺省 windows 照旧。',
       '**门禁规则**：解释器（python/node/Rscript/matlab/julia）跑工作区内脚本的命令直接执行；其它命令（删除/下载/系统类/工作区外路径）会被挂起推送 owner QQ 等人工确认，30 分钟不确认自动作废——这不是失败，返回的 note 会说明原因。夜间窗口（23:00-08:00）带 reason 可自批执行。所以：常规长任务请写成"python 工作区内脚本"形式，永远畅通；命令被挂起时不要反复原样重试，等确认或改写。',
       '任务结束自动通知（QQ 推送+worker 总结）——**派发后你的工作就完成了，不要设 goal/create_goal 来轮询进度，不要 Sleep 后再查。quest 有事件驱动通知，你等着被通知或被问就行。** 用户催进度时读工作区的 progress.md（quest 自动维护的实时快照）。',
+      '**同步等预检**：本工具会等预检结果才返回。预检不过（脚本语法错、命令用了 Linux 路径却没声明 shell: wsl、解释器不存在、车道与路径不匹配）会当场回「未派发：<原因>」——不会"看起来派发成功其实没跑"。看到它就按原因改正后重试（最常见：Linux 解释器要配 shell: "wsl" + Linux 的 cwd），不要原样重发。',
     ].join(' '),
     parameters: {
       command: { type: 'string', description: '要后台执行的完整命令（解释器用绝对路径）' },
@@ -111,8 +112,8 @@ function apply(ctx, config = {}) {
       ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, nodeId: { type: 'string' }, gate: { type: 'string' }, gateId: { type: 'string' }, note: { type: 'string' }, error: { type: 'string' } } },
-      render: (_a, v) => [{ type: 'text', text: v.error ? `派发失败：${v.error}` : v.gate === 'pending-confirm' ? `⏳ 命令被门禁挂起（${v.gateId}）：${v.note || '已推送 owner QQ 等确认'}` : `✅ 已后台派发：${v.nodeId}${v.gate === 'night-self-approved' ? '（夜间自批，已留痕）' : ''}
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, nodeId: { type: 'string' }, gate: { type: 'string' }, gateId: { type: 'string' }, note: { type: 'string' }, error: { type: 'string' }, hint: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 未派发：${v.error}${v.hint ? `\n${v.hint}` : ''}` : v.gate === 'pending-confirm' ? `⏳ 命令被门禁挂起（${v.gateId}）：${v.note || '已推送 owner QQ 等确认'}` : `✅ 已后台派发：${v.nodeId}${v.gate === 'night-self-approved' ? '（夜间自批，已留痕）' : ''}
 进度自动写入工作区 progress.md，完成后 QQ 通知` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/run?ws=${encodeURIComponent(wsOf(args, exec))}`, {
@@ -124,7 +125,7 @@ function apply(ctx, config = {}) {
         handoff: String(args.handoff || ''), autoFix: args.auto_fix === 'true' || args.auto_fix === true,
         shell: args.shell === 'wsl' ? 'wsl' : 'windows',
       }),
-    }, 8000),
+    }, 25000),
   }));
 
   ctx.tools.register(defineTool({
