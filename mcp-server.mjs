@@ -53,10 +53,10 @@ const server = new McpServer({ name: 'quest', version: '0.5.0' });
 
 server.tool(
   'quest_plan',
-  '写入任务线 plan.md（多节点流水线：依赖链 after、条件分支 when、自动修复 auto_fix、盯梢 watch_rules、WSL 车道 shell）。整体替换当前工作区的计划。',
-  { markdown: z.string().describe('完整的 plan.md 内容'), ws: z.string().optional().describe('工作区绝对路径') },
-  async ({ markdown, ws }) => {
-    const r = await q('POST', `/api/plan?ws=${encodeURIComponent(ws || '')}`, { markdown });
+  '写入任务线 plan.md（多节点流水线：依赖链 after、条件分支 when、自动修复 auto_fix、盯梢 watch_rules、WSL 车道 shell、冻结策略 freeze_on）。整体替换当前工作区的计划。若新计划会丢掉旧计划里未完成（非 completed）的节点，服务端会返回 409 并列出是被丢的哪些节点——先确认这是你要的，再带 force:true 重提交；不要把 409 当故障盲目重试。',
+  { markdown: z.string().describe('完整的 plan.md 内容'), ws: z.string().optional().describe('工作区绝对路径'), force: z.boolean().optional().describe('确认丢弃旧计划中未完成的节点（默认 false）') },
+  async ({ markdown, ws, force }) => {
+    const r = await q('POST', `/api/plan?ws=${encodeURIComponent(ws || '')}`, { markdown, ...(force === true ? { force: true } : {}) });
     return r.error ? fail(r) : ok(r);
   },
 );

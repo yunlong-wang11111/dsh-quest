@@ -28,7 +28,7 @@ async function questCall(cfg, path, init = {}, timeoutMs = 4000) {
       signal: ac.signal,
     });
     const json = await resp.json().catch(() => ({}));
-    if (!resp.ok) return { error: json.error || `HTTP ${resp.status}` };
+    if (!resp.ok) return { error: json.error || `HTTP ${resp.status}`, ...(json.hint ? { hint: json.hint } : {}), ...(json.dropped ? { dropped: json.dropped } : {}) };
     return json;
   } catch (err) {
     return { error: `quest 服务不可达（${String(err && err.message || err)}）——服务在跑吗？` };
@@ -54,19 +54,22 @@ function apply(ctx, config = {}) {
       '⚠️ 写之前必须先用 read 工具读模板：__HOME__\\dsh-plugins\\quest\\PLAN-TEMPLATE.md',
       '（含五段科研流水标准骨架、handoff 写作指南与红线——handoff 质量决定 worker 总结质量）。',
       '要点速览：节点用 "---node: <id>---" 分节；command 必填（解释器绝对路径）；',
-      'expect_minutes 写真实值（超时护栏=2倍）；after 声明依赖（上游成功自动派发、失败冻结下游）；',
+      'expect_minutes 写真实值（超时护栏=2倍）；after 声明依赖（上游成功自动派发、失败冻结下游；',
+      '若某节点不该被"疑似"上游拦住，给上游或 plan 头加 freeze_on: hard-fail-only——只有真失败才冻结，疑似放行并推你复核）；',
       '写完 plan 后顺手用 task_summary_update 把各节点登记进任务总揽（标题=节点id，备注=做什么）；manual: true 停下等人工；auto_fix: true 失败后自动修复；when: <节点>.verdict==ok 或 <节点>.metrics.loss_slope_10ep < -0.05 等条件门控（趋势运算符 slope_N/plateau_epochs 支持"看变化程度"的分支：a好跑b、不好跑c）；watch_log+watch_rules 运行中监控（默认只警告，NaN/OOM 类可配 action=kill+confirm 连续命中）；只需派发链头节点。**派发后不要设 goal 轮询——任务完成会 QQ 通知+自动流转。** workspace 取当前会话 cwd。',
+      '⚠️ 整体替换计划时会拦截"静默丢节点"：若旧计划里有未完成（非 completed）的节点不在新计划里，服务端返回 409 并列出节点，先确认这是有意的，再带 force:true 重提交——不要把 409 当故障重试。',
     ].join(' '),
     parameters: {
       markdown: { type: 'string', description: '完整 plan.md 内容' },
       ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd，一般不用传）' },
+      force: { type: 'boolean', description: '确认丢弃旧计划里未完成的节点（默认 false）。仅在收到 409 且确认要丢弃时传 true。' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean' }, nodes: { type: 'array', items: { type: 'string' } }, errors: { type: 'array', items: { type: 'string' } }, workspace: { type: 'string' }, error: { type: 'string' } } },
-      render: (_a, v) => [{ type: 'text', text: v.error ? `写入失败：${v.error}` : `任务线已保存，节点：${(v.nodes || []).join(', ')}` }],
+      schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean' }, nodes: { type: 'array', items: { type: 'string' } }, errors: { type: 'array', items: { type: 'string' } }, workspace: { type: 'string' }, error: { type: 'string' }, hint: { type: 'string' }, dropped: { type: 'array', items: { type: 'object', additionalProperties: true, properties: { id: { type: 'string' }, status: { type: 'string' } } } } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 计划未替换：${v.error}${v.hint ? `\n${v.hint}` : ''}` : `任务线已保存，节点：${(v.nodes || []).join(', ')}` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/plan?ws=${encodeURIComponent(wsOf(args, exec))}`, {
-      method: 'POST', body: JSON.stringify({ markdown: String(args.markdown || '') }),
+      method: 'POST', body: JSON.stringify({ markdown: String(args.markdown || ''), ...(args.force === true ? { force: true } : {}) }),
     }, 8000),
   }));
 

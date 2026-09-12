@@ -10,6 +10,7 @@
 # 任务线：<一句话说清这批实验在验证什么>
 workspace: <绝对路径>
 # 任务线头部可写 shell: wsl —— 整条任务线默认进 WSL（节点级可单独覆盖为 windows），AI 无需逐节点决定
+# 任务线头部可写 freeze_on: hard-fail-only —— 整条线"只有真失败才冻结下游"，疑似上游放行（详见下方冻结策略）
 
 ---node: <id-短横线小写>---
 command: <完整命令，解释器用绝对路径，如 E:\python_env\pinn\Scripts\python.exe>
@@ -24,6 +25,7 @@ quiet: <true=不发 QQ；缺省=false>
 max_log_mb: <stdout 日志封顶 MB，默认 256；超限截断（保留尾部新内容），防 verbose 训练吃满磁盘>
 push_images: <成功后把 cwd 里新产出的 png/jpg 直推 QQ 的张数上限，默认 2；0=关。可视化节点建议保持默认>
 shell: <windows 缺省；wsl = 该节点在 WSL(Ubuntu) 里跑
+freeze_on: <any-fail（缺省）= 上游任何异常都冻结下游；hard-fail-only = 上游只是"疑似"时放行下游>
 no_checkpoint: <true = 显式声明不需要断点（屏蔽「无存档提醒」）>
 断点约定：quest 派发/重派时自动把 cwd 里最新的 .pt/.ckpt/.pth 路径放进环境变量 QUEST_RESUME_FROM——脚本开头按约定读它（有则加载续跑），存档写固定文件名。长任务（>=15 分钟）脚本里没有 torch.save/checkpoint 模式会被提醒。
 ——bash 语法、cwd 用 Linux 路径（如 /home/xxx/exp），命令不经 cmd.exe（无引号剥离问题），且负载由 WSL 虚拟机养着、quest/DSH 崩溃照常跑>
@@ -79,6 +81,23 @@ manual: true        ← 出图前停一下等确认（想全自动就删这行�
 handoff: |
   <可视化段：出什么图、每张图要说明什么>
 ```
+
+## 冻结策略 freeze_on（②c，2026-09-12）
+
+上游失败默认冻结下游（`any-fail`）——保守，但整条链会因为一次"疑似"停摆。判定器的 `suspect`
+只代表**没找到完成证据**（没打印完成关键词、没产出文件），不等于失败：可能是脚本没写日志，
+也可能真的没跑完。既然有探针可以事后查证，这个判断就不该由脚本一刀切：
+
+- `freeze_on: hard-fail-only`：只有**真失败**（crashed / startup-failed / timeout / cancelled /
+  预检失败）才冻结下游；上游是 `suspect` 时**放行**下游，同时推一条 QQ：
+  「上游 X 疑似但已放行，让 AI 用 quest_probe 查证；确认没跑完就 /q取消 下游」。
+- 写哪都行，任一处声明即生效：**下游节点**（"别因为疑似上游冻我"）、**上游节点**（"我的疑似别
+  拖累全链"）、或 **plan 头**（整条线兜底）。建议写 plan 头。
+- 放行不等于失明：progress.md 会在下游那行标「⚠️上游疑似放行（X）」，账本记 `node.soft-pass`。
+
+**AI 的中间裁决流程**（默认动作）：收到"疑似但放行"通知 →`quest_probe` 查上游日志尾/产物
+mtime → 确认正常：什么都不做，让它继续跑；确认没跑完：`quest_cancel` 下游 + `quest_dispatch`
+上游（断点存档会自动带上，等于续跑）。
 
 ## 写作红线
 1. command 里的脚本必须**已存在且语法正确**（派发前有 py_compile 预检，语法错会被拦截并原文上报）

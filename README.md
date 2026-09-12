@@ -154,7 +154,8 @@ workspace: <实验目录绝对路径>
 command: <python 绝对路径> train.py --lr 1e-4
 cwd: <工作目录>
 expect_minutes: 240          # 超时护栏 = 2 倍
-after: gen-data              # 依赖：上游成功自动跑本节点
+after: gen-data              # 依赖：上游成功自动跑本节点、失败冻结下游
+freeze_on: hard-fail-only    # 可选：只有真失败才冻结下游，上游"疑似"时放行（可写 plan 头）
 auto_fix: true               # 失败后自动修复（可选）
 fix_budget: 2                # 修复次数上限（默认 2）
 handoff: |                   # 给 worker 的交接上下文（决定总结质量的上限）
@@ -235,6 +236,9 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 
 ## v0.5 新增
 
+- **计划覆盖保护（`force`）**：`/api/plan` 整体替换 `plan.md` 时，若旧计划里有未完成（非 `completed`）的节点不会出现在新计划里，服务端返回 **409** 并列出将丢失的节点与它们的当前状态，要求显式 `force: true` 才提交（账本记 `forced: true`）。防的是"AI 顺手重写 plan 把待办/失败节点一起蒸发、人再也看不见"。MCP 与 DSH 插件的 `quest_plan` 都带 `force` 参数，工具的说明里写明"409 不是故障、不要盲目重试"
+- **冻结策略 `freeze_on`（让 AI 在中间裁决，而不是脚本一刀切）**：上游失败默认冻结下游（`any-fail`，保守）。但判定器的 `suspect` 只代表"没找到完成证据"，不等于失败，整条链不该因此停摆——节点/plan 头声明 `freeze_on: hard-fail-only` 后，只有**真失败**（crashed/startup-failed/timeout/cancelled/预检失败）才冻结下游；上游只是 `suspect` 时放行，并推一条 IM：「上游 X 疑似但已放行，让 AI 用探针查证，确认没跑完就取消下游」。任一处声明即生效（下游/上游/plan 头），账本记 `node.soft-pass`，progress.md 在该行标「⚠️上游疑似放行」
+- **判定器修复（假 ok）**：quest 自己的台账 `progress.md` / `research-state.md` / `plan.md` 就写在任务工作区里（= 节点 cwd），且 `.md` 属于判定器的"文本产物"——节点运行期间任何一次 `/api/status` 刷新都会重写 `progress.md`，于是一个**零产物**的节点也被判成 `ok/artifact-fresh`，把真失败盖过去。现在这三类台账文件被排除在产物扫描之外（沙箱实测复现 + 修复验证）
 - **跨 Agent（MCP 工具面）**：8 个工具以标准 MCP 暴露（stdio），Claude Code / Codex / ZCode / Cursor 等可直接调用——模型不必再自己拼 curl。仓库自带 `mcp-server.mjs`，接法见上文「跨 Agent 使用」章节。实测 Claude Code `✓ Connected`、工具列表与真实调用往返正常
 - **可插拔的总结/修复后端**：quest 的执行/判定/指标/超时/重试/通知全程零模型依赖，只有「任务总结」与「自动修复」需要模型——现在这两件事可换后端：`workerBackend: dsh | openai | cli | off`、`fixerBackend: dsh | cli | off`。`openai` 打任意 OpenAI 兼容 chat completions；`cli` 驱动 headless agent（`claude -p` / `codex exec`）；`off` 为纯机械模式。实测纯机械模式下 `dispatch → 判定 → loss 指标提取 → 通知` 全链路跑通且零模型调用
 - **开机中断检测 + 一键续跑**：重启电脑会杀掉所有任务（Windows/WSL 皆然）。quest 启动对账发现「当时在跑、进程已消失、证据显示未正常完成、**且任务期间电脑确实重启过**（用系统开机时刻判定——这条把 OOM/自行崩溃排除掉，那种情况续跑只会再死一次）」的节点时，若该节点/任务线声明了 `resume_on_boot: true` **且能找到断点存档**，就登记为可续跑并推 IM 提示——回 `/q续跑` 即从断点接着跑（`QUEST_RESUME_FROM` 自动注入）。**检测自动、重派要人点头**：重复跑同一任务会双写产物，这个有副作用的决定留给人；另有每节点自动提示上限（`resumeCap`，默认 1）防崩溃循环

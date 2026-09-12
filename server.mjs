@@ -94,13 +94,13 @@ function parsePlan(markdown) {
     const m = line.match(/^---node:\s*(\S+)---\s*$/);
     if (m) {
       if (cur) nodes.push(cur);
-      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2, shell: '', resumeOnBoot: undefined };
+      cur = { id: m[1], command: '', cwd: '', expectMinutes: 30, timeoutSeconds: 0, success: '', quiet: false, needsExecution: false, handoff: '', after: [], manual: false, autoFix: false, fixBudget: 2, when: '', watchLog: '', watchIntervalMinutes: 10, watchRules: [], maxLogMB: 0, pushImages: 2, shell: '', resumeOnBoot: undefined, freezeOn: '' };
       handoffMode = false;
       continue;
     }
     if (!cur) {
       const kv = line.match(/^([a-zA-Z_]+):\s*(.*)$/);
-      if (kv && ['workspace', 'title', 'shell', 'resume_on_boot'].includes(kv[1])) meta[kv[1]] = kv[2].trim();
+      if (kv && ['workspace', 'title', 'shell', 'resume_on_boot', 'freeze_on'].includes(kv[1])) meta[kv[1]] = kv[2].trim();
       // 没写 title: 时，取第一个 Markdown 一级标题当标题（模板惯例是 "# 任务线：<名字>"）
       const h = line.match(/^#\s+(.+)$/);
       if (h && !meta.heading) meta.heading = h[1].replace(/^\s*任务线[：:]\s*/, '').trim().slice(0, 40);
@@ -130,6 +130,7 @@ function parsePlan(markdown) {
       case 'shell': cur.shell = v.trim().toLowerCase() === 'wsl' ? 'wsl' : 'windows'; break;
       case 'resume_on_boot': cur.resumeOnBoot = v.trim() === 'true'; break; // 开机中断后允许一键续跑（默认关）
       case 'no_checkpoint': cur.noCheckpoint = v.trim() === 'true'; break; // 显式声明不需要断点（屏蔽第一二层提醒） // wsl = 在 WSL(Ubuntu) 里跑（bash 语法，Linux 路径）
+      case 'freeze_on': cur.freezeOn = v.trim().toLowerCase() === 'hard-fail-only' ? 'hard-fail-only' : 'any-fail'; break; // ②c：只有真失败（崩溃/超时/取消）才冻结下游，suspect 放行
       case 'when': cur.when = v.trim(); break;
       case 'watch_log': cur.watchLog = v.trim(); break;
       case 'watch_interval_minutes': cur.watchIntervalMinutes = Number(v) || 10; break;
@@ -155,6 +156,8 @@ function parsePlan(markdown) {
   // shell 解析优先级：节点级 > plan 级（meta）> windows。plan 头写一次 shell: wsl = 整条任务线默认进 WSL。
   for (const n of nodes) n.shell = n.shell === 'wsl' ? 'wsl' : (meta.shell === 'wsl' ? 'wsl' : 'windows');
   for (const n of nodes) if (n.resumeOnBoot === undefined) n.resumeOnBoot = meta.resume_on_boot === 'true';
+  // ②c freeze 策略继承：节点级 > plan 级 > any-fail（默认行为与旧版一致，老 plan 不受影响）
+  for (const n of nodes) if (!n.freezeOn) n.freezeOn = meta.freeze_on === 'hard-fail-only' ? 'hard-fail-only' : 'any-fail';
   for (const n of nodes) {
     if (!n.command) errors.push(`节点 ${n.id} 缺 command`);
     if (!n.cwd) n.cwd = meta.workspace || '';
@@ -203,6 +206,8 @@ function buildState(wsKey) {
       if (e.t === 'node.metrics') { n.metrics = e.metrics; }
       if (e.t === 'watch.warn') { n.watchWarns = (n.watchWarns ?? 0) + 1; }
       if (e.t === 'watch.kill') { n.watchKilled = e.rule; }
+      // ②c：上游只是"疑似"被放行——不阻塞，但要在 progress.md 里留痕，AI 扫一眼就知道该查谁
+      if (e.t === 'node.soft-pass') { n.softPass = e.upstream || []; }
     }
   } catch {}
   return state;
@@ -257,6 +262,10 @@ const FINISH_KEYWORDS = ['训练完成', '训练结束', '训练成功', '训练
   'success', 'successful', 'model saved', 'save model', 'saved model', 'saved successfully', 'all done', '100%', 'done!'];
 const TEXT_EXTS = ['.log', '.txt', '.out', '.md', '.json', '.csv'];
 const ARTIFACT_EXTS = ['.pt', '.npz', '.pth', '.ckpt', '.png', '.jpg', '.h5', '.npy', '.bin'];
+// quest 自己的台账就写在任务工作区里（progress.md / research-state.md / plan.md）——它们不是任务产出。
+// 不排除的后果实测过：节点运行期间任何一次 /api/status 刷新都会重写 progress.md，
+// 于是一个零产物的节点也被判成 ok/artifact-fresh（假 ok，会掩盖真失败）。
+const QUEST_OWN_FILES = new Set(['progress.md', 'research-state.md', 'plan.md']);
 
 /** 从日志尾恢复真实退出码（WSL 包装器写的 EXIT_CODE:<n>）；拿不到返回 null。 */
 function recoverExitCode(logFile) {
@@ -290,6 +299,7 @@ function judge(node, exitCode, runSec, logFile) {
     for (const en of entries) {
       if (!en.isFile()) continue;
       const lower = en.name.toLowerCase();
+      if (QUEST_OWN_FILES.has(lower)) continue; // quest 台账不算产物
       if (![...TEXT_EXTS, ...ARTIFACT_EXTS].some((x) => lower.endsWith(x))) continue;
       try {
         const st = fs.statSync(path.join(d, en.name));
@@ -485,6 +495,7 @@ function writeProgress(wsKey) {
       if (st.metrics?.loss_last != null) l += ` · loss ${st.metrics.loss_last}`;
       if (st.metrics?.loss_slope_10ep != null) l += ` · 10ep斜率 ${st.metrics.loss_slope_10ep}`;
       if (st.watchWarns) l += ` · ⚠️watch警告×${st.watchWarns}`;
+      if (st.softPass?.length) l += ` · ⚠️上游疑似放行（${st.softPass.join(',')}）——建议用探针查证`;
       if (st.fixCount) l += ` · 修复${st.fixCount}次`;
       lines.push(l);
       if (st.lastFix) lines.push(`  - 最近修复: ${String(st.lastFix).split('\n')[0].slice(0, 120)}`);
@@ -1198,9 +1209,31 @@ async function orchestrate(wsKey) {
   const stOf = (id) => state.nodes[id]?.status ?? 'pending';
   const evOf = (id) => state.nodes[id]?.events ?? [];
 
+  // ②c 冻结策略：默认 any-fail（上游任意异常都冻结下游，保守，与旧版一致）。
+  // 声明 freeze_on: hard-fail-only 的节点只认"真失败"（崩溃/启动失败/超时/取消/预检失败）；
+  // suspect 只是"判定器没找到完成证据"，可能是坏、也可能是没写关键词——交给探针查证，
+  // 脚本不替 AI 做这个判断：不冻结、放行下游，同时推一条带探针指令的提醒。
+  const SOFT_VERDICTS = new Set(['suspect']);
+  const freezePolicy = new Map(plan.nodes.map((x) => [x.id, x.freezeOn || 'any-fail']));
   for (const n of plan.nodes) {
     if (stOf(n.id) !== 'pending' || !n.after?.length) continue;
-    const bad = n.after.find((d) => ['failed', 'timeout', 'frozen', 'cancelled', 'skipped'].includes(stOf(d)));
+    const badAll = n.after.filter((d) => ['failed', 'timeout', 'frozen', 'cancelled', 'skipped'].includes(stOf(d)));
+    if (!badAll.length) continue;
+    // 声明归属是双向的：写在下游（"别因为疑似上游冻我"）或写在上游（"我的疑似别拖累全链"）
+    // 都生效；plan 头写一次则整条线兜底。任一处声明即按宽松口径处理，避免"字面写了却不生效"。
+    const lenient = n.freezeOn === 'hard-fail-only' || badAll.some((d) => freezePolicy.get(d) === 'hard-fail-only');
+    const soft = lenient
+      ? badAll.filter((d) => SOFT_VERDICTS.has(String(state.nodes[d]?.verdict || '')))
+      : [];
+    const bad = badAll.find((d) => !soft.includes(d));
+    if (!bad && soft.length && !evOf(n.id).includes('node.soft-pass')) {
+      const desc = soft.map((d) => `${d}(${state.nodes[d]?.verdict || '?'}/${state.nodes[d]?.via || '?'})`).join('、');
+      appendEvent(wsKey, { t: 'node.soft-pass', node: n.id, upstream: soft, verdicts: soft.map((d) => state.nodes[d]?.verdict), reason: `freeze_on=hard-fail-only：上游 ${desc} 仅疑似，不冻结` });
+      pushInbox({ node: n.id, verdict: '上游疑似但已放行', detail: `${desc}；如需复核用 quest_probe 看上游日志与产物，确认是坏的则 /q取消 ${n.id}` });
+      if (!n.quiet) {
+        qqPush(wsKey, `[⚠️ 疑似但放行] ${n.id}\n上游 ${desc} 判定为"疑似"（没找到完成证据，不等于失败）——本节点按 freeze_on: hard-fail-only 直接开跑。\n让 AI 用 quest_probe 查证上游；确认确实没跑完就 /q取消 ${n.id}`).catch(() => {});
+      }
+    }
     if (bad && !evOf(n.id).includes('node.frozen')) {
       appendEvent(wsKey, { t: 'node.frozen', node: n.id, reason: `上游 ${bad} ${stOf(bad)}` });
       state.nodes[n.id] = state.nodes[n.id] ?? { status: 'pending', events: [] };
@@ -1574,8 +1607,31 @@ const server = http.createServer(async (req, res) => {
       const parsed = parsePlan(body.markdown || '');
       if (parsed.errors.length) return json(400, { ok: false, errors: parsed.errors });
       const dir = dirOf(wsKey);
-      fs.writeFileSync(path.join(dir, 'plan.md'), body.markdown, 'utf8');
-      appendEvent(wsKey, { t: fs.existsSync(path.join(dir, 'ledger.jsonl')) ? 'plan.reloaded' : 'plan.created', nodes: parsed.nodes.map((n) => n.id) });
+      // ⑦ 覆盖保护：plan.md 是"任务线的唯一真相"，被整体替换时旧 plan 里还没干净收尾的节点
+      // 会连状态一起蒸发（历史上发生过：AI 重写 plan 顺手删掉待办/失败节点，人再看不见）。
+      // 只认 completed 为"可以静默丢弃"；其余（含 skipped/cancelled）都要求显式 force 确认。
+      const planFile = path.join(dir, 'plan.md');
+      if (fs.existsSync(planFile) && body.force !== true) {
+        let oldNodes = [];
+        try { oldNodes = parsePlan(fs.readFileSync(planFile, 'utf8')).nodes; } catch { oldNodes = []; }
+        const keep = new Set(parsed.nodes.map((n) => n.id));
+        const st = buildState(wsKey);
+        const dropped = oldNodes
+          .filter((n) => !keep.has(n.id))
+          .map((n) => ({ id: n.id, status: st.nodes[n.id]?.status || 'pending', verdict: st.nodes[n.id]?.verdict || null }))
+          .filter((d) => d.status !== 'completed');
+        if (dropped.length) {
+          const desc = dropped.map((d) => `${d.id}(${d.status}${d.verdict ? '/' + d.verdict : ''})`).join('、');
+          return json(409, {
+            ok: false,
+            error: `新 plan 会丢掉 ${dropped.length} 个未完成节点：${desc}`,
+            dropped,
+            hint: '确认要丢弃就把这些节点写回新 plan，或重新提交时带 force:true（quest_plan 的 force 参数 / POST body {"force":true}）。已完成的节点不会拦。',
+          });
+        }
+      }
+      fs.writeFileSync(planFile, body.markdown, 'utf8');
+      appendEvent(wsKey, { t: fs.existsSync(path.join(dir, 'ledger.jsonl')) ? 'plan.reloaded' : 'plan.created', nodes: parsed.nodes.map((n) => n.id), ...(body.force === true ? { forced: true } : {}) });
       return json(200, { ok: true, nodes: parsed.nodes.map((n) => n.id), workspace: ws });
     }
     // P4：进程树查询
