@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // quest 服务 —— 任务线编排核心（P1：账本+作业执行+预检+判定器；P2：worker 子会话；P3：QQ 推送）
 //
-// 设计文档：__HOME__\dsh-plugins\QUEST_DESIGN.md
+// 字段说明与任务线格式：见 PLAN-TEMPLATE.md；通知出口与监督器：见 README.md
 // 数据目录：~/.dsh/quests/<wsKey>/（plan.md + ledger.jsonl + logs/ + state.json）
 // 端口：默认 3110，仅绑定 127.0.0.1；token 首启生成于 ~/.dsh/quests/.token
 //
@@ -32,22 +32,19 @@ const TOKEN_PATH = path.join(HOMEOverride, '.token');
 // ── 配置 ────────────────────────────────────────────────────────────────
 fs.mkdirSync(HOMEOverride, { recursive: true });
 if (!fs.existsSync(CONFIG_PATH)) {
+  // 默认配置必须"开箱可用"：只留真正需要的键，且都指向通用默认值。
+  // 通知出口默认关闭（provider 无关，配法见 README「通知出口」）——不预置任何 IM 桥路径。
   fs.writeFileSync(CONFIG_PATH, JSON.stringify({
     port: 3110,
-    // worker 会话目标：生产=http://127.0.0.1:3080（token 从 dsh-run.log 解析）
-    // 沙盒=http://127.0.0.1:3090 + tokenLog 指向沙盒日志
-    dshBaseUrl: 'http://127.0.0.1:3090',
-    dshTokenLog: '__HOME__/.dsh-test/sandbox-run3.log',
+    // worker 总结会话要连的 DSH 地址（DSH 默认端口 3080）；token 见下
+    dshBaseUrl: 'http://127.0.0.1:3080',
     dshToken: '',
     workerPreset: 'quest-worker',
     fixerPreset: 'quest-fixer',
-    qqNotify: {
-      enabled: false,
-      bridgeUrl: 'http://127.0.0.1:3100',
-      tokenFile: '__HOME__/qq-bridge/state/console-token',
-      userId: 0,
-    },
+    // 通知出口：off（默认）| bridge（任意 POST /api/send/private 的通知端）| webhook（任意 HTTP 端点）
+    notify: { kind: 'off' },
   }, null, 2));
+  console.log(`[quest] 已生成默认配置 ${CONFIG_PATH}（通知出口默认关闭，配法见 README「通知出口」）`);
 }
 const CFG = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 CFG.port = Number(argOf('--port', CFG.port));

@@ -79,7 +79,7 @@ npx dsh-quest-service
 #    服务起来后：仪表盘 http://127.0.0.1:3110/dashboard
 #              MCP 服务器 npx dsh-quest-service mcp（接 Claude Code / Codex / ZCode）
 
-# 2. 编辑 ~/.dsh/quests/quest-config.json（QQ 推送等），重启服务生效
+# 2. 编辑 ~/.dsh/quests/quest-config.json（通知出口等；默认关闭，配法见下文「通知出口」），重启服务生效
 
 # 3. 挂 DSH 插件：把 dsh-plugin/ 目录 link 或复制到你的 DSH profile，
 #    package.json 的 dsh.profile.bundles 加 "dsh-quest"
@@ -122,6 +122,10 @@ npx dsh-quest-service
 | 钉钉机器人 | `https://oapi.dingtalk.com/robot/send?access_token=<TOKEN>` | `{"msgtype":"text","text":{"content":"{{message}}"}}` |
 | 飞书机器人 | `https://open.feishu.cn/open-apis/bot/v2/hook/<TOKEN>` | `{"msg_type":"text","content":{"text":"{{message}}"}}` |
 | 企业微信 | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<KEY>` | `{"msgtype":"text","text":{"content":"{{message}}"}}` |
+| ntfy（自建/公共实例，手机 App 真推送） | `https://ntfy.sh/<topic>` | `{{message}}` |
+| Apprise API（一个端点转发到 100+ 服务） | `http://<host>:8000/notify/<key>` | `{"title":"quest","body":"{{message}}"}` |
+
+ntfy 这类"把请求体本身当消息"的服务用**裸** `{{message}}`；Telegram/钉钉这类要求 JSON 信封的用"带引号"写法。
 
 `{{message}}` 两种写法都支持：**带引号**（`"{{message}}"`，填 JSON 内层转义）或**裸放**（`{{message}}`，填完整 JSON 串）。照服务商文档抄哪种都对。消息里的引号、换行、反斜杠都会正确转义。
 
@@ -136,12 +140,19 @@ npx dsh-quest-service
 
 **Linux / macOS（推荐，用 systemd 而不是自己写守护）**：'guard/quest.service' 是现成的用户级单元（`Restart=always` + 重启风暴保护 + 日志落盘）。装法见文件头注释，四行命令。
 
-**Windows（没有 systemd，用计划任务）**：`guard/quest-guard.ps1` 是 40 行的最小监督器——探活 `/api/status`（任何 HTTP 响应都算活着，含 401），000 才判定为死并拉起，全程记日志。注册成每 5 分钟一次：
+**Windows（没有 systemd：计划任务 + 一个自愈批处理）**：`start-quest.bat` 是最小监督器——崩了 5 秒重起、按端口做单实例守卫（避免两个实例互抢端口刷屏）、日志超 32MB 自动归档。`quest-autostart.vbs` 负责以**隐藏窗口**把批处理拉起来。
 
 ```bat
-schtasks /Create /TN "quest-guard" /SC MINUTE /MO 5 /RL HIGHEST ^
-  /TR "powershell -NoProfile -ExecutionPolicy Bypass -File C:\path\to\quest-guard.ps1" /F
+rem 计划任务：登录时启动（每小时的复查见下面的 XML 说明）
+schtasks /Create /TN "quest-service" /SC ONLOGON ^
+  /TR "wscript.exe \"C:\path\to\quest\quest-autostart.vbs\"" /F
 ```
+
+想要"每小时复查一次、但不重复起实例、也不因任务超时被杀"，用 XML 定义三个设置更精确：`MultipleInstancesPolicy=IgnoreNew`、`ExecutionTimeLimit=PT0S`、`LogonType=InteractiveToken`（触发器给"登录"加一个"每小时重复"）。这样**监督链断了会在下一次复查时自己回来**，而正在跑的链不会被重复拉起。
+
+> ⚠️ **不要**把 quest 做成 Windows 服务（NSSM）或用"不管用户是否登录都运行"的计划任务：这两种都跑在 session 0，而 Store 版 WSL 在 session 0 里不可用（`wsl.exe` 会失败）——quest 的 WSL 车道正是靠 `wsl.exe` 派发的，会被打断。用"仅在用户登录时运行"就能两全。代价是：注销后 quest 停止（WSL 虚拟机本来也会随会话消失）。
+
+**更轻的替代**：`guard/quest-guard.ps1` 是一个探活 `/api/status` 的极简监督器（任何 HTTP 响应都算活着，含 401），适合"只要能死而复活"的场景——每 5 分钟轮询一次，注册方式见文件头注释。它和上面的批处理**二选一**，别同时上（两个拉起者会互相抢端口）。
 
 > 注意：监督器只管 **quest 进程**。它不负责"任务不要中断"——那是 quest 自己的事（见「崩溃韧性」与「中断恢复」）。二者互不替代。
 ## 任务线格式 / Plan Format
@@ -164,7 +175,7 @@ handoff: |                   # 给 worker 的交接上下文（决定总结质�
   OOM 会先打印 batch retry……
 ```
 
-完整字段说明与五段科研流水（生成→训练→后处理→评估→可视化）标准骨架见 [PLAN-TEMPLATE.md](PLAN-TEMPLATE.md)，设计取舍见 [DESIGN.md](DESIGN.md)。
+完整字段说明与五段科研流水（生成→训练→后处理→评估→可视化）标准骨架见 [PLAN-TEMPLATE.md](PLAN-TEMPLATE.md)；设计取舍（为什么不用现成工作流引擎、判定器与冻结策略怎么定的）见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 跨 Agent 使用（MCP） / Agent-agnostic via MCP
 
@@ -236,6 +247,7 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 
 ## v0.5 新增
 
+- **开箱可用的默认配置 + 监督器配方**：此前首启生成的 `quest-config.json` 里带着开发期的沙盒端口（3090）与本机路径（清洗后成了不存在的 `__HOME__` 占位），新用户拿到的是一份废配置；现在默认值只有真正需要的键，通知出口默认 `off`，DSH 指向默认端口 3080。Windows 侧的常驻配方也改写为实测过的"计划任务 + 自愈批处理"（`start-quest.bat` 崩了 5 秒重起、按端口做单实例守卫、日志超 32MB 自动归档），并写明**为什么不能做成 Windows 服务或"不登录也运行"的任务**（session 0 里 Store 版 WSL 不可用，会打断 WSL 车道）。设计取舍总览见 [docs/DESIGN.md](docs/DESIGN.md)
 - **计划覆盖保护（`force`）**：`/api/plan` 整体替换 `plan.md` 时，若旧计划里有未完成（非 `completed`）的节点不会出现在新计划里，服务端返回 **409** 并列出将丢失的节点与它们的当前状态，要求显式 `force: true` 才提交（账本记 `forced: true`）。防的是"AI 顺手重写 plan 把待办/失败节点一起蒸发、人再也看不见"。MCP 与 DSH 插件的 `quest_plan` 都带 `force` 参数，工具的说明里写明"409 不是故障、不要盲目重试"
 - **冻结策略 `freeze_on`（让 AI 在中间裁决，而不是脚本一刀切）**：上游失败默认冻结下游（`any-fail`，保守）。但判定器的 `suspect` 只代表"没找到完成证据"，不等于失败，整条链不该因此停摆——节点/plan 头声明 `freeze_on: hard-fail-only` 后，只有**真失败**（crashed/startup-failed/timeout/cancelled/预检失败）才冻结下游；上游只是 `suspect` 时放行，并推一条 IM：「上游 X 疑似但已放行，让 AI 用探针查证，确认没跑完就取消下游」。任一处声明即生效（下游/上游/plan 头），账本记 `node.soft-pass`，progress.md 在该行标「⚠️上游疑似放行」
 - **判定器修复（假 ok）**：quest 自己的台账 `progress.md` / `research-state.md` / `plan.md` 就写在任务工作区里（= 节点 cwd），且 `.md` 属于判定器的"文本产物"——节点运行期间任何一次 `/api/status` 刷新都会重写 `progress.md`，于是一个**零产物**的节点也被判成 `ok/artifact-fresh`，把真失败盖过去。现在这三类台账文件被排除在产物扫描之外（沙箱实测复现 + 修复验证）
@@ -291,9 +303,11 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 
 本仓库可作为一个 DSH 插件收录到社区目录（awesome-dsh-plugin）：投稿材料、要求对照与已知限制见 [docs/market-submission.md](docs/market-submission.md)。
 
-## QQ 命令（搭配 qq-bridge 类通知端）
+## 远程控制命令（示例实现：QQ 桥） / Remote control
 
-> 这些命令由**通知端**实现（读 quest 的 HTTP API：零 token、不经过模型）；quest 本身只提供端点。下表是参考实现，通知端可自行增删。
+> **这是可选的外挂，不是本仓库的组件。** quest 自身不依赖任何 IM：它只提供 HTTP 端点，命令由**通知端**实现（零 token、不经过模型）。下表是一个通知端的参考实现——用来在手机上用聊天命令操作 quest。任何通知端都能实现同一套命令。
+>
+> 下表对应的实现来自 **qq-bridge（第三方项目，不在本仓库内、不随本包分发，本仓库也不包含它的代码或配置）**。README 只描述"要实现哪些命令、调用了 quest 的哪些端点"，你需要自己准备一个通知端；不想弄就配 `notify.kind: webhook` 用只读通知，控制改走仪表盘。
 
 ```
 /q帮助          — 命令速查

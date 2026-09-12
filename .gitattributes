@@ -1,0 +1,5 @@
+# 启动脚本必须保持 CRLF：Windows 的 cmd.exe 对 LF-only 批处理的兼容性并不完整
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
