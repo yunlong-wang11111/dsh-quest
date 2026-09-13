@@ -27,6 +27,8 @@ node tests/run-all.mjs judge    # 只跑名字里含 judge 的
 | `freeze-policy.mjs` | plan 覆盖保护（409 + force + 已完成不拦 + 账本留痕）；`freeze_on: hard-fail-only` 三种声明位置；真崩溃仍冻结 |
 | `preflight-sync.mjs` | 预检失败必须**同步**回原因（不能伪装成"已派发"）：车道不匹配、WSL 配 Windows cwd、语法错、dispatch 路径 |
 | `two-strike.mjs` | DSH 看门狗的"两振判死"（同轮内复探吸收抖动；一直活走快路径）。被测脚本在仓库外，找不到则 SKIP（可用 `QUEST_WATCHDOG_PATH` 指定） |
+| `quiet-signal.mjs` | 收敛信号：只用 quest_run 的工作区也能收到、可重复、不刷屏 |
+| `ws-activity.mjs` | 工作区活跃度：账本安静≠没人干活；有人改代码时不判收敛 |
 | `notify-content.mjs` | 通知内容真的送达且可读（soft-pass 提示含节点/探针指令/取消指令） |
 
 ## 加新测试

@@ -44,6 +44,10 @@ if (!fs.existsSync(CONFIG_PATH)) {
     fixerPreset: 'quest-fixer',
     // 通知出口：off（默认）| bridge（任意 POST /api/send/private 的通知端）| webhook（任意 HTTP 端点）
     notify: { kind: 'off' },
+    // 静默判定：账本安静这么多分钟且没有在跑的节点 → 推一条收敛通知（回答是不是真都完成了）
+    quietMinutes: 10,
+    // 工作区活跃度窗口（分钟）：最近这么多分钟内有文件被改 → 说明"有人正在改代码"
+    wsActivityMinutes: 15,
   }, null, 2));
   console.log(`[quest] 已生成默认配置 ${CONFIG_PATH}（通知出口默认关闭，配法见 README「通知出口」）`);
 }
@@ -175,6 +179,9 @@ function buildState(wsKey) {
       let e; try { e = JSON.parse(l); } catch { continue; }
       if (!e.node) {
         state.lineEvents.push(e);
+        // quest 自己的记账事件（line.quiet/line.concluded）不算"工作区活动"——否则静默通知
+        // 一推、活动时钟立刻被自己刷新，状态又变回"不静默"（实测踩到过）。
+        if (e.at && !['line.quiet', 'line.concluded'].includes(e.t)) state.lastLineEventAt = e.at;
         if (e.t === 'plan.created' || e.t === 'plan.reloaded') {
           for (const n2 of Object.values(state.nodes)) n2.fixCount = 0; // 新 plan = 新预算
         }
@@ -182,6 +189,7 @@ function buildState(wsKey) {
       }
       const n = state.nodes[e.node] ?? (state.nodes[e.node] = { status: 'pending', events: [] });
       n.events.push(e.t);
+      n.lastEventAt = e.at;
       if (e.t === 'node.dispatched') { n.status = 'running'; n.jobId = e.jobId; n.pid = e.pid; n.logTs = e.logTs; n.startedAt = e.at; n.verdict = undefined; n.via = undefined; n.detail = undefined; n.summary = undefined; }
       if (e.t === 'fix.attempt') { n.fixCount = (n.fixCount ?? 0) + 1; n.fixing = true; }
       if (e.t === 'fix.reported') { n.lastFix = e.changes; n.fixing = false; }
@@ -508,6 +516,15 @@ function writeProgress(wsKey) {
     if (!wsDir) return;
     const headers = { 0: '## ✅ 已完成', 1: '## ▶ 进行中', 2: '## ⚠️ 异常（失败/超时/终止）', 3: '## ⏳ 待办（按计划顺序）' };
     const lines = [`# 任务进度（自动更新：${new Date().toLocaleString('zh-CN')}）`];
+    {
+      const act = lineActivity(state);
+      lines.push('', act.active.length
+        ? `> 状态：**进行中**（${act.active.length} 个在跑｜最近动作 ${act.idleMinutes ?? '-'} 分钟前）`
+        : `> 状态：**静默**（没有在跑的节点｜最近动作 ${act.idleMinutes ?? '-'} 分钟前｜共 ${act.nodes.length} 个）`);
+      if (act.ws) lines.push(act.ws.recent
+        ? `> 工作区：最近 ${act.ws.windowMinutes} 分钟有 **${act.ws.recent} 个文件**被改（最新 ${act.ws.latest?.name}，${act.ws.latest?.minutes} 分钟前）——有人正在改代码`
+        : `> 工作区：最近 ${act.ws.windowMinutes} 分钟无文件改动`);
+    }
     let curBucket = -1;
     for (const { n, st } of nodeDisplayOrder(plan, state)) {
       const b = ({ completed: 0, running: 1, failed: 2, timeout: 2, cancelled: 2 })[st.status ?? 'pending'] ?? 3;
@@ -1230,6 +1247,138 @@ ${diff}` : ''}`.slice(0, 900)).catch(() => {});
  * - 节点 failed/timeout → 下游冻结；全部节点终态 → line.concluded + QQ 收尾铃
  * 每个终态事件后调用；同刻多就绪只推进一个（链式天然串行）。
  */
+// ── 静默判定（2026-09-13）：回答"任务是不是真的都完成了" ─────────────────────
+// 为什么需要它：quest 原来只在"plan 声明的节点全部终态"时推一次"任务线结束"，而且只推一次。
+// 真实事故：某工作区 4 个 plan 节点 9/8 就全终态，之后又跑了 29 个 quest_run 快速单发任务，
+// 用户却再也收不到任何"都完成了"的信号——因为 (a) 判定只看 plan.nodes，quick 节点不在里面；
+// (b) 有个"只响一次"的守卫。用户侧的感受就是"我根本不知道子对话是在改代码、在重派，还是真完了"。
+//
+// 判据：没有非终态节点 + 最近 quietMinutes 分钟账本里没有任何动作（含 probe.run——那说明
+// AI/人在工作区里干活）+ 上次静默之后又有过新动作（所以可重复，不是一次性）。
+// 诚实边界：这是"收敛推断"不是"完成保证"——agent 会不会再派任务事前不可观测，
+// 所以通知里必须写清依据（最近动作多久前、共几个节点）。
+const TERMINAL_STATUS = ['completed', 'failed', 'timeout', 'frozen', 'cancelled', 'skipped'];
+const tsOf = (x) => (x ? Date.parse(x) || 0 : 0);
+
+/** 工作区活跃度快照（/api/status 与 progress.md 共用，不触发通知）。 */
+const WS_SKIP_DIRS = new Set(['.git', 'node_modules', 'archive', '__pycache__', 'logs', 'out', 'runs']);
+const WS_SKIP_FILES = new Set(['progress.md', 'research-state.md', 'plan.md']);
+
+/**
+ * 工作区活跃度：最近有没有文件被改动（回答"子对话是不是在改代码"）。
+ * 被动观测——agent、人、别的工具改代码都会写文件，不需要任何配合。
+ * 排除 quest 自己的台账（progress.md/research-state.md/plan.md）与常见产物目录，只看"源码/脚本"类改动。
+ */
+function workspaceActivity(wsDir, minutes) {
+  if (!wsDir) return null;
+  try { if (!fs.statSync(wsDir).isDirectory()) return null; } catch { return null; }
+  const win = Number(minutes ?? CFG.wsActivityMinutes ?? 15) || 15;
+  const found = [];
+  const walk = (dir, depth) => {
+    let list;
+    try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of list) {
+      if (found.length > 3000) return;
+      if (e.isDirectory()) {
+        if (depth > 0 && !WS_SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) walk(path.join(dir, e.name), depth - 1);
+        continue;
+      }
+      if (!e.isFile() || WS_SKIP_FILES.has(e.name)) continue;
+      try { found.push({ name: e.name, mtimeMs: fs.statSync(path.join(dir, e.name)).mtimeMs }); } catch {}
+    }
+  };
+  walk(wsDir, 2);
+  if (!found.length) return { dir: wsDir, windowMinutes: win, recent: 0, lastMs: 0, latest: null };
+  found.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const cutoff = Date.now() - win * 60000;
+  const recent = found.filter((f) => f.mtimeMs > cutoff);
+  return {
+    dir: wsDir, windowMinutes: win, recent: recent.length, lastMs: found[0].mtimeMs,
+    latest: { name: found[0].name, minutes: Math.round((Date.now() - found[0].mtimeMs) / 60000) },
+  };
+}
+
+function lineActivity(state) {
+  const plan0 = state.plan ? parsePlan(state.plan) : { nodes: [], meta: {} };
+  const nodes = mergedPlanNodes(plan0, state).nodes;
+  const stOf = (id) => state.nodes[id]?.status ?? 'pending';
+  const active = nodes.filter((n) => !TERMINAL_STATUS.includes(stOf(n.id)));
+  const lastAct = Math.max(
+    tsOf(state.lastLineEventAt),
+    ...Object.values(state.nodes || {}).map((n) => tsOf(n.lastEventAt)),
+    0,
+  );
+  const idleMs = lastAct ? Math.max(0, Date.now() - lastAct) : null;
+  const idleMinutes = idleMs == null ? null : Math.round((idleMs / 60000) * 100) / 100;
+  const counts = {};
+  for (const n of nodes) counts[stOf(n.id)] = (counts[stOf(n.id)] ?? 0) + 1;
+  const quietMinutes = Number(CFG.quietMinutes ?? 10) || 10;
+  // 工作区活跃度：账本安静 ≠ 没人干活（agent 可能正在改代码还没派发）。两个都静才算"真静默"。
+  // 门控只看静默窗口（quietMinutes）；ws.recent 是给人/AI 看的显示窗口（wsActivityMinutes）。
+  // 两个窗口用途不同——拿显示窗口当门控会比静默窗口还宽，永远不收敛（实测踩到过）。
+  const ws = workspaceActivity(plan0.meta?.workspace || '');
+  const wsIdleMs = ws && ws.lastMs ? Date.now() - ws.lastMs : null;
+  const wsQuiet = ws ? (wsIdleMs == null || wsIdleMs >= quietMinutes * 60000) : true;
+  return {
+    nodes, active, lastAct, idleMs, idleMinutes, counts, quietMinutes, ws, wsQuiet,
+    // 静默判定只在这里算一次，别处直接用（用原始毫秒比，别用取整的分钟——亚分钟配置会算错）
+    quiet: active.length === 0 && !!idleMs && idleMs >= quietMinutes * 60000 && wsQuiet,
+  };
+}
+
+/**
+ * 巡检一个工作区：满足静默条件就推一条可解释的收敛信号（并记 line.quiet 供下次比对）。
+ * 返回 null 表示"无需处理/不适用"，{quiet:false} 表示还在活跃期。
+ */
+function evaluateQuiet(wsKey) {
+  try {
+    const st = buildState(wsKey);
+    if (!st.plan) return null;
+    if (!parsePlan(st.plan).nodes.length && !Object.keys(st.nodes || {}).length) return null;
+    const info = lineActivity(st);
+    const lastQuiet = tsOf((st.lineEvents ?? []).filter((e) => e.t === 'line.quiet').pop()?.at);
+    if (info.lastAct === 0 || info.lastAct <= lastQuiet) {
+      return { quiet: false, active: info.active.length, idleMinutes: info.idleMinutes };
+    }
+    // 注意：任务在跑、或还在静默窗口内、或工作区刚被改过 → 都不算收敛
+    if (!info.quiet) {
+      return { quiet: false, active: info.active.length, idleMinutes: info.idleMinutes, waiting: true, wsRecent: info.ws?.recent ?? null };
+    }
+    const need = info.nodes.filter((n) => ['failed', 'timeout', 'frozen'].includes(st.nodes[n.id]?.status))
+      .slice(0, 4).map((n) => `${n.id.slice(0, 26)}（${st.nodes[n.id]?.verdict || st.nodes[n.id]?.status}）`);
+    appendEvent(wsKey, { t: 'line.quiet', counts: info.counts, idleMinutes: info.idleMinutes, nodes: info.nodes.length });
+    if (notifyKind(CFG) !== 'off') {
+      const summary = Object.entries(info.counts).map(([k, v]) => `${v} ${k}`).join(' / ');
+      const idleTxt = info.idleMinutes >= 1 ? Math.round(info.idleMinutes) + " 分钟前" : '不到 1 分钟前';
+      const wsLine = info.ws ? (info.ws.recent ? `工作区：最近 ${info.ws.windowMinutes} 分钟有 ${info.ws.recent} 个文件被改（最新 ${info.ws.latest?.name}）` : `工作区：最近 ${info.ws.windowMinutes} 分钟无改动`) : '';
+      qqPush(wsKey, `[🏁 静默] 没有在跑的节点 · 最近动作 ${idleTxt} · 共 ${info.nodes.length} 个：${summary}${wsLine ? '\n' + wsLine : ''}${need.length ? '\n需留意：' + need.join('、') : ''}`.slice(0, 500)).catch(() => {});
+    }
+    pushInbox({ node: '(line)', verdict: 'quiet', detail: `无在跑节点，最近动作 ${info.idleMinutes} 分钟前；共 ${info.nodes.length} 个节点` });
+    writeProgress(wsKey);
+    log(`line.quiet ${wsKey}: idle=${info.idleMinutes}min nodes=${info.nodes.length}`);
+    return { quiet: true, idleMinutes: info.idleMinutes, counts: info.counts };
+  } catch (e) {
+    log('静默判定失败:', e?.message);
+    return null;
+  }
+}
+
+/** 巡检：只扫"最近有活动"的工作区（账本 6 小时内动过），避免无谓 IO。 */
+function sweepQuiet() {
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(HOMEOverride, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch { return; }
+  const cutoff = Date.now() - 6 * 3600 * 1000;
+  for (const d of dirs) {
+    try {
+      const f = path.join(HOMEOverride, d, 'ledger.jsonl');
+      if (fs.statSync(f).mtimeMs < cutoff) continue;
+      evaluateQuiet(d);
+    } catch { /* 单个工作区出错不影响其它 */ }
+  }
+}
+
 async function orchestrate(wsKey) {
   const state = buildState(wsKey);
   if (!state.plan) return;
@@ -1299,10 +1448,14 @@ async function orchestrate(wsKey) {
     break;
   }
 
-  const allStopped = plan.nodes.every((n) => ['completed', 'failed', 'timeout', 'frozen', 'cancelled', 'skipped'].includes(stOf(n.id)));
+  // 2026-09-13 修：收尾判定用 plan ∪ 账本（mergedPlanNodes）。只看 plan.nodes 会让只用
+  // quest_run 快速单发的工作区永远等不到收尾信号（真实事故：某工作区 4 个 plan 节点 9/8
+  // 就全终态，之后 29 个 quick 任务跑完都没有任何汇总）。用户侧的可重复信号由 sweepQuiet 推。
+  const lineNodes = mergedPlanNodes(plan, state).nodes;
+  const allStopped = lineNodes.every((n) => TERMINAL_STATUS.includes(stOf(n.id)));
   if (allStopped && !(state.lineEvents ?? []).some((e) => e.t === 'line.concluded')) {
     const counts = {};
-    for (const n of plan.nodes) counts[stOf(n.id)] = (counts[stOf(n.id)] ?? 0) + 1;
+    for (const n of lineNodes) counts[stOf(n.id)] = (counts[stOf(n.id)] ?? 0) + 1;
     const bad = plan.nodes.filter((n) => ['failed', 'timeout', 'frozen'].includes(stOf(n.id)));
     const parts = bad.map((n) => `${stOf(n.id) === 'frozen' ? '⛔' : stOf(n.id) === 'timeout' ? '⏹' : '❌'} ${n.id}（${state.nodes[n.id]?.verdict ? state.nodes[n.id].verdict + '/' : ''}${stOf(n.id)}）`);
     appendEvent(wsKey, { t: 'line.concluded', counts });
@@ -1323,9 +1476,8 @@ async function orchestrate(wsKey) {
         log('research-state.md 已追加:', stateFile);
       }
     } catch (e) { log('research-state 追加失败:', e?.message); }
-    if (notifyKind(CFG) !== 'off') {
-      qqPush(wsKey, `[🏁 任务线结束] ${plan.nodes.length} 段：${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(' / ')}${parts.length ? '\n' + parts.join('\n') : '\n全绿 ✅'}`.slice(0, 500)).catch(() => {});
-    }
+    // 用户侧的收尾铃交给 line.quiet（可重复、含 quick 节点、带最近动作时间的依据）；
+    // 这里保留 line.concluded 作为内部事件 + research-state.md 落盘（翻篇种子，一次即可）。
     pushInbox({ node: '(line)', verdict: 'concluded', summary: JSON.stringify(counts) });
   }
 }
@@ -1393,6 +1545,9 @@ setInterval(async () => {
   try { fs.writeFileSync(QQ_QUEUE_FILE, JSON.stringify(remain, null, 1)); } catch {}
   if (remain.length < arr.length) log(`QQ 补发成功 ${arr.length - remain.length} 条，剩余 ${remain.length}`);
 }, 2 * 60 * 1000);
+
+// 静默巡检（quietMinutes/sweepSeconds 可配；测试用小值）
+setInterval(() => { try { sweepQuiet(); } catch (e) { log('sweepQuiet 异常:', e?.message); } }, Math.max(5, Number(CFG.sweepSeconds ?? 60)) * 1000);
 
 /** 产物图直推：把节点刚产出的 png/jpg 发 owner QQ（bridge /api/send/private-image，base64 image 段）。 */
 async function qqPushImage(wsKey, imagePath, caption) {
@@ -1629,7 +1784,17 @@ const server = http.createServer(async (req, res) => {
       const unread = inbox.splice(0); // 取走即清
       writeProgress(wsKey); // 查询即刷新：progress.md 不再等下一个节点事件（排序/状态实时保鲜）
       // workspace 优先取 plan.md 里声明的绝对路径（权威），入参只做缺省——/q翻页 等下游要拿真路径去匹配 DSH 会话
-      return json(200, { plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes }, unread, questVersion: '0.2.0' });
+      const act = lineActivity(state);
+      return json(200, {
+        plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes },
+        line: {
+          active: act.active.length, nodes: act.nodes.length, counts: act.counts,
+          idleMinutes: act.idleMinutes, quietMinutes: act.quietMinutes,
+          quiet: act.quiet, wsQuiet: act.wsQuiet,
+          workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
+        },
+        unread, questVersion: '0.2.0',
+      });
     }
     if (req.method === 'POST' && u.pathname === '/api/plan') {
       const body = await readBody(req);
