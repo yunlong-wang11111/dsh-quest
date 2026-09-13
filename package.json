@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node server.mjs",
     "mcp": "node mcp-server.mjs",
-    "pack:check": "npm pack --dry-run"
+    "pack:check": "npm pack --dry-run",
+    "test": "node tests/run-all.mjs"
   },
   "description": "Agent-agnostic research pipeline orchestrator: plan → dispatch → judge → auto-fix → notify, with WSL/Windows execution lanes, HTTP dashboard and MCP tool surface",
   "dependencies": {
@@ -18,17 +19,23 @@
   },
   "files": [
     "server.mjs",
+    "success.mjs",
     "backends.mjs",
     "resume.mjs",
     "notify.mjs",
     "session-export.mjs",
     "mcp-server.mjs",
     "dashboard.html",
+    "dashboard-v2.html",
+    "dsh-plugin/",
     "lib/",
     "guard/",
+    "tests/",
     "PLAN-TEMPLATE.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "start-quest.bat",
+    "quest-autostart.vbs"
   ],
   "license": "MIT",
   "repository": {

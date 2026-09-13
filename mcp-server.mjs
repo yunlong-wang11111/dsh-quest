@@ -81,6 +81,7 @@ server.tool(
     reason: z.string().optional().describe('为什么跑这条命令（门禁挂起时作为审批理由）'),
     expect_minutes: z.number().optional().describe('预计时长（分钟）'),
     handoff: z.string().optional().describe('交接上下文：做什么、看什么指标、异常特征'),
+    success: z.string().optional().describe('成功判据（白话即可）：引号关键词 / 文件名通配 / 指标阈值，会被判定器强制核对'),
     auto_fix: z.boolean().optional().describe('失败后是否自动修复'),
     shell: z.enum(['windows', 'wsl']).optional().describe('在 Windows 还是 WSL 里执行'),
     ws: z.string().optional().describe('工作区绝对路径（缺省用 cwd）'),
@@ -88,7 +89,7 @@ server.tool(
   async (a) => {
     const r = await q('POST', `/api/run?ws=${encodeURIComponent(a.ws || a.cwd)}`, {
       command: a.command, cwd: a.cwd, title: a.title, reason: a.reason,
-      expectMinutes: a.expect_minutes, handoff: a.handoff, autoFix: a.auto_fix, shell: a.shell,
+      expectMinutes: a.expect_minutes, handoff: a.handoff, success: a.success, autoFix: a.auto_fix, shell: a.shell,
     });
     return r.error ? fail(r) : ok(r);
   },

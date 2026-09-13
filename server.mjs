@@ -17,6 +17,7 @@ import { exportSessionArchive } from './session-export.mjs';
 import { completeText, workerViaBackend, fixerViaBackend, describeBackends } from './backends.mjs';
 import { sendText, sendImage, notifyKind, isRetryable } from './notify.mjs';
 import { offerResume, markResumed } from './resume.mjs';
+import { parseSuccessClaims, checkClaims } from './success.mjs';
 
 const QUEST_HOME = path.join(os.homedir(), '.dsh', 'quests');
 
@@ -187,7 +188,7 @@ function buildState(wsKey) {
       if (e.t === 'fix.stopped') { n.fixing = false; n.fixStopped = e.reason; }
       if (e.t === 'node.preflight-failed') { n.status = 'failed'; n.verdict = 'preflight-failed'; n.detail = e.error; }
       if (e.t === 'node.exited') { n.exitCode = e.code; n.runSeconds = e.runSec; }
-      if (e.t === 'node.judged') { n.verdict = e.verdict; n.via = e.via; n.file = e.file || null; }
+      if (e.t === 'node.judged') { n.verdict = e.verdict; n.via = e.via; n.file = e.file || null; if (e.detail) n.judgeDetail = e.detail; }
       if (e.t === 'worker.reported') { n.summary = e.summary; }
       if (e.t === 'node.completed') { n.status = 'completed'; n.completedAt = e.at; }
       if (e.t === 'node.failed') n.status = 'failed';
@@ -278,19 +279,11 @@ function judge(node, exitCode, runSec, logFile) {
     if (runSec < 60) return { verdict: 'startup-failed', via: 'fast-exit' };
     return { verdict: 'crashed', via: 'nonzero-exit' };
   }
-  // 查输出证据：cwd 常见目录 + 任务运行窗口内的文件
-  const tail = readTail(logFile, 4096).toLowerCase();
-  if (FINISH_KEYWORDS.some((k) => tail.includes(k.toLowerCase()))) return { verdict: 'ok', via: 'finish-keyword' };
-  // WSL 节点的包装器会在日志尾写 EXIT_CODE:<n>——那是真实退出码，比「产物新鲜」更硬
-  const ec = tail.match(/exit_code:\s*(\d+)/);
-  if (ec) {
-    if (ec[1] === '0') return { verdict: 'ok', via: 'exit-code-0' };
-    return { verdict: 'crashed', via: `exit-code-${ec[1]}` };
-  }
+  // 产物扫描：一次收集，声明判据与通用兜底共用（原来只有"取最新一个"的用法）
   const dirs = node.shell === 'wsl'
     ? [node.cwd, `${node.cwd}/out`, `${node.cwd}/logs`, `${node.cwd}/output`, `${node.cwd}/results`, `${node.cwd}/runs`].filter(Boolean).map(wslUnc)
     : [node.cwd, path.join(node.cwd, 'out'), path.join(node.cwd, 'logs'), path.join(node.cwd, 'output'), path.join(node.cwd, 'results'), path.join(node.cwd, 'runs')];
-  let latest = null;
+  const artifacts = [];
   for (const d of dirs) {
     let entries; try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
     for (const en of entries) {
@@ -298,16 +291,40 @@ function judge(node, exitCode, runSec, logFile) {
       const lower = en.name.toLowerCase();
       if (QUEST_OWN_FILES.has(lower)) continue; // quest 台账不算产物
       if (![...TEXT_EXTS, ...ARTIFACT_EXTS].some((x) => lower.endsWith(x))) continue;
-      try {
-        const st = fs.statSync(path.join(d, en.name));
-        if (!latest || st.mtimeMs > latest.mtimeMs) latest = { mtimeMs: st.mtimeMs, file: path.join(d, en.name) };
-      } catch {}
+      try { const f = path.join(d, en.name); artifacts.push({ name: en.name, file: f, mtimeMs: fs.statSync(f).mtimeMs }); } catch {}
     }
   }
   // 快任务 runSec 舍入到 0 时 startMs=now 会和自己的产物自竞争；+2s 容文件系统时间戳粒度
   const startMs = Date.now() - Math.max(runSec, 1) * 1000 - 2000;
+  const tailLc = (logFile ? readTail(logFile, 4096) : '').toLowerCase();
+
+  // ① 节点自己声明的成功判据优先（plan 的 success: 字段）——AI 写下的硬约定压过通用关键词表。
+  //    声明了判据却没满足 → suspect（不是 failed）：可能只是没达到预期，交给人/AI 判。
+  //    解析不出任何可校验条件（纯白话）时 total=0，自动退回下面的通用路径，零回归。
+  const claims = parseSuccessClaims(node.success);
+  if (claims.total > 0) {
+    const r = checkClaims(claims, { tail: tailLc, artifacts, metrics: logFile ? extractMetrics(logFile) : {}, startMs });
+    if (r.failures.length) {
+      return { verdict: 'suspect', via: 'success-claim-failed', detail: r.failures.map((f) => f.why).join('；').slice(0, 300), claims: r };
+    }
+    return {
+      verdict: 'ok',
+      via: r.unchecked.length ? `success-declared（未核实:${r.unchecked.map((u) => u.what).join(',')}）` : `success-declared（${r.checked.length} 项）`,
+      claims: r,
+    };
+  }
+
+  // ② 未声明判据：与旧版完全一致的通用兜底
+  if (FINISH_KEYWORDS.some((k) => tailLc.includes(k.toLowerCase()))) return { verdict: 'ok', via: 'finish-keyword' };
+  // WSL 节点的包装器会在日志尾写 EXIT_CODE:<n>——那是真实退出码，比「产物新鲜」更硬
+  const ec = tailLc.match(/exit_code:\s*(\d+)/);
+  if (ec) {
+    if (ec[1] === '0') return { verdict: 'ok', via: 'exit-code-0' };
+    return { verdict: 'crashed', via: `exit-code-${ec[1]}` };
+  }
+  const latest = artifacts.reduce((best, f) => (!best || f.mtimeMs > best.mtimeMs ? f : best), null);
   if (latest && latest.mtimeMs > Date.now() - 10 * 60 * 1000 && latest.mtimeMs > startMs) {
-    return { verdict: ARTIFACT_EXTS.some((x) => latest.file.toLowerCase().endsWith(x)) ? 'ok' : 'ok', via: 'artifact-fresh', file: latest.file };
+    return { verdict: 'ok', via: 'artifact-fresh', file: latest.file };
   }
   if (latest && latest.mtimeMs > startMs) return { verdict: 'suspect', via: 'no-keyword', file: latest.file };
   return { verdict: 'suspect', via: 'no-output' };
@@ -504,6 +521,7 @@ function writeProgress(wsKey) {
       if (st.metrics?.loss_slope_10ep != null) l += ` · 10ep斜率 ${st.metrics.loss_slope_10ep}`;
       if (st.watchWarns) l += ` · ⚠️watch警告×${st.watchWarns}`;
       if (st.softPass?.length) l += ` · ⚠️上游疑似放行（${st.softPass.join(',')}）——建议用探针查证`;
+      if (st.judgeDetail && st.status !== 'completed') l += ` · 判据未满足：${String(st.judgeDetail).slice(0, 100)}`;
       if (st.fixCount) l += ` · 修复${st.fixCount}次`;
       lines.push(l);
       if (st.lastFix) lines.push(`  - 最近修复: ${String(st.lastFix).split('\n')[0].slice(0, 120)}`);
@@ -536,11 +554,12 @@ function extractMetrics(logFile) {
       const v = Number(m[1]);
       if (Number.isFinite(v) && v >= 0) samples.push(v);
     }
-    if (samples.length < 2) return {};
+    if (!samples.length) return {};
     const s = samples.slice(-100); // 防超长
     const last = s[s.length - 1];
-    const min = Math.min(...s);
-    const out = { loss_first: r4(s[0]), loss_last: r4(last), loss_min: r4(min) };
+    const out = { loss_first: r4(s[0]), loss_last: r4(last), loss_min: r4(Math.min(...s)) };
+    // 单样本也能给绝对值（阈值判据/短评估日志常见）；斜率与平台才需要更多样本
+    if (s.length < 2) return out;
     // 斜率：last / N 个样本前 的相对变化（<0 = 下降）
     for (const n of [5, 10, 20]) {
       if (s.length > n) out[`loss_slope_${n}ep`] = r4(last / s[s.length - 1 - n] - 1);
@@ -863,9 +882,11 @@ function handleNodeExit(wsKey, node, ctx) {
     appendEvent(wsKey, { t: 'node.timeout', node: node.id, runSec });
     finishNode(wsKey, node, { verdict: 'timeout', via, logFile }, null, runSec, startedAt);
   } else {
-    const j = judge(node, code == null ? 0 : code, runSec, logFile);
+    let j;
+    try { j = judge(node, code == null ? 0 : code, runSec, logFile); }
+    catch (e) { j = { verdict: 'suspect', via: 'judge-error', detail: String(e && e.message || e).slice(0, 200) }; log('判定器异常:', e && e.message); }
     if (code == null) j.via = `${j.via}（退出码未知：quest 重启后再认领）`;
-    appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
+    appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined, ...(j.detail ? { detail: j.detail } : {}) });
     finishNode(wsKey, node, { ...j, logFile }, code, runSec, startedAt);
   }
 }
@@ -881,7 +902,7 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   try { pushInbox({ node: node.id, verdict: j.verdict, summary }); } catch {}
   if (!node.quiet && !node.__suppressFinishPush && notifyKind(CFG) !== 'off') {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
-    qqPush(wsKey, `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || (j.error || j.via || '')}`.slice(0, 600)).catch((e) => log('qqPush 异常:', e?.message));
+    qqPush(wsKey, `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || [j.via, j.detail].filter(Boolean).join(' · ') || j.error || ''}`.slice(0, 600)).catch((e) => log('qqPush 异常:', e?.message));
   }
   try { writeProgress(wsKey); } catch (e) { log('writeProgress 失败:', e?.message); }
   // 产物图直推（2026-09-09）：成功节点把运行窗口内新产出的 png/jpg（≤push_images 张，默认 2）发 owner QQ
@@ -1015,7 +1036,7 @@ async function adoptOrphan(wsKey, node, n) {
               node.__startedAt = n.startedAt;
               if (await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log })) node.__suppressFinishPush = true;
             } catch (e) { log('续跑检测失败:', e?.message); }
-      appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
+      appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined, ...(j.detail ? { detail: j.detail } : {}) });
       await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
       return;
     }
@@ -1065,7 +1086,7 @@ async function adoptOrphan(wsKey, node, n) {
               node.__startedAt = n.startedAt;
               if (await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log })) node.__suppressFinishPush = true;
             } catch (e) { log('续跑检测失败:', e?.message); }
-    appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined });
+    appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined, ...(j.detail ? { detail: j.detail } : {}) });
     await finishNode(wsKey, node, { ...j, logFile }, null, runSec, startedAt);
     return;
   }
@@ -1661,6 +1682,7 @@ const server = http.createServer(async (req, res) => {
         expectMinutes: Number(b.expectMinutes) || 30, quiet: b.quiet === true,
         autoFix: b.autoFix === true, fixBudget: 2,
         handoff: String(b.handoff || '快速单发任务').slice(0, 2000),
+        success: String(b.success || '').slice(0, 300),
         after: [], when: '', watchRules: [],
         shell: b.shell === 'wsl' ? 'wsl' : 'windows',
       };
