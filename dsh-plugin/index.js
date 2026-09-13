@@ -196,7 +196,7 @@ function apply(ctx, config = {}) {
     description: [
       '查询当前工作区任务线的全部节点状态（pending/running/completed/failed/timeout + 判定依据 + worker 总结）。',
       '返回开头的 unread 是自上次查看以来的完成事件摘要。用户问"实验跑完了吗/怎么样了"时用这个。',
-      '返回的 line 字段回答"是不是真都完成了"：quiet=true 表示没有在跑节点、账本安静了 idleMinutes 分钟、且工作区也没有新文件改动；workspace.recent>0 说明有人正在改代码（可能马上又派任务）。这是收敛推断不是完成保证，回答用户时把依据一起说。',
+      '返回的 line 字段回答"是不是真都完成了"：quiet=true 表示没有在跑节点、账本安静了 idleMinutes 分钟、且工作区也没有新文件改动；workspace.recent>0 说明有人正在改代码（可能马上又派任务）。dsh.running>0 表示本工作区的 DSH 会话正在跑（AI 在思考/写代码）。这是收敛推断不是完成保证，回答用户时把依据一起说。',
     ].join(' '),
     parameters: {
       ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd，一般不用传）' },

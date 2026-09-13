@@ -524,6 +524,9 @@ function writeProgress(wsKey) {
       if (act.ws) lines.push(act.ws.recent
         ? `> 工作区：最近 ${act.ws.windowMinutes} 分钟有 **${act.ws.recent} 个文件**被改（最新 ${act.ws.latest?.name}，${act.ws.latest?.minutes} 分钟前）——有人正在改代码`
         : `> 工作区：最近 ${act.ws.windowMinutes} 分钟无文件改动`);
+      if (act.dsh) lines.push(act.dsh.running
+        ? `> 子对话：**${act.dsh.running} 个会话在跑**（本工作区共 ${act.dsh.total} 个）——AI 正在干活`
+        : `> 子对话：没有会话在跑（本工作区共 ${act.dsh.total} 个）`);
     }
     let curBucket = -1;
     for (const { n, st } of nodeDisplayOrder(plan, state)) {
@@ -1261,6 +1264,55 @@ const TERMINAL_STATUS = ['completed', 'failed', 'timeout', 'frozen', 'cancelled'
 const tsOf = (x) => (x ? Date.parse(x) || 0 : 0);
 
 /** 工作区活跃度快照（/api/status 与 progress.md 共用，不触发通知）。 */
+// C：DSH 会话活跃度——直接回答"子对话现在在不在干活"
+//
+// DSH 的 session/list 返回 SessionSummary { sessionId, updatedAt, running, cwd, parentSessionId, origin }，
+// 其中 running 是布尔、cwd 能跟工作区对上。所以"子对话忙不忙"是可读的事实，而不是推断。
+//
+// 三条设计约束：
+//   1) /api/status 会被 dashboard 频繁轮询 → 绝不能在请求路径上打 DSH。只由巡检（每 sweepSeconds）刷新，
+//      状态查询读缓存。探测失败 = 当作"不知道"，不门控（宁可不拦，也不能因为 DSH 抽风把信号憋死）。
+//   2) 会话按 cwd 匹配工作区（复用 wsKeyOf 的归一化），匹配不到就退化为不门控。
+//   3) 这是 DSH 的内部 RPC 形状，不是稳定公开 API：所有异常都必须被吞掉并降级。
+let dshSessCache = { at: 0, items: null };
+
+/** 刷新会话列表缓存（只由巡检与非请求路径调用）。 */
+async function refreshDshSessions() {
+  try {
+    // dsh-client 与 worker 会话处一致用动态 import（只在真要连 DSH 时才加载）
+    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+    const api = new NodeApiClient(CFG.dshBaseUrl, 8000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    const resp = await api.sessions.list({});
+    const items = resp?.result?.value?.items ?? [];
+    dshSessCache = { at: Date.now(), items: Array.isArray(items) ? items : [] };
+  } catch (e) {
+    dshSessCache = { at: Date.now(), items: null }; // 失败也记时间，避免每个巡检周期都重试轰炸
+    log('会话探测失败（按"不知道"处理）:', e?.message);
+  }
+  return dshSessCache.items;
+}
+
+/** 读缓存并折算成某工作区的会话活跃度（同步、零 IO）。 */
+function dshActivity(wsDir) {
+  const items = dshSessCache.items;
+  if (!items || !wsDir) return null;
+  let key;
+  try { key = wsKeyOf(wsDir); } catch { return null; }
+  const mine = items.filter((s) => {
+    if (!s?.cwd) return false;
+    try { return wsKeyOf(String(s.cwd)) === key; } catch { return false; }
+  });
+  if (!mine.length) return { total: 0, running: 0, idleMinutes: null, ageSeconds: Math.round((Date.now() - dshSessCache.at) / 1000) };
+  const running = mine.filter((s) => s.running === true);
+  const newest = mine.reduce((a, b) => (Number(b.updatedAt || 0) > Number(a.updatedAt || 0) ? b : a), mine[0]);
+  const idleMs = newest?.updatedAt ? Math.max(0, Date.now() - Number(newest.updatedAt)) : null;
+  return {
+    total: mine.length,
+    running: running.length,
+    idleMinutes: idleMs == null ? null : Math.round((idleMs / 60000) * 100) / 100,
+    ageSeconds: Math.round((Date.now() - dshSessCache.at) / 1000),
+  };
+}
 const WS_SKIP_DIRS = new Set(['.git', 'node_modules', 'archive', '__pycache__', 'logs', 'out', 'runs']);
 const WS_SKIP_FILES = new Set(['progress.md', 'research-state.md', 'plan.md']);
 
@@ -1319,10 +1371,14 @@ function lineActivity(state) {
   const ws = workspaceActivity(plan0.meta?.workspace || '');
   const wsIdleMs = ws && ws.lastMs ? Date.now() - ws.lastMs : null;
   const wsQuiet = ws ? (wsIdleMs == null || wsIdleMs >= quietMinutes * 60000) : true;
+  // 会话活跃度：agent 正在这个工作区里跑会话（在思考/写代码/读文件）→ 不算收敛。
+  // 探测不可用时 dsh=null → 不门控（宁可不拦，也不能因为 DSH 抽风把信号憋死）。
+  const dsh = dshActivity(plan0.meta?.workspace || '');
+  const dshQuiet = !dsh || dsh.running === 0;
   return {
-    nodes, active, lastAct, idleMs, idleMinutes, counts, quietMinutes, ws, wsQuiet,
+    nodes, active, lastAct, idleMs, idleMinutes, counts, quietMinutes, ws, wsQuiet, dsh, dshQuiet,
     // 静默判定只在这里算一次，别处直接用（用原始毫秒比，别用取整的分钟——亚分钟配置会算错）
-    quiet: active.length === 0 && !!idleMs && idleMs >= quietMinutes * 60000 && wsQuiet,
+    quiet: active.length === 0 && !!idleMs && idleMs >= quietMinutes * 60000 && wsQuiet && dshQuiet,
   };
 }
 
@@ -1351,7 +1407,8 @@ function evaluateQuiet(wsKey) {
       const summary = Object.entries(info.counts).map(([k, v]) => `${v} ${k}`).join(' / ');
       const idleTxt = info.idleMinutes >= 1 ? Math.round(info.idleMinutes) + " 分钟前" : '不到 1 分钟前';
       const wsLine = info.ws ? (info.ws.recent ? `工作区：最近 ${info.ws.windowMinutes} 分钟有 ${info.ws.recent} 个文件被改（最新 ${info.ws.latest?.name}）` : `工作区：最近 ${info.ws.windowMinutes} 分钟无改动`) : '';
-      qqPush(wsKey, `[🏁 静默] 没有在跑的节点 · 最近动作 ${idleTxt} · 共 ${info.nodes.length} 个：${summary}${wsLine ? '\n' + wsLine : ''}${need.length ? '\n需留意：' + need.join('、') : ''}`.slice(0, 500)).catch(() => {});
+      const dshLine = info.dsh ? `子对话：无会话在跑（本工作区 ${info.dsh.total} 个）` : '';
+      qqPush(wsKey, `[🏁 静默] 没有在跑的节点 · 最近动作 ${idleTxt} · 共 ${info.nodes.length} 个：${summary}${wsLine ? '\n' + wsLine : ''}${dshLine ? '\n' + dshLine : ''}${need.length ? '\n需留意：' + need.join('、') : ''}`.slice(0, 500)).catch(() => {});
     }
     pushInbox({ node: '(line)', verdict: 'quiet', detail: `无在跑节点，最近动作 ${info.idleMinutes} 分钟前；共 ${info.nodes.length} 个节点` });
     writeProgress(wsKey);
@@ -1365,6 +1422,11 @@ function evaluateQuiet(wsKey) {
 
 /** 巡检：只扫"最近有活动"的工作区（账本 6 小时内动过），避免无谓 IO。 */
 function sweepQuiet() {
+  // 会话缓存每轮刷新一次（一次 RPC），失败自动降级；随后各工作区同步读缓存
+  refreshDshSessions().then(() => sweepQuietDirs()).catch(() => sweepQuietDirs());
+}
+
+function sweepQuietDirs() {
   let dirs = [];
   try {
     dirs = fs.readdirSync(HOMEOverride, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
@@ -1790,7 +1852,7 @@ const server = http.createServer(async (req, res) => {
         line: {
           active: act.active.length, nodes: act.nodes.length, counts: act.counts,
           idleMinutes: act.idleMinutes, quietMinutes: act.quietMinutes,
-          quiet: act.quiet, wsQuiet: act.wsQuiet,
+          quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
         unread, questVersion: '0.2.0',
