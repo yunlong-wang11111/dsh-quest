@@ -39,6 +39,27 @@
   .spark { vertical-align:middle; }
   #tokbar { position:fixed; right:12px; bottom:12px; background:var(--card); border:1px solid var(--line); border-radius:9px; padding:9px; display:flex; gap:6px; }
   .toast { position:fixed; left:50%; transform:translateX(-50%); bottom:16px; background:#1c2130; border:1px solid var(--acc); border-radius:8px; padding:8px 14px; font-size:12.5px; display:none; }
+  /* ── 任务线追踪（魔兽任务追踪器式的约定：进行中在最上、已完成灰掉打勾并默认收起） ── */
+  .trk-hd { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-bottom:5px; }
+  .trk-hd b { font-size:13.5px; }
+  #trkState { border-color:var(--acc); color:var(--fg); }
+  #trkState.busy { border-color:var(--run); color:#bcd9ff; }
+  #trkState.quiet { border-color:var(--ok); color:#bff0d0; }
+  #trkState.bad { border-color:var(--bad); color:#ffc4b8; }
+  #trkList { display:grid; gap:1px; margin-top:2px; }
+  .obj { display:flex; gap:7px; align-items:center; padding:3px 6px; border-radius:6px; }
+  .obj:hover { background:#1b2129; }
+  .obj .oi { flex:0 0 16px; text-align:center; }
+  .obj .oid { flex:0 1 auto; max-width:40%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .obj .ostat { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--dim); font-size:12px; }
+  .obj.done { opacity:.5; }
+  .obj.done .oi { color:var(--ok); }
+  .obj.run .oi { color:var(--run); animation:p 1s infinite alternate; }
+  .obj.run .ostat { color:#9dc6ff; }
+  .obj.bad .oi, .obj.bad .ostat { color:var(--bad); }
+  .obj.warn .oi, .obj.warn .ostat { color:var(--warn); }
+  .trk-grp { margin:7px 0 1px; color:var(--dim); font-size:11.5px; }
+  .trk-more { color:var(--dim); font-size:11.5px; padding:2px 0 2px 23px; }
 </style>
 </head>
 <body>
@@ -56,10 +77,23 @@
 </nav>
 
 <section id="tasks" class="on">
-  <div class="card">
+  <div class="card" id="trk">
+    <div class="trk-hd">
+      <b>任务线追踪</b>
+      <span class="pill" id="trkState">读取中…</span>
+      <span class="mut" id="trkCount"></span>
+      <span style="flex:1"></span>
+      <button class="act" id="trkBtnDone" onclick="toggleDone()">显示已完成</button>
+    </div>
+    <div class="mut" id="trkWhy" style="margin-bottom:4px"></div>
+    <div id="trkList"></div>
+  </div>
+  <div class="card" style="margin-top:10px">
     <div class="row">
       <select id="ws"></select>
       <span class="mut" id="wsmeta"></span>
+      <span style="flex:1"></span>
+      <span class="mut">全部节点明细 ↓</span>
     </div>
     <table>
       <thead><tr><th>节点</th><th>状态</th><th>判定</th><th>耗时</th><th>指标</th><th>操作</th></tr></thead>
@@ -162,6 +196,8 @@ async function loadTasks() {
   $('#ver').textContent = d.questVersion || '';
   $('#wsmeta').textContent = d.plan?.workspace || '';
   nodesCache = d.plan?.nodes || [];
+  lastStatus = d;
+  renderTracker(d);
   $('#nodes').innerHTML = nodesCache.map((n) => {
     const canDispatch = ['failed','timeout','cancelled','pending','skipped','ready','frozen'].includes(n.status);
     const canCancel = n.status === 'running';
@@ -183,8 +219,96 @@ async function loadTasks() {
   if (!$('#logs').classList.contains('on')) return;
 }
 
-async function act(kind, node) {
-  try {
+// ── 任务线追踪（一眼看出：子对话在改代码 / 任务在跑 / 真收敛）──────────────
+// 约定借自魔兽的任务追踪器：进行中在最上、已完成灰掉打勾并默认收起、标题栏带 x/y 计数。
+let lastStatus = null;
+let showDone = false;
+const TRK_ICON = { completed:'✔', failed:'✖', timeout:'⏱', cancelled:'⛔', frozen:'🔒', skipped:'⏭', ready:'⏸', running:'▶', pending:'○' };
+const TRK_CLS  = { completed:'done', failed:'bad', timeout:'bad', cancelled:'bad', frozen:'bad', skipped:'warn', ready:'warn', running:'run', pending:'' };
+const TRK_TXT  = { completed:'完成', failed:'失败', timeout:'超时', cancelled:'已终止', frozen:'冻结(等人工)', skipped:'跳过(when 不成立)', ready:'就绪(等人工派发)', running:'运行中', pending:'待办' };
+function toggleDone() {
+  showDone = !showDone;
+  $('#trkBtnDone').textContent = showDone ? '隐藏已完成' : '显示已完成';
+  renderTracker(lastStatus);
+}
+/** 工作区级状态：这是"看不见子对话在干嘛"的正解——它在改代码 / 在跑会话 / 真收敛，都写在这。 */
+function trkStateText(line) {
+  if (!line) return { t: '（没有状态信息）', cls: '' };
+  const ago = (m) => (m == null ? '' : m < 1 ? `${Math.round(m * 60)} 秒前` : `${Math.round(m)} 分钟前`);
+  if (line.dsh?.running) return { t: `子对话正在工作（${line.dsh.running} 个会话在跑）`, cls: 'busy' };
+  const ws = line.workspace;
+  if (ws?.recent) return { t: `正在改代码（最近 ${ws.windowMinutes} 分钟改了 ${ws.recent} 个文件，最新 ${ws.latest?.name || '?'}）`, cls: 'busy' };
+  if (line.active) return { t: `${line.active} 个任务在跑`, cls: 'busy' };
+  if (line.quiet) return { t: '静默（收敛）', cls: 'quiet' };
+  return { t: `刚有动作（${ago(line.idleMinutes)}）· 还没到静默窗口（${line.quietMinutes} 分钟）`, cls: '' };
+}
+/** 节点最近一次动作时间（用于把最新发生的排在最上——WoW 追踪器也是把当前目标放最前）。 */
+function nodeAt(n) { return Date.parse(n.completedAt || n.startedAt || '') || 0; }
+function renderTracker(d) {
+  if (!d) return;
+  const nodes = d.plan?.nodes || [];
+  const line = d.line || {};
+  const st = trkStateText(line);
+  const el = $('#trkState');
+  el.textContent = st.t; el.className = 'pill ' + st.cls;
+  const c = line.counts || {};
+  const done = c.completed ?? nodes.filter((n) => n.status === 'completed').length;
+  $('#trkCount').textContent = `完成 ${done}/${line.nodes ?? nodes.length}`
+    + (c.failed ? ` · 失败 ${c.failed}` : '') + (c.frozen ? ` · 冻结 ${c.frozen}` : '')
+    + (c.cancelled ? ` · 终止 ${c.cancelled}` : '') + (line.active ? ` · 进行中 ${line.active}` : '');
+  // 最近发生的那个节点单独点出来：用户第一眼想知道的就是"刚刚谁动了、结果如何"
+  const newest = nodes.filter((n) => nodeAt(n)).sort((a, b) => nodeAt(b) - nodeAt(a))[0];
+  const newestLine = newest
+    ? `最新：${newest.id} · ${TRK_TXT[newest.status] || newest.status}${newest.verdict ? '（' + newest.verdict + '）' : ''}`
+    : '';
+  $('#trkWhy').textContent = [
+    newestLine,
+    line.quiet ? `判据：无在跑节点 · 最近动作 ${line.idleMinutes ?? '-'} 分钟前 · 工作区 ${line.workspace ? (line.workspace.recent ? '有改动' : '无改动') : '未知'} · 子对话 ${line.dsh ? (line.dsh.running ? '在跑' : '空闲') : '未知'}` : '',
+  ].filter(Boolean).join(' ｜ ');
+  const byRecent = (a, b) => nodeAt(b) - nodeAt(a);
+  const groups = [
+    ['进行中', nodes.filter((n) => n.status === 'running').sort(byRecent)],
+    ['待办', nodes.filter((n) => ['pending', 'ready'].includes(n.status))],
+    ['需留意', nodes.filter((n) => ['failed', 'timeout', 'frozen', 'cancelled'].includes(n.status)).sort(byRecent)],
+    ['已完成', nodes.filter((n) => n.status === 'completed').sort(byRecent)],
+  ];
+  const CAP = 12; // 每组最多展开 12 条，其余折叠成一行（否则 70 条异常会把面板撑成一堵墙）
+  const rows = [];
+  for (const [name, list] of groups) {
+    if (!list.length) continue;
+    if (name === '已完成' && !showDone) {
+      rows.push(`<div class="trk-grp">${name}（${list.length}）· 已收起</div><div class="trk-more">点右上「显示已完成」展开</div>`);
+      continue;
+    }
+    const shown = list.slice(0, CAP);
+    rows.push(`<div class="trk-grp">${name}（${list.length}）${list.length > CAP ? `· 只列最近 ${CAP} 条` : ''}</div>`);
+    for (const n of shown) {
+      const bits = [];
+      if (n.status === 'running') {
+        const secs = n.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(n.startedAt)) / 1000)) : n.runSeconds;
+        if (secs != null) bits.push(`已跑 ${Math.floor(secs / 60)}分${secs % 60}秒`);
+      } else {
+        if (n.verdict) bits.push(n.verdict);
+        if (n.via) bits.push(n.via);
+        if (n.runSeconds != null) bits.push(`${Math.round(n.runSeconds / 60)}分`);
+      }
+      if (n.judgeDetail) bits.push(String(n.judgeDetail).slice(0, 60));
+      if (n.metrics?.loss_last != null) bits.push(`loss ${n.metrics.loss_last}`);
+      if (n.fixCount) bits.push(`修复${n.fixCount}次`);
+      if (n.softPass?.length) bits.push(`上游疑似放行(${n.softPass.join(',')})`);
+      rows.push(`<div class="obj ${TRK_CLS[n.status] || ''}">
+        <span class="oi">${TRK_ICON[n.status] || '·'}</span>
+        <span class="oid mono" title="${esc(n.id)}">${esc(n.id)}</span>
+        <span class="ostat">${esc(TRK_TXT[n.status] || n.status)}${bits.length ? ' · ' + esc(bits.join(' · ')) : ''}</span>
+        <button class="act" onclick="openLog('${esc(n.id)}')">日志</button>
+      </div>`);
+    }
+    if (list.length > CAP) rows.push(`<div class="trk-more">… 还有 ${list.length - CAP} 条更早的（下面「全部节点明细」里有完整列表）</div>`);
+  }
+  $('#trkList').innerHTML = rows.join('') || '<div class="mut">这个工作区还没有节点</div>';
+}
+
+async function act(kind, node) {  try {
     if (kind === 'dispatch') {
       if (!confirm(`派发节点「${node}」？\n\n会立即在后台执行，完成后通知。`)) return;
       const r = await post('/api/dispatch?ws=' + encodeURIComponent(curWs), { node });
@@ -318,6 +442,8 @@ async function refreshAll() {
   catch (e) { toast('刷新失败：' + e.message); }
 }
 loadWs().then(() => { loadTasks(); fillLogNodes(); pump(); });
+// 运行中的"已跑 X分Y秒"要自己走动；同时兜住长轮询万一断线时的刷新
+setInterval(() => { if (lastStatus) renderTracker(lastStatus); }, 5000);
 setInterval(() => { if ($('#logs').classList.contains('on') && $('#logAuto').checked) loadLog(); }, 8000);
 </script>
 </body>

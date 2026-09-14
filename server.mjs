@@ -289,7 +289,7 @@ function judge(node, exitCode, runSec, logFile) {
   }
   // 产物扫描：一次收集，声明判据与通用兜底共用（原来只有"取最新一个"的用法）
   const dirs = node.shell === 'wsl'
-    ? [node.cwd, `${node.cwd}/out`, `${node.cwd}/logs`, `${node.cwd}/output`, `${node.cwd}/results`, `${node.cwd}/runs`].filter(Boolean).map(wslUnc)
+    ? [node.cwd, `${node.cwd}/out`, `${node.cwd}/logs`, `${node.cwd}/output`, `${node.cwd}/results`, `${node.cwd}/runs`].filter(Boolean).map(hostPathFor)
     : [node.cwd, path.join(node.cwd, 'out'), path.join(node.cwd, 'logs'), path.join(node.cwd, 'output'), path.join(node.cwd, 'results'), path.join(node.cwd, 'runs')];
   const artifacts = [];
   for (const d of dirs) {
@@ -642,7 +642,27 @@ const wslUnc = (linuxPath) => `//wsl$/${WSL_DISTRO()}${String(linuxPath).startsW
 // ── 断点三层（2026-09-10）：防忘（派发前静态扫描）/ 防假（运行中盯档案）/ 防重跑（重派自动带存档指针）──
 const CK_EXTS = /\.(pt|ckpt|pth)$/i;
 const CK_PAT = /torch\.save|save_checkpoint|state_dict|checkpoint|resume_from|QUEST_RESUME_FROM/i;
-const uncToLinux = (p) => String(p).replace(/^\/\/wsl\$\/[^/]+/i, '');
+const uncToLinux = (p) => {
+  const s = String(p);
+  // 原生盘路径（我们为了让 Windows 侧能读，把 /mnt/c/… 换成了 C:\…）要能换回 Linux 视图
+  const m = s.match(/^([A-Za-z]):[\\/]?(.*)$/);
+  if (m) return `/mnt/${m[1].toLowerCase()}/${(m[2] || '').replace(/\\/g, '/')}`;
+  return s.replace(/^\/\/wsl\$\/[^/]+/i, '');
+};
+
+/**
+ * WSL 的 Linux 路径 → Windows 侧**真的能读**的路径。
+ * 2026-09-14 修复：\wsl$\<distro>\mnt\c\… 对 drvfs 是 EPERM（drvfs 不经 9p 共享暴露），
+ * 而 /mnt/<盘> 在 Windows 侧本来就是原生 <盘>:\ —— 原生路径快且可靠；真 Linux 路径（/home/…）
+ * 才走 UNC。踩坑后果：cwd 为 /mnt/c/… 的 WSL 节点，产物扫描全空 → 误判"未找到产物/无输出"，
+ * 断点续跑找不到存档、图片不推送、静态检查读不到脚本。
+ */
+const hostPathFor = (linuxPath) => {
+  const s = String(linuxPath || '');
+  const m = s.match(/^\/mnt\/([a-zA-Z])(\/.*)?$/);
+  if (m) return `${m[1].toUpperCase()}:${(m[2] || '/').replace(/\//g, '\\')}`;
+  return wslUnc(s);
+};
 
 /** 找 dir 里最近 N 天内最新的存档文件（dir 为 Windows 路径或 UNC），返回 {file, mtimeMs} 或 null */
 function findLatestCheckpoint(dir, withinDays = 7) {
@@ -707,7 +727,7 @@ function dispatchJob(wsKey, node, body = {}) {
       const pyFile = String(node.command || '').match(/\b([\w./\:-]+\.py)\b/)?.[1];
       if (pyFile) {
         const scriptPath = node.shell === 'wsl'
-          ? wslUnc((node.cwd || `/home/${WSL_USER()}`) + '/' + pyFile.replace(/^\/+/, ''))
+          ? hostPathFor((node.cwd || `/home/${WSL_USER()}`) + '/' + pyFile.replace(/^\/+/, ''))
           : path.isAbsolute(pyFile) ? pyFile : path.join(node.cwd || '.', pyFile);
         try {
           if (!CK_PAT.test(readTail(scriptPath, 262144))) {
@@ -745,7 +765,7 @@ function dispatchJob(wsKey, node, body = {}) {
       // 退出码：service 模式 systemd-run 立即返回，wsl 会话改为轮询单元状态 + 从日志尾解析 EXIT_CODE。
       job.wslUnit = `quest-${String(node.id).replace(/[^a-zA-Z0-9_.-]/g, '_')}-${logTs}`.slice(0, 90);
       job.wslPidFile = `${dir}/${node.id}-${logTs}.unit`; // 记单元名（供重启后重建）
-      const ckL = findLatestCheckpoint(wslUnc(node.cwd || `/home/${WSL_USER()}`));
+      const ckL = findLatestCheckpoint(hostPathFor(node.cwd || `/home/${WSL_USER()}`));
       const resumeExport = ckL ? `export QUEST_RESUME_FROM=${shq(uncToLinux(ckL.file))}; ` : '';
       const svcCmd = `${resumeExport}exec >> ${shq(linuxLog)} 2>&1; cd ${shq(node.cwd || `/home/${WSL_USER()}`)} 2>/dev/null || { echo 'cd 失败' >> ${shq(linuxLog)}; echo EXIT_CODE:111; exit 0; }; ${node.command}; ec=\$?; echo EXIT_CODE:\$ec`;
       const wrapped = [
@@ -814,7 +834,7 @@ function dispatchJob(wsKey, node, body = {}) {
     job.timers.push(setInterval(() => {
       // 断点第二层（防假）：长任务 20 分钟内无新存档 → 提醒一次（存档路径写错/未生效）
       if (!job.ckWarned && node.expectMinutes >= 20 && !node.noCheckpoint && Date.now() - startedAt > 20 * 60000) {
-        const latest = findLatestCheckpoint(node.shell === 'wsl' ? wslUnc(node.cwd || '') : node.cwd || '');
+        const latest = findLatestCheckpoint(node.shell === 'wsl' ? hostPathFor(node.cwd || '') : node.cwd || '');
         if (!latest || latest.mtimeMs < startedAt) {
           job.ckWarned = true;
           appendEvent(wsKey, { t: 'checkpoint.stale', node: node.id });
@@ -942,7 +962,7 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
 /** 扫节点 cwd（不递归）里运行窗口内新产出的 png/jpg，按 mtime 取最新 N 张直推 QQ。
  *  时间窗用节点真实起点（worker 总结耗时几秒到几分钟，不能用 now-runSec 倒推，会把刚产出的图当旧货滤掉）。 */
 async function pushArtifactImages(wsKey, node, startedAt) {
-  const dir = node.shell === 'wsl' ? wslUnc(node.cwd) : node.cwd; // WSL 节点经 UNC 扫产物
+  const dir = node.shell === 'wsl' ? hostPathFor(node.cwd) : node.cwd; // WSL 节点：/mnt/<盘> 用原生盘路径，其余走 UNC
   if (!dir) return;
   const sinceMs = startedAt - 2000;
   let entries;
