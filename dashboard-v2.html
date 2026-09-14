@@ -196,11 +196,23 @@ function saveTok() {
 if (!TOKEN) showTokbar();
 
 async function api(path, opt) {
-  const r = await fetch(path, { ...(opt || {}), headers: { 'x-quest-token': TOKEN, ...((opt && opt.headers) || {}) } });
-  if (r.status === 401) { showTokbar(); throw new Error('token 无效'); }
+  // 每个请求都带超时与自述错误（2026-09-14 远程事故）：以前 fetch 挂住或 401 时**什么都不说**，
+  // 页面就永久停在初始的"读取中…"，人只能猜是本地还是远程坏了。现在失败一定有一条带 URL 的说明。
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 15000);
+  let r;
+  try {
+    r = await fetch(path, { ...(opt || {}), signal: ac.signal, headers: { 'x-quest-token': TOKEN, ...((opt && opt.headers) || {}) } });
+  } catch (e) {
+    const why = (e && e.name === 'AbortError') ? '15 秒无响应' : `请求失败（${e && e.message}）`;
+    throw new Error(`${why} · ${path}${/^http/.test(location.protocol) && location.hostname !== '127.0.0.1' ? '（远程访问请确认地址里带 ?token=… 且 relay/quest 在跑）' : ''}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (r.status === 401) { showTokbar(); throw new Error(`token 无效或缺失 · ${path}——本页需要 ?token=（见 ~/.dsh/quests/.token）`); }
   const txt = await r.text();
   let j; try { j = JSON.parse(txt); } catch { j = { raw: txt.slice(0, 300) }; }
-  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  if (!r.ok) throw new Error(`${j.error || ('HTTP ' + r.status)} · ${path}`);
   return j;
 }
 const post = (p, body) => api(p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
@@ -623,7 +635,26 @@ async function refreshAll() {
   try { await loadWs(); await loadTasks(); fillLogNodes(); loadGate(); toast('已刷新'); }
   catch (e) { toast('刷新失败：' + e.message); }
 }
-loadWs().then(() => { loadTasks(); fillLogNodes(); pump(); });
+// 启动链必须兜住失败：以前 loadWs() reject 时 .then 永不执行 ⇒ 页面永久停在初始的"读取中…"
+// （远程访问最容易踩：地址里缺 token 就 401）。现在失败会在状态徽章与工作区那行写明原因。
+function bootFailed(e) {
+  const msg = (e && e.message) || String(e);
+  const t = $('#trkState'); if (t) { t.textContent = '加载失败'; t.className = 'pill bad'; }
+  const m = $('#wsmeta'); if (m) m.textContent = '⚠️ ' + msg;
+  toast('加载失败：' + msg);
+}
+// 首屏看门狗：连异常都没有的"纯挂住"（网络停在中途）也要在 12 秒后说话，而不是永远"读取中…"
+setTimeout(() => {
+  if (lastStatus) return;
+  const t = $('#trkState');
+  if (t && /读取中/.test(t.textContent)) {
+    t.textContent = '加载超时';
+    t.className = 'pill bad';
+    const m = $('#wsmeta');
+    if (m) m.textContent = '⚠️ 12 秒内没读到数据：检查地址里是否有 ?token=…、quest 是否在跑（node tools/when-idle.mjs）；点右上「刷新」重试';
+  }
+}, 12000);
+loadWs().then(async () => { await loadTasks(); fillLogNodes(); pump(); }).catch(bootFailed);
 // 运行中的"已跑 X分Y秒"要自己走动；同时兜住长轮询万一断线时的刷新
 setInterval(() => {
   if (!lastStatus || !$('#tasks')) return;

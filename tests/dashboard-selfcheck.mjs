@@ -34,6 +34,12 @@ s.check('⑤ 脚本语法能被解析', !synErr, synErr);
 // 关键节点：这几块是页面骨架，删掉任何一个都等于坏功能（有测试盯着，改名时会立刻发现）
 const KEY = ['rmCanvas', 'rmWhy', 'rmCount', 'gateBody', 'gateState', 'runList'];
 const gone = KEY.filter((k) => !idSet.has(k));
-s.check('⑥ 关键区块都在（画布/说明/门禁/追踪/在跑）', gone.length === 0, gone.join(', '));
+s.check('⑥ 关键区块都在（画布/说明/门禁/在跑）', gone.length === 0, gone.join(', '));
+
+// ⑦⑧⑨ 首屏失败、请求挂住这两类"静默停在读取中…"的故障必须被防住：
+//    2026-09-14 远程事故就是 loadWs() reject 时 .then 永不执行，页面一直停在初始文字，人只能猜。
+s.check('⑦ 启动链兜住了失败（.catch bootFailed）', /loadWs\(\)\.then\([\s\S]{0,160}\)\.catch\(bootFailed\)/.test(html), '启动链没有 .catch → 失败会静默停在读取中');
+s.check('⑧ 请求带超时（不会无限挂住）', /AbortController/.test(html) && /ac\.abort\(\)/.test(html), 'api() 没有超时保护');
+s.check('⑨ 首屏看门狗在（纯挂住也能说话）', /加载超时/.test(html), '没有首屏看门狗');
 
 s.done();
