@@ -78,6 +78,7 @@
   .rm-node.frontier { border-color:var(--ok); box-shadow:0 0 0 2px rgba(63,185,111,.25); }
   .rm-check { position:absolute; right:5px; bottom:3px; color:var(--ok); font-size:12px; }
   .rm-crest { position:absolute; left:5px; bottom:3px; color:var(--warn); font-size:11px; }
+  .rm-rejudge { position:absolute; left:5px; top:3px; color:var(--acc); font-size:11px; }
   .rm-time { position:absolute; right:5px; top:3px; color:#5f6b7a; font-size:10px; }
   .rm-legend { color:var(--dim); font-size:11.5px; margin-top:7px; line-height:1.7; }
 </style>
@@ -144,15 +145,11 @@
     </table>
   </div>
 
-  <!-- ⑤ 门禁：只在有挂起命令时出现 -->
-  <div class="card" id="gate" style="margin-top:10px;display:none">
-    <div class="trk-hd"><b>门禁（待确认的命令）</b></div>
+  <!-- ⑤ 门禁：常驻（没有待确认时也要看得见，否则人会以为它没了；旧版"没事就整块隐藏"） -->
+  <div class="card" id="gate" style="margin-top:10px">
+    <div class="trk-hd"><b>门禁（待确认的命令）</b> <span class="mut" id="gateState"></span></div>
     <div id="gateBody"></div>
   </div>
-</section>
-
-<section id="gate">
-  <div class="card" id="gateBody"><span class="mut">加载中…</span></div>
 </section>
 
 <section id="logs">
@@ -304,7 +301,17 @@ function trkStateText(line) {
   return { t: `刚有动作（${ago(line.idleMinutes)}）· 还没到静默窗口（${line.quietMinutes} 分钟）`, cls: '' };
 }
 /** 节点最近一次动作时间（用于把最新发生的排在最上——WoW 追踪器也是把当前目标放最前）。 */
-function nodeAt(n) { return Date.parse(n.completedAt || n.startedAt || '') || 0; }
+// 画布上的时间是"这个节点跑完的时刻"。两个坑都要绕：
+//   ① 重判会补一条 node.completed，旧版服务端会让它覆盖 completedAt ⇒ 昨夜的节点显示成"重判时刻"
+//      （2026-09-14 用户被误导：4 个 ✔ 显示今早 10:35，其实那是重判时刻）。
+//   ② 新版服务端给了 endedAt（只认第一条终态事件），旧版没有 ⇒ 用 派发时刻+运行秒数 反推。
+const wasRejudged = (n) => n.rejudgedAt != null || (n.events || []).includes('node.rejudged');
+const rejudgeAt = (n) => Date.parse(n.rejudgedAt || (wasRejudged(n) ? (n.lastEventAt || '') : '')) || 0;
+function nodeAt(n) {
+  if (n.endedAt) return Date.parse(n.endedAt) || 0;
+  if (wasRejudged(n) && n.startedAt) return (Date.parse(n.startedAt) || 0) + (n.runSeconds || 0) * 1000;
+  return Date.parse(n.completedAt || n.startedAt || '') || 0;
+}
 function renderTracker(d) {   // 瘦身成「当前状态」卡：徽章 + 计数 + 最新 + 依据
   if (!d) return;
   const nodes = d.plan?.nodes || [];
@@ -470,7 +477,8 @@ function renderRoute(d) {
       <div class="rid">${TRK_ICON[n.status] || '·'} ${esc(n.id)}</div>
       <div class="rst">${esc(TRK_TXT[n.status] || n.status)}${bits.length ? ' · ' + esc(bits.join(' · ')) : ''}</div>
       ${n.status === 'completed' ? '<span class="rm-check">✔</span>' : ''}
-      ${nodeAt(n) ? `<span class="rm-time" title="最后一次动作">${new Date(nodeAt(n)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).replace(/\//g, '-')}</span>` : ''}
+      ${n.rejudgedAt || wasRejudged(n) ? `<span class="rm-rejudge" title="这条判定被重新核过（${rejudgeAt(n) ? new Date(rejudgeAt(n)).toLocaleString('zh-CN', { hour12: false }) : '时间未知'}）：判定器或扫描路径修好后用它纠正旧账，节点本身没有重跑；框里显示的时间是它跑完的时刻。">↻</span>` : ''}
+      ${nodeAt(n) ? `<span class="rm-time" title="${n.rejudgedAt ? '跑完时刻（↻ 是重判时刻）' : '跑完时刻'}">${new Date(nodeAt(n)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).replace(/\//g, '-')}</span>` : ''}
       ${n.manual ? '<span class="rm-crest" title="人工门：上游完成后停下等确认">★</span>' : ''}
     </div>`;
   }).join('');
@@ -506,7 +514,7 @@ async function loadGate() {
     const np = (d.pending || []).length;
     if ($('#gateN')) $('#gateN').textContent = np ? np : '';
     if ($('#gateTop')) $('#gateTop').style.display = np ? 'inline-block' : 'none';
-    if ($('#gate')) $('#gate').style.display = np ? 'block' : 'none';
+    if ($('#gateState')) $('#gateState').textContent = np ? `有 ${np} 条等你确认` : '当前无待确认';
     const items = (d.pending || []).map((g) => `<div class="gate-item">
       <b class="mono">${esc(g.id)}</b> <span class="mut">${new Date(g.createdAt).toLocaleString('zh-CN',{hour12:false})} · ${esc(g.why)}</span>
       <code>${esc(g.command)}</code>
@@ -515,7 +523,7 @@ async function loadGate() {
         <button class="act" onclick="gateDecide('${esc(g.id)}',true)">放行</button>
         <button class="act danger" onclick="gateDecide('${esc(g.id)}',false)">作废</button>
       </div></div>`).join('');
-    $('#gateBody').innerHTML = `<div class="row">${night}</div>` + (items || '<span class="mut">没有挂起的命令</span>');
+    $('#gateBody').innerHTML = `<div class="row">${night}</div>` + (items || '<span class="mut">没有挂起的命令。白名单内的命令（解释器跑工作区内脚本）自动执行、不进这里；只有命中了确认规则的命令（删除/网络下载/工作区外路径/夜间窗口等）才会在这里等你放行。</span>');
   } catch (e) { $('#gateBody').innerHTML = `<span class="mut">读取失败：${esc(e.message)}</span>`; }
 }
 async function gateDecide(id, approve) {

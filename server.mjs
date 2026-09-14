@@ -216,6 +216,10 @@ function buildState(wsKey) {
       if (!n) { if (e.at) state.lastLineEventAt = e.at; continue; }   // 认不出所属节点的历史事件：只当活动，不建节点
       n.events.push(e.t);
       n.lastEventAt = e.at;
+      // 终态时间只认**第一次**（原始跑完的时刻）。重判会补一条 node.completed，若让它覆盖终点时间，
+      // 控制台就会把"重判时刻"当"完成时刻"显示（2026-09-14：4 个昨夜跑完的节点显示成今早 10:35）。
+      if (!n.endedAt && ['node.completed', 'node.failed', 'node.timeout', 'node.frozen', 'node.cancelled', 'node.skipped'].includes(e.t)) n.endedAt = e.at;
+      if (e.t === 'node.rejudged') n.rejudgedAt = e.at;
       if (e.t === 'node.dispatched') { n.status = 'running'; n.jobId = e.jobId; n.pid = e.pid; n.logTs = e.logTs; n.startedAt = e.at; n.verdict = undefined; n.via = undefined; n.detail = undefined; n.summary = undefined; }
       if (e.t === 'fix.attempt') { n.fixCount = (n.fixCount ?? 0) + 1; n.fixing = true; }
       if (e.t === 'fix.reported') { n.lastFix = e.changes; n.fixing = false; }
