@@ -304,7 +304,7 @@ function recoverExitCode(logFile) {
   } catch { return null; }
 }
 
-function judge(node, exitCode, runSec, logFile) {
+function judge(node, exitCode, runSec, logFile, startedAtMs = null, endedAtMs = null) {
   // 超时由外层标记，这里只判退出路径
   if (exitCode !== 0) {
     if (runSec < 60) return { verdict: 'startup-failed', via: 'fast-exit' };
@@ -325,8 +325,12 @@ function judge(node, exitCode, runSec, logFile) {
       try { const f = path.join(d, en.name); artifacts.push({ name: en.name, file: f, mtimeMs: fs.statSync(f).mtimeMs }); } catch {}
     }
   }
-  // 快任务 runSec 舍入到 0 时 startMs=now 会和自己的产物自竞争；+2s 容文件系统时间戳粒度
-  const startMs = Date.now() - Math.max(runSec, 1) * 1000 - 2000;
+  // startMs = 本次运行的起点。+2s 容文件系统时间戳粒度（快任务 runSec 舍入到 0 时避免自竞争）。
+  // 重算历史判定时必须传 startedAtMs 锚到**当时**——否则用今天算窗口，旧产物会被判成不新鲜（踩过）。
+  const startMs = startedAtMs != null ? startedAtMs - 2000 : Date.now() - Math.max(runSec, 1) * 1000 - 2000;
+  // endedAtMs 只在"重算历史判定"时给：把产物新鲜度限制在该节点**自己的运行窗口**内。
+  // 不设上界的话，后来别的运行产出的同名文件会满足老节点的判据 → 把被杀掉的任务也翻成成功（假阳性）。
+  const endMs = endedAtMs != null ? endedAtMs + 120000 : Infinity;
   const tailLc = (logFile ? readTail(logFile, 4096) : '').toLowerCase();
 
   // ① 节点自己声明的成功判据优先（plan 的 success: 字段）——AI 写下的硬约定压过通用关键词表。
@@ -334,7 +338,7 @@ function judge(node, exitCode, runSec, logFile) {
   //    解析不出任何可校验条件（纯白话）时 total=0，自动退回下面的通用路径，零回归。
   const claims = parseSuccessClaims(node.success);
   if (claims.total > 0) {
-    const r = checkClaims(claims, { tail: tailLc, artifacts, metrics: logFile ? extractMetrics(logFile) : {}, startMs });
+    const r = checkClaims(claims, { tail: tailLc, artifacts: artifacts.filter((f) => f.mtimeMs <= endMs), metrics: logFile ? extractMetrics(logFile) : {}, startMs });
     if (r.failures.length) {
       return { verdict: 'suspect', via: 'success-claim-failed', detail: r.failures.map((f) => f.why).join('；').slice(0, 300), claims: r };
     }
@@ -353,7 +357,7 @@ function judge(node, exitCode, runSec, logFile) {
     if (ec[1] === '0') return { verdict: 'ok', via: 'exit-code-0' };
     return { verdict: 'crashed', via: `exit-code-${ec[1]}` };
   }
-  const latest = artifacts.reduce((best, f) => (!best || f.mtimeMs > best.mtimeMs ? f : best), null);
+  const latest = artifacts.filter((f) => f.mtimeMs <= endMs).reduce((best, f) => (!best || f.mtimeMs > best.mtimeMs ? f : best), null);
   if (latest && latest.mtimeMs > Date.now() - 10 * 60 * 1000 && latest.mtimeMs > startMs) {
     return { verdict: 'ok', via: 'artifact-fresh', file: latest.file };
   }
@@ -2333,27 +2337,45 @@ const server = http.createServer(async (req, res) => {
       const targets = Object.keys(state.nodes).filter((id) => (!only || only.includes(id)));
       const changed = [];
       const skipped = [];
+      const downgrades = [];
       for (const id of targets) {
         const n = state.nodes[id];
         if (['running'].includes(n.status)) { skipped.push({ node: id, why: '在跑' }); continue; }
         if (!n.logTs && !n.verdict) { skipped.push({ node: id, why: '无日志/无判定' }); continue; }
         const pn = planById.get(id) ?? {};
-        const logFile = n.shell === 'wsl'
-          ? wslUnc(`/home/${WSL_USER()}/quest-logs/${wsKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-40)}/${id}-${n.logTs}.log`)
-          : path.join(dirOf(wsKey), 'logs', `${id}-${n.logTs}.log`);
-        if (!fs.existsSync(logFile)) { skipped.push({ node: id, why: '日志文件不存在' }); continue; }
-        const node = { ...pn, id, cwd: pn.cwd || n.cwd || plan.meta?.workspace || '', shell: n.shell || pn.shell || 'windows', success: pn.success || n.success || '', expectMinutes: pn.expectMinutes ?? n.expectMinutes ?? 30 };
-        const recovered = recoverExitCode(logFile);
+        // 车道按「日志到底在哪」反推：老账本没记 shell（quick.dispatched 是 2026-09-14 才加的），
+        // 只看账本车道会把 WSL 快速单发当成 Windows → 找不到日志 → 全部跳过，而那批正是 /mnt/c 盲区
+        // 的受害者，永远纠正不了（预演实测：134 个跳过里全是它们）。
+        const logsDir = path.join(dirOf(wsKey), 'logs');
+        const winLog = path.join(logsDir, `${id}-${n.logTs}.log`);
+        const wslLog = wslUnc(`/home/${WSL_USER()}/quest-logs/${wsKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-40)}/${id}-${n.logTs}.log`);
+        let logFile = null; let lane = n.shell === 'wsl' ? 'wsl' : 'windows';
+        if (fs.existsSync(winLog)) logFile = winLog;
+        else if (fs.existsSync(wslLog)) { logFile = wslLog; lane = 'wsl'; }
+        if (!logFile) { skipped.push({ node: id, why: '日志文件不存在（Windows 与 WSL 两侧都找了）' }); continue; }
+        // 原始 cwd 若是"猜"的（plan 已被替换、账本也没记），重算就会扫错目录 → 把本来 ok 的判成
+        // 无产物（预演实测 23 个这样的误降级）。宁可不重算，也不能制造新的假失败。
+        const cwdKnown = pn.cwd || n.cwd;
+        if (!cwdKnown) { skipped.push({ node: id, why: '原始工作目录未知（plan 已替换/账本未记），不重算以免误判' }); continue; }
+        const node = { ...pn, id, cwd: cwdKnown, shell: lane, success: pn.success || n.success || '', expectMinutes: pn.expectMinutes ?? n.expectMinutes ?? 30 };
+        // 退出码优先用账本里记的真实值（node.exited），其次才是日志里的 EXIT_CODE；
+        // 都没有才当 0——否则 Windows 车道真实 exit 126 的崩溃会被误判成成功。
+        const recovered = n.exitCode != null ? Number(n.exitCode) : recoverExitCode(logFile);
         const runSec = Math.round(Number(n.runSeconds || 0)) || 1;
         const startedAt = n.startedAt ? Date.parse(n.startedAt) : Date.now() - runSec * 1000;
         let j;
-        try { j = judge(node, recovered == null ? 0 : recovered, runSec, logFile); }
+        try { j = judge(node, recovered == null ? 0 : recovered, runSec, logFile, startedAt, startedAt + runSec * 1000); }
         catch (e) { skipped.push({ node: id, why: '判定抛错 ' + (e?.message || e) }); continue; }
         const before = { verdict: n.verdict || null, via: n.via || null };
-        if (before.verdict === j.verdict && String(before.via || '').startsWith(String(j.via || '').slice(0, 12))) {
+        // 比较时抹掉 "重新判定：" 前缀，否则重复运行会把同一次改判反复当成"又变了"（幂等问题）
+        const strip = (s) => String(s || '').replace(/^重新判定：/, '');
+        if (before.verdict === j.verdict && strip(before.via).startsWith(strip(j.via).slice(0, 12))) {
           skipped.push({ node: id, why: '判定未变（' + j.verdict + '）' });
           continue;
         }
+        // 铁律：重算只用来**纠正假失败**（非 ok → ok）。反方向（ok → 非 ok）一律不写，
+        // 只列进 downgrades 供人看——历史退出/产物可能已被清理，降级判断不可靠。
+        if (before.verdict === 'ok' && j.verdict !== 'ok') { downgrades.push({ node: id, to: j.verdict, via: j.via, why: '重算比原判定更差，未写入' }); continue; }
         if (b.apply !== true) { changed.push({ node: id, from: before.verdict, to: j.verdict, via: j.via }); continue; }
         appendEvent(wsKey, { t: 'node.rejudged', node: id, from: before.verdict, fromVia: before.via, to: j.verdict, toVia: j.via });
         appendEvent(wsKey, { t: 'node.judged', node: id, verdict: j.verdict, via: `重新判定：${j.via}`, ...(j.detail ? { detail: j.detail } : {}) });
@@ -2363,7 +2385,7 @@ const server = http.createServer(async (req, res) => {
       if (b.apply === true && changed.length) { try { writeProgress(wsKey); } catch {} }
       return json(200, {
         ok: true, applied: b.apply === true, changed: changed.length, unchanged: skipped.length,
-        detail: changed, skipped: skipped.slice(0, 20),
+        detail: changed, skipped: skipped.slice(0, 20), downgrades: downgrades.slice(0, 20), downgradeCount: downgrades.length,
         note: b.apply === true ? '已按新判定追加事件（历史事件保留，可审计）' : '这是预演（未写入）；确认后带 {"apply": true} 再调',
       });
     }
