@@ -146,7 +146,9 @@ function apply(ctx, config = {}) {
       '诊断探针：同步跑一条命令，30 秒内拿回尾部输出（≤8KB）。跑 plan/run 任务的任何时候都能用，不影响它们。',
       '用途：打印中间量/张量形状/验证路径存在/跑一行检查——"我现在就要看这个值"的场景；改完代码先探一下再等重派也是好习惯。',
       '只接受解释器（python/node/Rscript/matlab/julia）跑工作区内脚本，或 -c 内联诊断；被拒绝说明命令超出探针范围。探针不走 shell（无管道/重定向），复杂逻辑写进 -c 代码里。',
-      '**超过 30 秒的任务不是探针的事，用 quest_run。**每次探针入账本留痕。看正在跑的任务的输出用 quest_log（读日志，不执行）。',
+      '**车道按命令首词自动判**（Linux 绝对路径如 /home/…/bin/python → 走 WSL；盘符/UNC → Windows），不用你说明。',
+      '**硬上限 30 秒（WSL 车道 25 秒，留中继余量）**，到点杀整个进程组并返回超时前输出（会标 ⏱）；超时的任务不是探针的事，改用 quest_run。',
+      '每次探针入账本留痕（probe.run + probe.done/probe.error）。看正在跑的任务的输出用 quest_log（读日志，不执行）。',
     ].join(' '),
     parameters: {
       command: { type: 'string', description: '诊断命令，如 python -c "print(arr.shape)" 或 python check_env.py' },
@@ -155,7 +157,7 @@ function apply(ctx, config = {}) {
     },
     output: {
       schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, code: { type: 'number' }, killed: { type: 'boolean' }, ms: { type: 'number' }, log: { type: 'string' }, error: { type: 'string' } } },
-      render: (_a, v) => [{ type: 'text', text: v.error ? `探针被拒：${v.error}` : `${v.killed ? '⏱ 30s 超时被杀（输出为超时前内容）' : `退出码 ${v.code}`} · ${(Math.round((v.ms || 0) / 100) / 10).toString()}s\n${String(v.log || '').slice(-2000)}` }],
+      render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 探针未执行：${v.error}` : `${v.killed ? `⏱ ${v.secs || 30}s 超时被杀（输出为超时前内容）` : `退出码 ${v.code}`} · ${(Math.round((v.ms || 0) / 100) / 10).toString()}s\n${String(v.log || '').slice(-2000)}` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/probe?ws=${encodeURIComponent(wsOf(args, exec))}`, {
       method: 'POST',

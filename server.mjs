@@ -2313,19 +2313,44 @@ const server = http.createServer(async (req, res) => {
       // 代价：无 shell 特性（管道/重定向/&），需要时写进 -c 代码里——对诊断场景是合理限制。
       const argv = shellSplit(command);
       if (!argv.length) return json(400, { ok: false, error: '空命令' });
-      const child = spawn(argv[0], argv.slice(1), { cwd, windowsHide: true, stdio: ['ignore', out, out] });
+      // 车道判定（2026-09-14 修）：探针以前只有 Windows 一条路。WSL 工作区的探针命令首词是 Linux
+      // 绝对路径（/home/…/bin/python），在 Windows 上 spawn 必然 ENOENT；而 'error' 事件没人监听
+      // ⇒ await child.on('exit') 永不返回 ⇒ 这个 HTTP 请求永远悬着，客户端 35s 后 AbortError，
+      // 看着像"quest 服务不可达"。账本证据：5 条 probe.run 没有配对的 probe.done，其中 4 条是 Linux 路径命令。
+      // 修法照抄 run：经 wsl.exe 中继，硬上限交给 Linux 侧 timeout（默认连整个进程组一起杀）。
+      const wslLane = argv[0].startsWith('/') || String(cwd).startsWith('/');
+      const secs = wslLane ? 25 : 30;   // WSL 留出中继启动与 kill 的余量，保证早于插件侧 35s
+      let spawnErr = null;
+      let child;
+      if (wslLane) {
+        const linuxCwd = String(cwd).startsWith('/') ? String(cwd) : uncToLinux(cwd);
+        const wrapped = `cd ${shq(linuxCwd)} 2>/dev/null || { echo 'cd 失败: ${linuxCwd}'; exit 111; }; exec timeout -k 5 ${secs} bash -c ${shq(command)}`;
+        child = spawn('wsl.exe', ['-d', WSL_DISTRO(), '--exec', 'bash', '-c', wrapped],
+          { cwd: hostPathFor(linuxCwd), windowsHide: true, stdio: ['ignore', out, out] });
+      } else {
+        child = spawn(argv[0], argv.slice(1), { cwd: String(cwd).startsWith('/') ? hostPathFor(cwd) : cwd, windowsHide: true, stdio: ['ignore', out, out] });
+      }
       questPids.set(child.pid, Date.now() + 5 * 60 * 1000);
       const startedAt = Date.now();
       let killed = false;
-      const killer = setTimeout(() => {
+      const killer = setTimeout(() => {   // Windows 侧兜底：WSL 车道留给 Linux 侧 timeout 先动手
         killed = true;
         try { execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => {}); } catch {}
-      }, 30000);
-      const code = await new Promise((resolve) => child.on('exit', resolve));
+      }, (secs + 15) * 1000);
+      const code = await new Promise((resolve) => {
+        child.on('exit', resolve);
+        child.on('error', (e) => { spawnErr = e; resolve(null); });
+      });
       clearTimeout(killer);
       try { fs.closeSync(out); } catch {}
-      appendEvent(wsKey, { t: 'probe.done', code, ms: Date.now() - startedAt, killed: killed || undefined });
-      return json(200, { ok: true, code, killed, ms: Date.now() - startedAt, log: readTail(logFile, 8192), logFile });
+      if (spawnErr) {
+        const why = `探测命令没能启动（${spawnErr.code || spawnErr.message}）：${wslLane ? 'WSL' : 'Windows'} 车道的解释器「${argv[0]}」、cwd「${cwd}」——检查它们是否属于该车道（Linux 绝对路径 ↔ Windows 盘符/UNC）。`;
+        appendEvent(wsKey, { t: 'probe.error', error: why });
+        return json(200, { ok: false, secs, error: why });
+      }
+      const timedOut = wslLane ? (code === 124 || code === 137) : killed;
+      appendEvent(wsKey, { t: 'probe.done', code, ms: Date.now() - startedAt, killed: timedOut || undefined });
+      return json(200, { ok: true, code, killed: timedOut, secs, ms: Date.now() - startedAt, log: readTail(logFile, 8192), logFile });
     }
     // 重新判定：用当前判定器重算历史节点（修完判定器/扫描路径后用来纠正旧账）
     if (req.method === 'POST' && u.pathname === '/api/rejudge') {

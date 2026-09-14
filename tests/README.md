@@ -33,6 +33,7 @@ node tests/run-all.mjs judge    # 只跑名字里含 judge 的
 | `dsh-session-activity.mjs` | 会话活跃度：会话在跑时不判收敛；别的 cwd 的会话不误拦；探测失败安全降级（用假 DSH） |
 | `ws-activity.mjs` | 工作区活跃度：账本安静≠没人干活；有人改代码时不判收敛 |
 | `notify-content.mjs` | 通知内容真的送达且可读（soft-pass 提示含节点/探针指令/取消指令） |
+| `probe-lane.mjs` | 探针端点**任何时候都必须有响应**：Windows 车道有输出、spawn 失败必须秒回错误（旧 bug：只听 `exit` 不听 `error`，WSL 命令的请求永远悬着 → 客户端 35s 误报「服务不可达」）、WSL 车道真能跑、超长探针按时被杀且早于 35s |
 
 ## 加新测试
 
@@ -41,7 +42,8 @@ node tests/run-all.mjs judge    # 只跑名字里含 judge 的
 3. **端口要挑没被占用的**（现有：3122–3127、3199）。
 4. 别引入本机专有路径（如某个 python 的绝对路径）——需要就允许缺省跳过（见 `preflight-sync.mjs` 里 python 的处理）。
 
-## 两个已知的环境依赖
+## 三个已知的环境依赖
 
 - `preflight-sync.mjs` 的"语法错预检"需要本机有 `python`/`python3`（或用 `QUEST_TEST_PYTHON` 指定），没有会跳过单条。
 - `two-strike.mjs` 需要 Windows + PowerShell + 那台机器上的看门狗脚本；在别的机器上会 SKIP。
+- `probe-lane.mjs` 的 C/D 组（WSL 车道探针）需要本机有 WSL 且发行版叫 `Ubuntu`，没有会跳过这两条；A/B 组（Windows 车道、起不来必须报错）在任何 Windows 机器上都跑。
