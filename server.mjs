@@ -181,6 +181,31 @@ function parsePlan(markdown) {
   return { meta, nodes, errors };
 }
 
+/**
+ * 覆盖前把旧 plan.md 存档到 <wsDir>/plans/（2026-09-14 用户需求：一次科研里会有很多个短流程 plan
+ * ——生成数据/训练/后处理/评估/可视化——每次一份，做完就该能回看；而一个工作区只有一份 plan.md，
+ * 不存档 = 覆盖即永久丢失依赖关系（箭头）与 handoff）。
+ * 只存"有条目节点"的 plan：快速单发自动补的空壳不值一存。绝不覆盖已有存档（同一毫秒也加后缀）。
+ */
+function archivePlanIfNeeded(wsKey) {
+  try {
+    const dir = dirOf(wsKey);
+    const f = path.join(dir, 'plan.md');
+    if (!fs.existsSync(f)) return null;
+    const md = fs.readFileSync(f, 'utf8');
+    const parsed = parsePlan(md);
+    if (!parsed.nodes.length) return null;
+    const pd = path.join(dir, 'plans');
+    fs.mkdirSync(pd, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const title = String(parsed.meta?.title || 'plan').replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'plan';
+    let out = path.join(pd, `${ts}__${title}__${parsed.nodes.length}n.md`);
+    for (let i = 2; fs.existsSync(out) && i < 50; i++) out = path.join(pd, `${ts}__${title}__${parsed.nodes.length}n-${i}.md`);
+    fs.writeFileSync(out, md, 'utf8');
+    return out;
+  } catch (e) { log('存档 plan 失败:', e?.message); return null; }
+}
+
 /** 状态推导：从 ledger 事件流重建各节点当前状态。 */
 function buildState(wsKey) {
   const dir = dirOf(wsKey);
@@ -1965,6 +1990,56 @@ const server = http.createServer(async (req, res) => {
         unread, questVersion: '0.2.0',
       });
     }
+    // 历史计划列表（2026-09-14）：控制台用下拉栏调出以前那些短流程 plan。
+    // 每条都带自己的节点与依赖（after），状态从账本取（节点 id 跨 plan 稳定）。
+    // current 那条就是现在的 plan.md，live 表示它还有没终结的节点 = "当下正在走的短流程"。
+    if (req.method === 'GET' && u.pathname === '/api/plans') {
+      const state = buildState(wsKey);
+      const dir = dirOf(wsKey);
+      const nodesOfPlan = (parsed) => parsed.nodes.map((n) => {
+        const st = state.nodes[n.id] || {};
+        return {
+          id: n.id, after: Array.isArray(n.after) ? n.after : [], status: st.status || 'pending',
+          verdict: st.verdict || null, shell: n.shell || 'windows', command: n.command || '',
+          success: n.success || '', manual: !!n.manual, expectMinutes: n.expectMinutes ?? 0,
+          startedAt: st.startedAt || null, endedAt: st.endedAt || null, runSeconds: st.runSeconds ?? null,
+          rejudgedAt: st.rejudgedAt || null, metrics: st.metrics || null, inPlan: true,
+        };
+      });
+      const count = (nodes) => nodes.reduce((a, n) => { a[n.status] = (a[n.status] || 0) + 1; return a; }, {});
+      const live = (nodes) => nodes.some((n) => !TERMINAL_STATUS.includes(n.status));
+      const plans = [];
+      const curFile = path.join(dir, 'plan.md');
+      if (fs.existsSync(curFile)) {
+        const parsed = parsePlan(fs.readFileSync(curFile, 'utf8'));
+        if (parsed.nodes.length) {
+          const nodes = nodesOfPlan(parsed);
+          plans.push({
+            file: '(当前)', current: true, live: live(nodes),
+            at: fs.statSync(curFile).mtime.toISOString(),
+            title: parsed.meta?.title || '', workspace: parsed.meta?.workspace || ws,
+            nodes, counts: count(nodes),
+          });
+        }
+      }
+      const pd = path.join(dir, 'plans');
+      if (fs.existsSync(pd)) {
+        for (const f of fs.readdirSync(pd).filter((x) => x.endsWith('.md')).sort().reverse()) {
+          try {
+            const full = path.join(pd, f);
+            const parsed = parsePlan(fs.readFileSync(full, 'utf8'));
+            const nodes = nodesOfPlan(parsed);
+            plans.push({
+              file: f, current: false, live: live(nodes),
+              at: fs.statSync(full).mtime.toISOString(),
+              title: parsed.meta?.title || '', workspace: parsed.meta?.workspace || ws,
+              nodes, counts: count(nodes),
+            });
+          } catch (e) { log('读存档 plan 失败:', f, e?.message); }
+        }
+      }
+      return json(200, { ok: true, plans });
+    }
     if (req.method === 'POST' && u.pathname === '/api/plan') {
       const body = await readBody(req);
       const parsed = parsePlan(body.markdown || '');
@@ -1993,9 +2068,11 @@ const server = http.createServer(async (req, res) => {
           });
         }
       }
+      const archived = archivePlanIfNeeded(wsKey);   // 覆盖前先存档旧 plan（历史计划要能回看）
       fs.writeFileSync(planFile, body.markdown, 'utf8');
+      if (archived) appendEvent(wsKey, { t: 'plan.archived', file: path.basename(archived) });
       appendEvent(wsKey, { t: fs.existsSync(path.join(dir, 'ledger.jsonl')) ? 'plan.reloaded' : 'plan.created', nodes: parsed.nodes.map((n) => n.id), ...(body.force === true ? { forced: true } : {}) });
-      return json(200, { ok: true, nodes: parsed.nodes.map((n) => n.id), workspace: ws });
+      return json(200, { ok: true, nodes: parsed.nodes.map((n) => n.id), workspace: ws, ...(archived ? { archived: path.basename(archived) } : {}) });
     }
     // P4：进程树查询
     if (req.method === 'GET' && u.pathname === '/api/runs') {

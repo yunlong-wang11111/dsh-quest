@@ -117,13 +117,15 @@
     <div id="runList"></div>
   </div>
 
-  <!-- ③ 计划路线：只画 plan.md 声明的节点（快速单发不在图里，见上方「正在跑」） -->
+  <!-- ③ 计划路线：只画 plan.md 声明的节点（快速单发不在图里，见上方「正在跑」）；
+       下拉切换"当下在走的线 / 以前的短流程"（历史只读） -->
   <div class="card" style="margin-top:10px">
     <div class="rm-hd">
       <b>计划路线</b>
       <span class="mut" id="rmCount"></span>
       <span style="flex:1"></span>
-      <button class="act" onclick="renderRoute(lastStatus)">重画</button>
+      <select class="act" id="planPick" title="切换看哪条线：当下在走的 / 以前的短流程（历史只读，节点不会重跑）"></select>
+      <button class="act" onclick="loadPlans().then(() => renderRoute(lastStatus))">重画</button>
     </div>
     <div class="mut" id="rmWhy" style="margin-bottom:8px"></div>
     <div id="rmDone" style="display:none"></div>
@@ -256,10 +258,47 @@ async function loadWs() {
     }
   }
   curWs = sel.value;
-  sel.onchange = () => { curWs = sel.value; loadTasks(); fillLogNodes(); };
+  sel.onchange = () => { curWs = sel.value; pickedPlan = ''; loadTasks(); fillLogNodes(); };
 }
 
 let nodesCache = [];
+// ── 计划切换（2026-09-14）：当下在走的线 / 以前的短流程 ──────────────────────
+// pickedPlan === '' ⇒ 看"当下"（有未终结节点才画，否则空白）；否则看某份历史存档（只读回看）。
+let pickedPlan = '';
+let plansCache = [];
+async function loadPlans() {
+  try {
+    const d = await api('/api/plans?ws=' + encodeURIComponent(curWs));
+    plansCache = d.plans || [];
+  } catch (e) {
+    // 旧版服务端还没有 /api/plans（下一次重启前）：用当前状态页自己拼一条"刚结束的这条"，
+    // 至少保证最近那条线还能从下拉调出来看（节点与依赖都在 /api/status 里）。
+    const inPlan = (lastStatus?.plan?.nodes || []).filter((n) => n.inPlan);
+    plansCache = inPlan.length ? [{
+      file: '(当前)', current: true,
+      live: inPlan.some((n) => !['completed', 'failed', 'frozen', 'cancelled', 'skipped', 'timeout'].includes(n.status)),
+      at: new Date(Math.max(0, ...inPlan.map(nodeAt)) || Date.now()).toISOString(), title: lastStatus?.plan?.title || '',
+      nodes: inPlan,
+      counts: inPlan.reduce((a, n) => { a[n.status] = (a[n.status] || 0) + 1; return a; }, {}),
+    }] : [];
+  }
+  const sel = $('#planPick');
+  if (!sel) return;
+  const curP = plansCache.find((p) => p.current);
+  const opts = [`<option value="">当下${curP ? (curP.live ? '：' + (curP.title || '').slice(0, 22) : '：无在走的 plan') : '：没有 plan'}</option>`];
+  const label = (p) => {
+    const t = new Date(p.at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+    const cc = p.counts || {};
+    return `${t} · ${(p.title || '（无标题）').slice(0, 26)} · ✔${cc.completed || 0}${(cc.failed || 0) ? ' ✖' + cc.failed : ''}${cc.frozen ? ' 🔒' + cc.frozen : ''}`;
+  };
+  // 当前这条**已经结束**的也要能调出来（它就是"上一次的短流程"）——否则它会无处可看
+  if (curP && !curP.live) opts.push(`<option value="${esc(curP.file)}">刚结束 · ${label(curP)}</option>`);
+  for (const p of plansCache.filter((x) => !x.current)) opts.push(`<option value="${esc(p.file)}">${label(p)}</option>`);
+  sel.innerHTML = opts.join('');
+  if (pickedPlan && !plansCache.some((p) => p.file === pickedPlan)) pickedPlan = '';   // 存档被清掉就回当下
+  sel.value = pickedPlan;
+  sel.onchange = () => { pickedPlan = sel.value; renderRoute(lastStatus); };
+}
 async function loadTasks() {
   if (!curWs) { // 没选到工作区：说清楚，别一直"读取中…"（静默空白最难查）
 
@@ -271,6 +310,7 @@ async function loadTasks() {
   $('#wsmeta').textContent = d.plan?.workspace || '';
   nodesCache = d.plan?.nodes || [];
   lastStatus = d;
+  await loadPlans();          // 先拿到"计划"下拉的选项，再画图（切工作区也走这条路）
   renderTracker(d);
   renderRunning(d);
   renderRoute(d);
@@ -323,8 +363,6 @@ const wasRejudged = (n) => n.rejudgedAt != null || (n.events || []).includes('no
 const rejudgeAt = (n) => Date.parse(n.rejudgedAt || (wasRejudged(n) ? (n.lastEventAt || '') : '')) || 0;
 // 一条**已经全部结束**的线：默认把画布收起成一行摘要（2026-09-14 用户反馈：全部结束的老 plan 一直占着
 // 画布，看着像"没清空"，而当下在跑的活其实全是快速单发）。要看随时展开，选择记在 localStorage。
-function routeOpen() { try { return localStorage.getItem('questRouteOpen') === '1'; } catch { return false; } }
-function toggleRoute() { try { localStorage.setItem('questRouteOpen', routeOpen() ? '0' : '1'); } catch {} renderRoute(lastStatus); }
 function nodeAt(n) {
   if (n.endedAt) return Date.parse(n.endedAt) || 0;
   if (wasRejudged(n) && n.startedAt) return (Date.parse(n.startedAt) || 0) + (n.runSeconds || 0) * 1000;
@@ -376,71 +414,80 @@ function renderRunning(d) {
   }).join("");
 }
 
-// ── 任务链路线图（横排；BTWQuests 式：依赖箭头 + 完成绿勾 + 可派发绿框 + 人工门金星）──
-// 只画 plan.md 声明的节点（快速单发不在图里）：回答"当下 plan 走到哪了"。
-// 布局：深度 = 最长前置链（Kahn 拓扑层次，带环保护）；同列按声明顺序。
+// ── 计划路线（横排 DAG；BTWQuests 式：依赖箭头 + 完成绿勾 + 可派发绿框 + 人工门金星）──
+// 2026-09-14 定稿（用户口径）：一次科研里会有很多个**短流程 plan**（生成数据→训练→后处理→评估→可视化），
+// 每次一份、做完就该收。所以：
+//   · 画布只画**当下正在走的那条线**（还有未终结节点）；当下没有在走的线 ⇒ 画布空白；
+//   · 以前那些线用顶部「计划」下拉调出（历史视图，可随时切回「当下」）；
+//   · 快速单发（AI 用 quest_run 派的）从来不上画布——看上方「正在跑」与下方明细。
 function renderRoute(d) {
   if (!d) return;
   const all = d.plan?.nodes || [];
-  const plan = all.filter((n) => n.inPlan);
+  const TERM = ['completed', 'failed', 'frozen', 'cancelled', 'skipped', 'timeout'];
+  const cur = all.filter((n) => n.inPlan);
+  const curLive = cur.some((n) => !TERM.includes(n.status));
+  const picked = pickedPlan ? (plansCache.find((p) => p.file === pickedPlan) || null) : null;
+  const plan = picked ? picked.nodes : (curLive ? cur : []);
+  const isHistory = !!picked;
   const byId = new Map(all.map((n) => [n.id, n]));
+  const nb = (id) => (plan.find((x) => x.id === id) || byId.get(id) || null);   // 当下的在图里/历史视图都要能查到
   const line = d.line || {};
   const c = {};
   for (const n of plan) c[n.status] = (c[n.status] ?? 0) + 1;
-  const depsOf = (n) => (n.after || []).filter((a) => byId.has(a));
-  const frontier = plan.filter((n) => ['pending', 'ready'].includes(n.status) && depsOf(n).every((a) => byId.get(a)?.status === 'completed'));
+  const depsOf = (n) => ((n && n.after) || []).filter((a) => !!nb(a));
+  const frontier = plan.filter((n) => ['pending', 'ready'].includes(n.status) && depsOf(n).every((a) => nb(a).status === 'completed'));
   if ($('#rmCount')) {
     $('#rmCount').textContent = plan.length
       ? `plan 节点 ${plan.length}｜完成 ${c.completed || 0} · 运行 ${c.running || 0} · 可派发 ${frontier.length} · 异常 ${(c.failed || 0) + (c.timeout || 0) + (c.frozen || 0) + (c.cancelled || 0)}`
-      : 'plan 里还没有节点（本工作区只有快速单发）';
+      : '（当下没有在走的 plan）';
   }
   const quick = all.filter((n) => !n.inPlan);
   const quickRunning = quick.filter((n) => n.status === 'running');
   const serverHasPlanMeta = all.length > 0 && ('inPlan' in (all[0] || {}));
-  const planAllDone = plan.length > 0 && plan.every((n) => ['completed', 'failed', 'frozen', 'cancelled', 'skipped', 'timeout'].includes(n.status));
-  const collapsed = planAllDone && !routeOpen();   // 全部结束的线默认收起（可展开，见 routeOpen/toggleRoute）
-  const lastPlanAct = plan.length ? Math.max(0, ...plan.map((n) => nodeAt(n))) : 0;   // 这份 plan 最近一次动作（改"看着像没动"）
+  const lastPlanAct = plan.length ? Math.max(0, ...plan.map((n) => nodeAt(n))) : 0;   // 这份 plan 最近一次动作
   const closedAt = d.plan?.closedAt ? Date.parse(d.plan.closedAt) : 0;
+  const agoOf = (ms) => (ms ? (Date.now() - ms >= 3600000 ? `${Math.round((Date.now() - ms) / 3600000)} 小时` : '刚刚') + '前' : '时间未知');
+  const hist = plansCache.filter((p) => !p.current);
+  const curBad = (cur.reduce((a, n) => { a[n.status] = (a[n.status] || 0) + 1; return a; }, {}));
   if ($('#rmWhy')) {
-    $('#rmWhy').textContent = plan.length
-      ? `画布只放 plan.md 声明的 ${plan.length} 个节点`
+    if (isHistory) {
+      $('#rmWhy').textContent = `${picked.current ? '刚结束的这条线' : '历史线'}：${(picked.title || '（无标题）').slice(0, 48)} · ${new Date(picked.at).toLocaleString('zh-CN', { hour12: false })}`
+        + ` · 完成 ${picked.counts.completed || 0} · 失败/冻结 ${(picked.counts.failed || 0) + (picked.counts.timeout || 0) + (picked.counts.frozen || 0)}`
+        + ` —— 只读回看（节点不会重跑）。顶部「计划」下拉切回「当下」即返回。`;
+    } else if (!plan.length) {
+      $('#rmWhy').textContent = (cur.length
+        ? `当下没有在走的 plan（最后一条已全部结束：完成 ${curBad.completed || 0} · 失败/冻结 ${(curBad.failed || 0) + (curBad.timeout || 0) + (curBad.frozen || 0)}，最近动作 ${agoOf(lastPlanAct)}）`
+        : '这个工作区的 plan.md 里还没有声明节点')
+        + `——所以画布是空的。今天的活都在快速单发里：共 ${quick.length} 个`
+        + (quickRunning.length ? `（此刻 ${quickRunning.length} 个在跑，见上方「正在跑」）` : '')
+        + (plansCache.length ? `；要回看它或更早的短流程，用顶部「计划」下拉选（可调出 ${plansCache.length} 条）。` : '。');
+    } else {
+      $('#rmWhy').textContent = `画布只放 plan.md 声明的 ${plan.length} 个节点`
         + (quick.length ? `；${quick.length} 个快速单发不进画布——正在跑的看上方「正在跑」，全量看下方明细` + (quickRunning.length ? `（此刻 ${quickRunning.length} 个在跑）` : '') : '')
-        + (planAllDone && quickRunning.length ? '。图里是这条线的历史状态，今天在跑的是快速单发' : '')
-        + (lastPlanAct ? `。这份 plan 最近一次动作是 ${Math.round((Date.now() - lastPlanAct) / 3600000) >= 1 ? Math.round((Date.now() - lastPlanAct) / 3600000) + ' 小时' : '刚刚'}前` : '')
-        + (closedAt ? `。🔒 本线已收线（${new Date(closedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}）：未派发的节点已冻结，不会再被自动派出去` : '')
-      : (!serverHasPlanMeta
-        ? '⚠️ 当前 quest 服务是旧版（/api/status 还没有 inPlan/after 字段）——重启 quest 后路线图就能读到 plan 的依赖关系了'
-        : `这份 plan.md 里还没有声明任何节点（全是快速单发 ${quick.length} 个）：画布因此是空的——正在跑的看上方「正在跑」，全量见下方明细。要让画布有内容，就让 AI 写一份 plan.md（或往现有 plan 里追加一条链）`);
+        + (lastPlanAct ? `。这份 plan 最近一次动作是 ${agoOf(lastPlanAct)}` : '')
+        + (closedAt ? `。🔒 本线已收线（${new Date(closedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}）：未派发的节点已冻结，不会再被自动派出去` : '');
+    }
+    if (!serverHasPlanMeta && !isHistory) $('#rmWhy').textContent = '⚠️ 当前 quest 服务是旧版（/api/status 还没有 inPlan/after 字段）——重启 quest 后路线图就能读到 plan 的依赖关系了';
   }
   const canvas = $('#rmCanvas');
   if (!canvas) return;
-  // 收起态：画布/图例让位给一行摘要（展开按钮在摘要里）
   const wrap = canvas.parentElement;
-  if ($('#rmLegend')) $('#rmLegend').style.display = collapsed ? 'none' : '';
-  if (wrap) wrap.style.display = collapsed ? 'none' : '';
-  if ($('#rmDone')) $('#rmDone').style.display = collapsed ? '' : 'none';
-  if (collapsed) {
-    if ($('#rmWhy')) $('#rmWhy').textContent = '';
-    if ($('#rmCount')) $('#rmCount').textContent = '（已结束，已收起）';
-    const c = {};
-    for (const n of plan) c[n.status] = (c[n.status] || 0) + 1;
-    const bad = plan.filter((n) => ['failed', 'timeout', 'frozen', 'cancelled'].includes(n.status)).map((n) => n.id);
-    const hrs = lastPlanAct ? (Date.now() - lastPlanAct) / 3600000 : null;
-    const ago = hrs == null ? '时间未知' : (hrs >= 1 ? `${Math.round(hrs)} 小时` : '刚刚');
-    $('#rmDone').innerHTML = `<div class="rm-donebar">`
-      + `<b>这条线已全部结束</b>：完成 ${c.completed || 0}`
-      + (bad.length ? ` · 失败/冻结 ${bad.length}（<span class="mono">${bad.map(esc).join('、')}</span>）` : '')
-      + ` · 最近动作 ${ago}前。`
-      + `<span class="mut"> 画布已收起——当下的活都在快速单发里（此刻在跑 ${quickRunning.length} 个，见上方「正在跑」；全量见下方明细）。</span>`
-      + `<button class="act" style="margin-left:8px" onclick="toggleRoute()">展开路线图</button></div>`;
+  const showMap = plan.length > 0;
+  if ($('#rmLegend')) $('#rmLegend').style.display = showMap ? '' : 'none';
+  if (wrap) wrap.style.display = showMap ? '' : 'none';
+  if ($('#rmDone')) $('#rmDone').style.display = showMap ? 'none' : '';
+  if (!showMap) {
+    // 空白态：不画任何东西（这是"当下没有在走的线"的正常样子），只留一句怎么调出历史
+    if ($('#rmDone')) $('#rmDone').innerHTML = `<div class="rm-donebar mut">画布空白 = 当下没有在走的 plan（快速单发不进画布）。`
+      + (plansCache.length ? `要回看刚结束/更早的线：用顶部「<b>计划</b>」下拉选（${plansCache.length} 条，只读回看）。` : `等 AI 写下一份 plan.md，这里就会出现它的路线图。`)
+      + `</div>`;
     return;
   }
-  if (!plan.length) { canvas.innerHTML = ''; canvas.style.height = '40px'; return; }
 
   const depth = new Map();
   const calc = (id, seen) => {
     if (depth.has(id)) return depth.get(id);
-    const deps = depsOf(byId.get(id));
+    const deps = depsOf(nb(id));
     if (!deps.length || seen.has(id)) { depth.set(id, 0); return 0; }
     seen.add(id);
     const d2 = 1 + Math.max(...deps.map((p) => calc(p, seen)));
@@ -484,7 +531,7 @@ function renderRoute(d) {
   const paths = [];
   for (const n of plan) {
     for (const a of depsOf(n)) {
-      const p = byId.get(a), pp = pos.get(a), cp = pos.get(n.id);
+      const p = nb(a), pp = pos.get(a), cp = pos.get(n.id);
       if (!pp || !cp) continue;
       const x1 = pp.x + NW, y1 = pp.y + NH / 2, x2 = cp.x - 6, y2 = cp.y + NH / 2;
       const col = edgeColor(p);
