@@ -78,6 +78,7 @@
   .rm-node.frontier { border-color:var(--ok); box-shadow:0 0 0 2px rgba(63,185,111,.25); }
   .rm-check { position:absolute; right:5px; bottom:3px; color:var(--ok); font-size:12px; }
   .rm-crest { position:absolute; left:5px; bottom:3px; color:var(--warn); font-size:11px; }
+  .rm-time { position:absolute; right:5px; top:3px; color:#5f6b7a; font-size:10px; }
   .rm-legend { color:var(--dim); font-size:11.5px; margin-top:7px; line-height:1.7; }
 </style>
 </head>
@@ -372,11 +373,13 @@ function renderRoute(d) {
   const quickRunning = quick.filter((n) => n.status === 'running');
   const serverHasPlanMeta = all.length > 0 && ('inPlan' in (all[0] || {}));
   const planAllDone = plan.length > 0 && plan.every((n) => ['completed', 'failed', 'frozen', 'cancelled', 'skipped', 'timeout'].includes(n.status));
+  const lastPlanAct = plan.length ? Math.max(0, ...plan.map((n) => nodeAt(n))) : 0;   // 这份 plan 最近一次动作（改"看着像没动"）
   if ($('#rmWhy')) {
     $('#rmWhy').textContent = plan.length
       ? `图里只有 plan.md 声明的 ${plan.length} 个节点`
         + (quick.length ? `；另有 ${quick.length} 个快速单发不在图里` + (quickRunning.length ? `（其中 ${quickRunning.length} 个正在跑，见上方「正在跑」）` : '') : '')
         + (planAllDone && quickRunning.length ? ' —— 图里是历史状态，今天在跑的是快速单发，所以不在路线图上' : '')
+        + (lastPlanAct ? `。这份 plan 最近一次动作是 ${Math.round((Date.now() - lastPlanAct) / 3600000) >= 1 ? Math.round((Date.now() - lastPlanAct) / 3600000) + ' 小时' : '刚刚'}前` : '')
       : (!serverHasPlanMeta
         ? '⚠️ 当前 quest 服务是旧版（/api/status 还没有 inPlan/after 字段）——重启 quest 后路线图就能读到 plan 的依赖关系了'
         : `这个工作区还没有 plan.md（历史都是快速单发 ${quick.length} 个）——用下方明细看它们；想让路线图有内容，就让 AI 写一份 plan.md 把流水固定下来`);
@@ -465,6 +468,7 @@ function renderRoute(d) {
       <div class="rid">${TRK_ICON[n.status] || '·'} ${esc(n.id)}</div>
       <div class="rst">${esc(TRK_TXT[n.status] || n.status)}${bits.length ? ' · ' + esc(bits.join(' · ')) : ''}</div>
       ${n.status === 'completed' ? '<span class="rm-check">✔</span>' : ''}
+      ${nodeAt(n) ? `<span class="rm-time" title="最后一次动作">${new Date(nodeAt(n)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).replace(/\//g, '-')}</span>` : ''}
       ${n.manual ? '<span class="rm-crest" title="人工门：上游完成后停下等确认">★</span>' : ''}
     </div>`;
   }).join('');

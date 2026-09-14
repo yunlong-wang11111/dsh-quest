@@ -2289,6 +2289,51 @@ const server = http.createServer(async (req, res) => {
       appendEvent(wsKey, { t: 'probe.done', code, ms: Date.now() - startedAt, killed: killed || undefined });
       return json(200, { ok: true, code, killed, ms: Date.now() - startedAt, log: readTail(logFile, 8192), logFile });
     }
+    // 重新判定：用当前判定器重算历史节点（修完判定器/扫描路径后用来纠正旧账）
+    if (req.method === 'POST' && u.pathname === '/api/rejudge') {
+      const b = await readBody(req);
+      const state = buildState(wsKey);
+      const plan = state.plan ? parsePlan(state.plan) : { nodes: [] };
+      const planById = new Map(plan.nodes.map((n) => [n.id, n]));
+      const only = b.node ? [String(b.node)] : null;
+      const targets = Object.keys(state.nodes).filter((id) => (!only || only.includes(id)));
+      const changed = [];
+      const skipped = [];
+      for (const id of targets) {
+        const n = state.nodes[id];
+        if (['running'].includes(n.status)) { skipped.push({ node: id, why: '在跑' }); continue; }
+        if (!n.logTs && !n.verdict) { skipped.push({ node: id, why: '无日志/无判定' }); continue; }
+        const pn = planById.get(id) ?? {};
+        const logFile = n.shell === 'wsl'
+          ? wslUnc(`/home/${WSL_USER()}/quest-logs/${wsKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-40)}/${id}-${n.logTs}.log`)
+          : path.join(dirOf(wsKey), 'logs', `${id}-${n.logTs}.log`);
+        if (!fs.existsSync(logFile)) { skipped.push({ node: id, why: '日志文件不存在' }); continue; }
+        const node = { ...pn, id, cwd: pn.cwd || n.cwd || plan.meta?.workspace || '', shell: n.shell || pn.shell || 'windows', success: pn.success || n.success || '', expectMinutes: pn.expectMinutes ?? n.expectMinutes ?? 30 };
+        const recovered = recoverExitCode(logFile);
+        const runSec = Math.round(Number(n.runSeconds || 0)) || 1;
+        const startedAt = n.startedAt ? Date.parse(n.startedAt) : Date.now() - runSec * 1000;
+        let j;
+        try { j = judge(node, recovered == null ? 0 : recovered, runSec, logFile); }
+        catch (e) { skipped.push({ node: id, why: '判定抛错 ' + (e?.message || e) }); continue; }
+        const before = { verdict: n.verdict || null, via: n.via || null };
+        if (before.verdict === j.verdict && String(before.via || '').startsWith(String(j.via || '').slice(0, 12))) {
+          skipped.push({ node: id, why: '判定未变（' + j.verdict + '）' });
+          continue;
+        }
+        if (b.apply !== true) { changed.push({ node: id, from: before.verdict, to: j.verdict, via: j.via }); continue; }
+        appendEvent(wsKey, { t: 'node.rejudged', node: id, from: before.verdict, fromVia: before.via, to: j.verdict, toVia: j.via });
+        appendEvent(wsKey, { t: 'node.judged', node: id, verdict: j.verdict, via: `重新判定：${j.via}`, ...(j.detail ? { detail: j.detail } : {}) });
+        appendEvent(wsKey, { t: j.verdict === 'ok' ? 'node.completed' : 'node.failed', node: id, verdict: j.verdict });
+        changed.push({ node: id, from: before.verdict, to: j.verdict, via: j.via });
+      }
+      if (b.apply === true && changed.length) { try { writeProgress(wsKey); } catch {} }
+      return json(200, {
+        ok: true, applied: b.apply === true, changed: changed.length, unchanged: skipped.length,
+        detail: changed, skipped: skipped.slice(0, 20),
+        note: b.apply === true ? '已按新判定追加事件（历史事件保留，可审计）' : '这是预演（未写入）；确认后带 {"apply": true} 再调',
+      });
+    }
+
     if (req.method === 'POST' && u.pathname === '/api/external-exit') {
       // 外部进程退出（python-manager 检测到的手动启动任务）：合成虚拟节点走同一条
       // finishNode 流水线（worker 总结 + QQ 推送 + 账本），不占用 plan.md
