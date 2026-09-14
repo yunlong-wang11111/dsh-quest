@@ -214,6 +214,15 @@ function buildState(wsKey) {
       if (e.t === 'watch.kill') { n.watchKilled = e.rule; }
       // ②c：上游只是"疑似"被放行——不阻塞，但要在 progress.md 里留痕，AI 扫一眼就知道该查谁
       if (e.t === 'node.soft-pass') { n.softPass = e.upstream || []; }
+      // quick 单发的车道/命令要从账本恢复：重启对账时若不知道它是 WSL 车道，会按 Windows 去找 pid
+      // → 明明还在跑的 WSL 任务被判"进程已消失"（2026-09-14 实测踩到，两个假失败）
+      if (e.t === 'quick.dispatched') {
+        n.shell = e.shell || 'windows';
+        if (e.cwd) n.cwd = e.cwd;
+        if (e.command) n.command = e.command;
+        if (e.expectMinutes != null) n.expectMinutes = e.expectMinutes;
+        if (e.success) n.success = e.success;
+      }
     }
   } catch {}
   return state;
@@ -1067,15 +1076,32 @@ async function adoptOrphan(wsKey, node, n) {
     try { unit = fs.readFileSync(wslUnc(`${base}.unit`), 'utf8').trim(); } catch {}
     if (!unit) unit = `quest-${String(node.id).replace(/[^a-zA-Z0-9_.-]/g, '_')}-${n.logTs}`.slice(0, 90);
     n.wslUnit = unit;
-    const alive = await wslUnitActive(unit);
-    if (!alive) {
+    // 判"WSL 作业是否结束"要用两个独立信号，任一表示"还在跑"就不结案：
+    //   ① 日志尾没有 EXIT_CODE:<n>（包装器最后写它，是"跑完了"的权威信号）
+    //   ② systemd 单元仍 active
+    // 2026-09-14 事故：重启对账在进程起来约 9 秒后就问一次 is-active，而单元可能还没被
+    // systemd-run 建出来（或 VM 刚醒）→"问不到"被当成"死了"→ 明明还在跑的任务被判 suspect
+    // （实测：75 秒后日志写着"训练完成 / EXIT_CODE:0"、产物也落盘，却已经判了 failed）。
+    // 教训与 DSH 看门狗那次一样：**必须把"问不到"和"确实不活"分开**。
+    const finishedByLog = () => /EXIT_CODE:\s*\d+/.test(readTail(logFile, 2048));
+    const finished0 = finishedByLog();
+    let alive = finished0 ? false : await wslUnitActive(unit);
+    if (!finished0 && !alive) {
+      for (let i = 0; i < 3 && !alive; i++) { // 宽限期：单元/VM 可能还在起
+        await new Promise((r) => setTimeout(r, 5000));
+        if (finishedByLog()) break;
+        alive = await wslUnitActive(unit);
+      }
+    }
+    const finished = finished0 || finishedByLog();
+    if (finished || !alive) {
       appendEvent(wsKey, { t: 'node.readopted', node: node.id, result: 'gone-wsl' });
       const runSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
       const metrics = extractMetrics(logFile);
       if (Object.keys(metrics).length) appendEvent(wsKey, { t: 'node.metrics', node: node.id, metrics });
       const recovered = recoverExitCode(logFile);
     const j = judge(node, recovered == null ? 0 : recovered, runSec, logFile);
-      j.via = `${j.via}（quest 重启期间 WSL 进程已消失，按产物/关键词判定）`;
+      j.via = `${j.via}（quest 重启期间${finished ? '作业已结束，按日志退出码/产物判定' : 'WSL 进程已消失，按产物/关键词判定'}）`;
       try {
               node.__startedAt = n.startedAt;
               if (await offerResume(wsKey, node, j, n.resumeCount, n.interrupted, { cfg: CFG, appendEvent, qqPush, pushInbox, findLatestCheckpoint, wslUnc, log })) node.__suppressFinishPush = true;
@@ -1092,7 +1118,9 @@ async function adoptOrphan(wsKey, node, n) {
     job.timers.push(setTimeout(() => { timedOut = true; killJobTree(job, 0); }, Math.max(0, startedAt + timeoutMs - Date.now())));
     setupWatch(wsKey, node, job, logFile, 0);
     const iv = setInterval(async () => {
-      if (await wslUnitActive(unit)) return;
+      // 盯梢判"还在跑"同样要两个信号：日志没有终标记 **且** 单元活着 → 继续等；
+      // 否则（日志写了 EXIT_CODE，或单元确实不在了）才结案。
+      if (!finishedByLog() && (await wslUnitActive(unit))) return;
       clearInterval(iv);
       handleNodeExit(wsKey, node, { code: null, timedOut, logFile, startedAt, timeoutMs, job, pid: 0, reAdopted: true });
     }, 10000);
@@ -2329,10 +2357,15 @@ server.listen(CFG.port || 3110, '127.0.0.1', () => {
         const n = state.nodes[id];
         if (n?.status !== 'running' || !n.pid) continue;
         const node = planById.get(id) ?? {
-          // 账本独有的快速单发节点：合成最小配置（命令已不在账本里，认领只靠 pid/logTs）
-          id, command: '', cwd: plan.meta?.workspace || '', expectMinutes: 30, timeoutSeconds: 0,
-          shell: 'windows', quiet: true, autoFix: false, fixBudget: 0, when: '', after: [],
-          watchRules: [], maxLogMB: 0, pushImages: 0, noCheckpoint: true, handoff: '', success: '',
+          // 账本独有的快速单发节点：**车道/命令/预期时长从账本恢复**（buildState 读 quick.dispatched）。
+          // 以前这里硬编码 shell:'windows' —— WSL 车道的快速单发在重启后会被当 Windows 处理，
+          // 去 Windows 侧找 pid 必然找不到 → 明明还在跑的 WSL 任务判成"进程已消失"（假失败）。
+          id, command: n?.command || '', cwd: n?.cwd || plan.meta?.workspace || '',
+          expectMinutes: n?.expectMinutes ?? 30, timeoutSeconds: 0,
+          shell: n?.shell === 'wsl' ? 'wsl' : 'windows',
+          quiet: true, autoFix: false, fixBudget: 0, when: '', after: [],
+          watchRules: [], maxLogMB: 0, pushImages: 0, noCheckpoint: true, handoff: '',
+          success: n?.success || '',
         };
         adoptOrphan(wsKey, node, n).catch((e) => log('再认领失败:', wsKey, id, e?.message));
       }

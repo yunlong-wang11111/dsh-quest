@@ -28,6 +28,7 @@ node tests/run-all.mjs judge    # 只跑名字里含 judge 的
 | `preflight-sync.mjs` | 预检失败必须**同步**回原因（不能伪装成"已派发"）：车道不匹配、WSL 配 Windows cwd、语法错、dispatch 路径 |
 | `two-strike.mjs` | DSH 看门狗的"两振判死"（同轮内复探吸收抖动；一直活走快路径）。被测脚本在仓库外，找不到则 SKIP（可用 `QUEST_WATCHDOG_PATH` 指定） |
 | `quiet-signal.mjs` | 收敛信号：只用 quest_run 的工作区也能收到、可重复、不刷屏 |
+| `wsl-restart-adopt.mjs` | 重启 quest 时正在跑的 WSL 任务必须被认领而非判死（真杀 quest 再起来验证） |
 | `wsl-mntc-artifact.mjs` | WSL 节点 cwd 在 /mnt/c 时产物必须被扫到（drvfs 的 UNC 是 EPERM，走原生盘路径） |
 | `dsh-session-activity.mjs` | 会话活跃度：会话在跑时不判收敛；别的 cwd 的会话不误拦；探测失败安全降级（用假 DSH） |
 | `ws-activity.mjs` | 工作区活跃度：账本安静≠没人干活；有人改代码时不判收敛 |
