@@ -407,18 +407,33 @@ function renderRoute(d) {
   const cols = new Map();
   for (const n of plan) { const dp = depth.get(n.id) || 0; if (!cols.has(dp)) cols.set(dp, []); cols.get(dp).push(n); }
 
-  const NW = 186, NH = 44, GX = 68, GY = 16, PAD = 10;
+  const NW = 186, NH = 44, GX = 68, GY = 16, PAD = 10, LANE = 16;
+  // 同列行序：按"父节点所在行的重心"排（Sugiyama 第二步，减少交叉）。跑两遍足够这个规模。
+  for (let pass = 0; pass < 2; pass++) {
+    const rowOf = new Map();
+    for (const [dp, list] of [...cols.entries()].sort((a, b) => a[0] - b[0])) list.forEach((n, i) => rowOf.set(n.id, i));
+    for (const [dp, list] of [...cols.entries()].sort((a, b) => a[0] - b[0])) {
+      if (dp === 0) continue; // 根列保持声明顺序
+      const key = (n) => {
+        const ps = depsOf(n).filter((a) => rowOf.has(a));
+        return ps.length ? ps.reduce((s, a) => s + rowOf.get(a), 0) / ps.length : -1; // 无前置的排最上
+      };
+      const withIdx = list.map((n, i) => ({ n, i, k: key(n) }));
+      withIdx.sort((a, b) => (a.k - b.k) || (a.i - b.i));
+      cols.set(dp, withIdx.map((x) => x.n));
+    }
+  }
   const pos = new Map();
   let maxX = 0, maxY = 0;
   for (const [dp, list] of cols) {
     list.forEach((n, i) => {
       const x = PAD + dp * (NW + GX);
-      const y = PAD + i * (NH + GY);
+      const y = PAD + LANE + i * (NH + GY); // 上方留出跳级边的"车道"
       pos.set(n.id, { x, y });
       maxX = Math.max(maxX, x + NW); maxY = Math.max(maxY, y + NH);
     });
   }
-  const W = maxX + PAD, H = maxY + PAD;
+  const W = maxX + PAD, H = maxY + LANE + PAD; // 下方也留一条车道
   canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
 
   // 箭头：绿=上游完成，红=上游失败/冻结，灰=其它
@@ -430,7 +445,15 @@ function renderRoute(d) {
       if (!pp || !cp) continue;
       const x1 = pp.x + NW, y1 = pp.y + NH / 2, x2 = cp.x - 6, y2 = cp.y + NH / 2;
       const col = edgeColor(p);
-      paths.push(`<path d="M ${x1} ${y1} C ${x1 + 34} ${y1}, ${x2 - 34} ${y2}, ${x2} ${y2}" fill="none" stroke="${col}" stroke-width="1.6" marker-end="url(#arm-${col.slice(1)})"/>`);
+      const gap = (depth.get(n.id) || 0) - (depth.get(a) || 0);
+      if (gap >= 2) {
+        // **跳级边（跨 ≥2 列）走正交"车道"**：横向段在上下留白里（盒子区之外），
+        // 两个竖直转折都落在列间隙（18px，绝无盒子）——几何上不可能穿过任何盒子。
+        const laneY = y2 < y1 ? PAD + LANE / 2 : H - LANE / 2;
+        paths.push(`<path d="M ${x1} ${y1} H ${x1 + 18} V ${laneY} H ${x2 - 18} V ${y2} H ${x2}" fill="none" stroke="${col}" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arm-${col.slice(1)})"/>`);
+      } else {
+        paths.push(`<path d="M ${x1} ${y1} C ${x1 + 34} ${y1}, ${x2 - 34} ${y2}, ${x2} ${y2}" fill="none" stroke="${col}" stroke-width="1.6" marker-end="url(#arm-${col.slice(1)})"/>`);
+      }
     }
   }
   const markers = ['#3fb96f', '#e0563f', '#3a4350'].map((col) => `<marker id="arm-${col.slice(1)}" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="${col}"/></marker>`).join('');
