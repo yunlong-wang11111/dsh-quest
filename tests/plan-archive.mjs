@@ -57,6 +57,7 @@ try {
   const last3 = wsList.slice(-3).map((w) => w.wsKey);
   s.check('⑩ 残留工作区排在最后（页面默认不会落到它）', !/^_orphaned/.test(wsList[0]?.wsKey || ''), JSON.stringify(wsList.slice(0, 2).map((w) => w.wsKey)));
   s.check('⑪ 每个工作区带 nodes/junk 字段（页面据此标注）', typeof wsList[0]?.nodes === 'number' && typeof wsList[0]?.junk === 'boolean', JSON.stringify(wsList[0]));
+  s.check('⑫ 工作区条目带 workspace 路径（下拉栏显示路径而不是 plan 标题）', typeof wsList[0]?.workspace === 'string' && wsList[0].workspace.length > 0, String(wsList[0]?.workspace));
 } finally {
   sb.stop();
 }

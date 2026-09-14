@@ -2150,11 +2150,16 @@ const server = http.createServer(async (req, res) => {
         for (const d of fs.readdirSync(HOMEOverride, { withFileTypes: true })) {
           if (!d.isDirectory()) continue;
           let title = '';
+          let wsPath = '';
           let running = 0;
           let nodes = 0;
           try {
             const st = buildState(d.name);
-            if (st.plan) title = parsePlan(st.plan).meta?.title || '';
+            if (st.plan) {
+              const meta = parsePlan(st.plan).meta || {};
+              title = meta.title || '';
+              wsPath = meta.workspace || '';   // 下拉栏按"工作区路径"显示（像 DSH 的工作区切换器）
+            }
             running = Object.values(st.nodes).filter((n) => n.status === 'running').length;
             nodes = Object.keys(st.nodes).length;
           } catch {}
@@ -2162,7 +2167,7 @@ const server = http.createServer(async (req, res) => {
           // 页面在地址没带 ?ws= 时会落在这个列表的第一项 —— 2026-09-14 用户刷新后
           // "全部节点明细只剩 2 个节点"，就是因为第一项是 _orphaned-… 那个残留键。
           const junk = /^_orphaned/.test(d.name) || /^-mnt-/.test(d.name) || d.name === 'logs';
-          list.push({ wsKey: d.name, title, running, nodes, junk });
+          list.push({ wsKey: d.name, title, workspace: wsPath, running, nodes, junk });
         }
       } catch {}
       list.sort((a, b) => b.running - a.running || Number(a.junk) - Number(b.junk) || b.nodes - a.nodes || a.wsKey.localeCompare(b.wsKey));

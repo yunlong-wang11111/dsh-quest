@@ -88,7 +88,8 @@
 <header>
   <h1>quest 控制台 <small id="ver"></small></h1>
   <span class="pill" id="live">● 实时</span>
-  <select id="ws" style="max-width:340px"></select>
+  <span class="mut">工作区</span>
+  <select id="ws" style="max-width:380px" title="切换工作区（控制台按工作区看节点；地址里带 ?ws= 会固定住）"></select>
   <span class="mut" id="wsmeta"></span>
   <span class="mut" id="wsNote" style="color:var(--warn)"></span>
   <span style="flex:1"></span>
@@ -245,10 +246,12 @@ async function loadWs() {
   for (const w of d.workspaces) {
     const o = document.createElement('option');
     o.value = w.wsKey;
-    // 标注"残留"工作区与节点数：2026-09-14 用户刷新后落到 _orphaned-… 那个残留键上，
-    // 明细里只剩它自己的 2 个节点，看着像"工作目录没绑定"。现在这种键会被明确标出来。
-    o.textContent = (w.running ? '▶ ' : '') + (w.junk ? '（残留）' : '') + (w.title || w.wsKey)
+    // 这个是**工作区切换器**（和 DSH 一致）：显示工作区路径，而不是 plan 标题——
+    // 2026-09-14 用户反馈：以前标签是 plan 标题，看着像"计划选择器"，认不出这是切工作区。
+    // plan 标题放进悬停提示；节点数/在跑/残留都标出来。
+    o.textContent = (w.running ? '▶ ' : '') + (w.junk ? '（残留）' : '') + (w.workspace || w.wsKey)
       + (typeof w.nodes === 'number' ? (w.nodes ? ` · ${w.nodes} 节点` : ' · 空') : '');
+    o.title = [w.workspace || w.wsKey, w.title ? `任务线：${w.title}` : '', w.junk ? '残留工作区（孤立键 / 老版路径残留）' : ''].filter(Boolean).join('\n');
     sel.appendChild(o);
   }
   // 工作区从哪来：url（地址里带 ?ws=）> remembered（上次用的）> guessed（按"最近有活动"挑的第一个非残留）
