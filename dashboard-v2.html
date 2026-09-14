@@ -85,22 +85,39 @@
 <header>
   <h1>quest 控制台 <small id="ver"></small></h1>
   <span class="pill" id="live">● 实时</span>
-  <span class="mut" id="wslhint"></span>
+  <select id="ws" style="max-width:340px"></select>
+  <span class="mut" id="wsmeta"></span>
+  <span style="flex:1"></span>
+  <button class="act" id="gateTop" style="display:none" onclick="document.getElementById('gate').scrollIntoView({behavior:'smooth'})">门禁 <b id="gateN"></b></button>
   <button class="act" onclick="refreshAll()">刷新</button>
 </header>
 <nav>
-  <button data-t="route" class="on">计划路线</button>
-  <button data-t="tasks">任务线</button>
-  <button data-t="gate">门禁 <span id="gateN" class="mut"></span></button>
+  <button data-t="tasks" class="on">任务线</button>
   <button data-t="logs">日志</button>
   <button data-t="files">文件</button>
 </nav>
 
-<section id="route" class="on">
-  <div class="card">
+<section id="tasks" class="on">
+  <!-- ① 状态：一眼看出"在改代码 / 在跑 / 静默" -->
+  <div class="card" id="trk">
+    <div class="trk-hd">
+      <b>当前状态</b>
+      <span class="pill" id="trkState">读取中…</span>
+      <span class="mut" id="trkCount"></span>
+    </div>
+    <div class="mut" id="trkWhy"></div>
+  </div>
+
+  <!-- ② 正在跑：**所有**在跑的节点（plan + 快速单发都在这里，回答"现在在跑什么"） -->
+  <div class="card" id="running" style="margin-top:10px">
+    <div class="trk-hd"><b>正在跑</b><span class="mut" id="runCount"></span></div>
+    <div id="runList"></div>
+  </div>
+
+  <!-- ③ 计划路线：只画 plan.md 声明的节点（快速单发不在图里，见上方「正在跑」） -->
+  <div class="card" style="margin-top:10px">
     <div class="rm-hd">
-      <b>任务链路线图</b>
-      <span class="pill" id="rmState">读取中…</span>
+      <b>计划路线</b>
       <span class="mut" id="rmCount"></span>
       <span style="flex:1"></span>
       <button class="act" onclick="renderRoute(lastStatus)">重画</button>
@@ -110,35 +127,26 @@
     <div class="rm-legend">
       图例：✔ 完成（盒右下角绿勾）· ✖ 失败 · ▶ 运行中 · ⛔ 冻结 · ⏭ 跳过 · ○ 待办 · ★ 人工门（manual: true）·
       <b style="color:var(--ok)">绿框 = 现在可派发</b>（前置都已完成）· 点节点 → 看它的日志 ·
-      <b>实线</b>箭头 = 相邻列的依赖（链上的下一步）· <b>虚线</b>箭头 = <b style="color:#9dc6ff">跳级依赖</b>（after 跨 ≥2 列，从盒子区外侧的留白绕行，所以不会穿过任何盒子）·
+      <b>实线</b>箭头 = 相邻列的依赖 · <b>虚线</b>箭头 = <b style="color:#9dc6ff">跳级依赖</b>（after 跨 ≥2 列，从盒子区外侧绕行）·
       箭头颜色：绿=上游已完成，红=上游失败/冻结，灰=待办
     </div>
   </div>
-</section>
 
-<section id="tasks">
-  <div class="card" id="trk">
-    <div class="trk-hd">
-      <b>任务线追踪</b>
-      <span class="pill" id="trkState">读取中…</span>
-      <span class="mut" id="trkCount"></span>
-      <span style="flex:1"></span>
-      <button class="act" id="trkBtnDone" onclick="toggleDone()">显示已完成</button>
-    </div>
-    <div class="mut" id="trkWhy" style="margin-bottom:4px"></div>
-    <div id="trkList"></div>
-  </div>
+  <!-- ④ 全部节点（含操作按钮） -->
   <div class="card" style="margin-top:10px">
     <div class="row">
-      <select id="ws"></select>
-      <span class="mut" id="wsmeta"></span>
-      <span style="flex:1"></span>
-      <span class="mut">全部节点明细 ↓</span>
+      <span class="mut">全部节点明细（plan + 快速单发，按 进行中→异常→待办→已完成 排）</span>
     </div>
     <table>
       <thead><tr><th>节点</th><th>状态</th><th>判定</th><th>耗时</th><th>指标</th><th>操作</th></tr></thead>
       <tbody id="nodes"></tbody>
     </table>
+  </div>
+
+  <!-- ⑤ 门禁：只在有挂起命令时出现 -->
+  <div class="card" id="gate" style="margin-top:10px;display:none">
+    <div class="trk-hd"><b>门禁（待确认的命令）</b></div>
+    <div id="gateBody"></div>
   </div>
 </section>
 
@@ -202,7 +210,8 @@ const post = (p, body) => api(p, { method: 'POST', headers: { 'content-type': 'a
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 const fmtSize = (n) => n > 1048576 ? (n/1048576).toFixed(1)+'MB' : n > 1024 ? (n/1024).toFixed(0)+'KB' : n+'B';
 const wslHome = () => '\\\\wsl$\\Ubuntu\\home\\solanine';
-$('#wslhint').textContent = 'WSL: ' + wslHome();
+// 注意：wslhint 那个元素在合并页面时删掉了——**删元素必须同时删引用**，否则顶层赋值抛异常会
+// 静默中断整个脚本（页面全空、只显示"读取中…"）。这类"删了元素忘了引用"踩过一次，留个记号。
 let toastT = null;
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toastT); toastT = setTimeout(() => t.style.display = 'none', 2600); }
 
@@ -241,7 +250,7 @@ async function loadWs() {
 let nodesCache = [];
 async function loadTasks() {
   if (!curWs) { // 没选到工作区：说清楚，别一直"读取中…"（静默空白最难查）
-    const el = $('#rmState'); if (el) { el.textContent = '没有选中工作区'; el.className = 'pill bad'; }
+
     const t2 = $('#trkState'); if (t2) { t2.textContent = '没有选中工作区'; t2.className = 'pill bad'; }
     return;
   }
@@ -251,7 +260,9 @@ async function loadTasks() {
   nodesCache = d.plan?.nodes || [];
   lastStatus = d;
   renderTracker(d);
+  renderRunning(d);
   renderRoute(d);
+  loadGate();
   $('#nodes').innerHTML = nodesCache.map((n) => {
     const canDispatch = ['failed','timeout','cancelled','pending','skipped','ready','frozen'].includes(n.status);
     const canCancel = n.status === 'running';
@@ -276,15 +287,10 @@ async function loadTasks() {
 // ── 任务线追踪（一眼看出：子对话在改代码 / 任务在跑 / 真收敛）──────────────
 // 约定借自魔兽的任务追踪器：进行中在最上、已完成灰掉打勾并默认收起、标题栏带 x/y 计数。
 let lastStatus = null;
-let showDone = false;
+
 const TRK_ICON = { completed:'✔', failed:'✖', timeout:'⏱', cancelled:'⛔', frozen:'🔒', skipped:'⏭', ready:'⏸', running:'▶', pending:'○' };
 const TRK_CLS  = { completed:'done', failed:'bad', timeout:'bad', cancelled:'bad', frozen:'bad', skipped:'warn', ready:'warn', running:'run', pending:'' };
 const TRK_TXT  = { completed:'完成', failed:'失败', timeout:'超时', cancelled:'已终止', frozen:'冻结(等人工)', skipped:'跳过(when 不成立)', ready:'就绪(等人工派发)', running:'运行中', pending:'待办' };
-function toggleDone() {
-  showDone = !showDone;
-  $('#trkBtnDone').textContent = showDone ? '隐藏已完成' : '显示已完成';
-  renderTracker(lastStatus);
-}
 /** 工作区级状态：这是"看不见子对话在干嘛"的正解——它在改代码 / 在跑会话 / 真收敛，都写在这。 */
 function trkStateText(line) {
   if (!line) return { t: '（没有状态信息）', cls: '' };
@@ -298,68 +304,50 @@ function trkStateText(line) {
 }
 /** 节点最近一次动作时间（用于把最新发生的排在最上——WoW 追踪器也是把当前目标放最前）。 */
 function nodeAt(n) { return Date.parse(n.completedAt || n.startedAt || '') || 0; }
-function renderTracker(d) {
+function renderTracker(d) {   // 瘦身成「当前状态」卡：徽章 + 计数 + 最新 + 依据
   if (!d) return;
   const nodes = d.plan?.nodes || [];
   const line = d.line || {};
   const st = trkStateText(line);
-  const el = $('#trkState');
-  el.textContent = st.t; el.className = 'pill ' + st.cls;
+  const el = $("#trkState");
+  if (el) { el.textContent = st.t; el.className = "pill " + st.cls; }
   const c = line.counts || {};
-  const done = c.completed ?? nodes.filter((n) => n.status === 'completed').length;
-  $('#trkCount').textContent = `完成 ${done}/${line.nodes ?? nodes.length}`
-    + (c.failed ? ` · 失败 ${c.failed}` : '') + (c.frozen ? ` · 冻结 ${c.frozen}` : '')
-    + (c.cancelled ? ` · 终止 ${c.cancelled}` : '') + (line.active ? ` · 进行中 ${line.active}` : '');
-  // 最近发生的那个节点单独点出来：用户第一眼想知道的就是"刚刚谁动了、结果如何"
+  const done = c.completed ?? nodes.filter((n) => n.status === "completed").length;
+  const running = nodes.filter((n) => n.status === "running").length;
+  if ($("#trkCount")) $("#trkCount").textContent = `共 ${line.nodes ?? nodes.length} 个节点：完成 ${done}`
+    + (running ? ` · 在跑 ${running}` : "")
+    + (c.failed ? ` · 失败 ${c.failed}` : "") + (c.frozen ? ` · 冻结 ${c.frozen}` : "")
+    + (c.cancelled ? ` · 终止 ${c.cancelled}` : "");
   const newest = nodes.filter((n) => nodeAt(n)).sort((a, b) => nodeAt(b) - nodeAt(a))[0];
   const newestLine = newest
-    ? `最新：${newest.id} · ${TRK_TXT[newest.status] || newest.status}${newest.verdict ? '（' + newest.verdict + '）' : ''}`
-    : '';
-  $('#trkWhy').textContent = [
+    ? `最新：${newest.id} · ${TRK_TXT[newest.status] || newest.status}${newest.verdict ? "（" + newest.verdict + "）" : ""}`
+    : "";
+  if ($("#trkWhy")) $("#trkWhy").textContent = [
     newestLine,
-    line.quiet ? `判据：无在跑节点 · 最近动作 ${line.idleMinutes ?? '-'} 分钟前 · 工作区 ${line.workspace ? (line.workspace.recent ? '有改动' : '无改动') : '未知'} · 子对话 ${line.dsh ? (line.dsh.running ? '在跑' : '空闲') : '未知'}` : '',
-  ].filter(Boolean).join(' ｜ ');
-  const byRecent = (a, b) => nodeAt(b) - nodeAt(a);
-  const groups = [
-    ['进行中', nodes.filter((n) => n.status === 'running').sort(byRecent)],
-    ['待办', nodes.filter((n) => ['pending', 'ready'].includes(n.status))],
-    ['需留意', nodes.filter((n) => ['failed', 'timeout', 'frozen', 'cancelled'].includes(n.status)).sort(byRecent)],
-    ['已完成', nodes.filter((n) => n.status === 'completed').sort(byRecent)],
-  ];
-  const CAP = 12; // 每组最多展开 12 条，其余折叠成一行（否则 70 条异常会把面板撑成一堵墙）
-  const rows = [];
-  for (const [name, list] of groups) {
-    if (!list.length) continue;
-    if (name === '已完成' && !showDone) {
-      rows.push(`<div class="trk-grp">${name}（${list.length}）· 已收起</div><div class="trk-more">点右上「显示已完成」展开</div>`);
-      continue;
-    }
-    const shown = list.slice(0, CAP);
-    rows.push(`<div class="trk-grp">${name}（${list.length}）${list.length > CAP ? `· 只列最近 ${CAP} 条` : ''}</div>`);
-    for (const n of shown) {
-      const bits = [];
-      if (n.status === 'running') {
-        const secs = n.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(n.startedAt)) / 1000)) : n.runSeconds;
-        if (secs != null) bits.push(`已跑 ${Math.floor(secs / 60)}分${secs % 60}秒`);
-      } else {
-        if (n.verdict) bits.push(n.verdict);
-        if (n.via) bits.push(n.via);
-        if (n.runSeconds != null) bits.push(`${Math.round(n.runSeconds / 60)}分`);
-      }
-      if (n.judgeDetail) bits.push(String(n.judgeDetail).slice(0, 60));
-      if (n.metrics?.loss_last != null) bits.push(`loss ${n.metrics.loss_last}`);
-      if (n.fixCount) bits.push(`修复${n.fixCount}次`);
-      if (n.softPass?.length) bits.push(`上游疑似放行(${n.softPass.join(',')})`);
-      rows.push(`<div class="obj ${TRK_CLS[n.status] || ''}">
-        <span class="oi">${TRK_ICON[n.status] || '·'}</span>
-        <span class="oid mono" title="${esc(n.id)}">${esc(n.id)}</span>
-        <span class="ostat">${esc(TRK_TXT[n.status] || n.status)}${bits.length ? ' · ' + esc(bits.join(' · ')) : ''}</span>
-        <button class="act" onclick="openLog('${esc(n.id)}')">日志</button>
-      </div>`);
-    }
-    if (list.length > CAP) rows.push(`<div class="trk-more">… 还有 ${list.length - CAP} 条更早的（下面「全部节点明细」里有完整列表）</div>`);
-  }
-  $('#trkList').innerHTML = rows.join('') || '<div class="mut">这个工作区还没有节点</div>';
+    line.quiet ? `判据：无在跑节点 · 最近动作 ${line.idleMinutes ?? "-"} 分钟前 · 工作区 ${line.workspace ? (line.workspace.recent ? "有改动" : "无改动") : "未知"} · 子对话 ${line.dsh ? (line.dsh.running ? "在跑" : "空闲") : "未知"}` : "",
+  ].filter(Boolean).join(" ｜ ");
+}
+
+// ── 正在跑：**所有**在跑的节点（plan 与快速单发都在这里）——回答"我现在在跑什么" ──
+function renderRunning(d) {
+  if (!d) return;
+  const nodes = d.plan?.nodes || [];
+  const run = nodes.filter((n) => n.status === "running");
+  if ($("#runCount")) $("#runCount").textContent = run.length ? `${run.length} 个` : "（没有）";
+  const box = $("#runList");
+  if (!box) return;
+  if (!run.length) { box.innerHTML = String.raw`<div class="mut">现在没有在跑的任务。</div>`; return; }
+  box.innerHTML = run.sort((a, b) => nodeAt(b) - nodeAt(a)).map((n) => {
+    const secs = n.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(n.startedAt)) / 1000)) : n.runSeconds;
+    const started = n.startedAt ? new Date(n.startedAt).toLocaleTimeString("zh-CN", { hour12: false }).slice(0, 5) : "";
+    return `<div class="obj run">
+      <span class="oi">▶</span>
+      <span class="oid mono" title="${esc(n.id)}">${esc(n.id)}</span>
+      <span class="ostat">${n.inPlan ? "plan 节点" : "快速单发"}${n.shell === "wsl" ? " · WSL 车道" : " · Windows 车道"} · 已跑 ${secs != null ? Math.floor(secs / 60) + "分" + (secs % 60) + "秒" : "?"}${started ? " · 起于 " + started : ""}${n.expectedMinutes ? "" : ""}</span>
+      <button class="act" onclick="openLog('${esc(n.id)}')">日志</button>
+      <button class="act danger" onclick="act('cancel','${esc(n.id)}')">终止</button>
+    </div>`;
+  }).join("");
 }
 
 // ── 任务链路线图（横排；BTWQuests 式：依赖箭头 + 完成绿勾 + 可派发绿框 + 人工门金星）──
@@ -371,9 +359,6 @@ function renderRoute(d) {
   const plan = all.filter((n) => n.inPlan);
   const byId = new Map(all.map((n) => [n.id, n]));
   const line = d.line || {};
-  const st = trkStateText(line);
-  const el = $('#rmState');
-  if (el) { el.textContent = st.t; el.className = 'pill ' + st.cls; }
   const c = {};
   for (const n of plan) c[n.status] = (c[n.status] ?? 0) + 1;
   const depsOf = (n) => (n.after || []).filter((a) => byId.has(a));
@@ -383,14 +368,18 @@ function renderRoute(d) {
       ? `plan 节点 ${plan.length}｜完成 ${c.completed || 0} · 运行 ${c.running || 0} · 可派发 ${frontier.length} · 异常 ${(c.failed || 0) + (c.timeout || 0) + (c.frozen || 0) + (c.cancelled || 0)}`
       : '没有 plan.md 节点';
   }
-  const quick = all.length - plan.length;
+  const quick = all.filter((n) => !n.inPlan);
+  const quickRunning = quick.filter((n) => n.status === 'running');
   const serverHasPlanMeta = all.length > 0 && ('inPlan' in (all[0] || {}));
+  const planAllDone = plan.length > 0 && plan.every((n) => ['completed', 'failed', 'frozen', 'cancelled', 'skipped', 'timeout'].includes(n.status));
   if ($('#rmWhy')) {
     $('#rmWhy').textContent = plan.length
-      ? (quick ? `另有 ${quick} 个快速单发节点不在图里（见「任务线」页）` : '')
+      ? `图里只有 plan.md 声明的 ${plan.length} 个节点`
+        + (quick.length ? `；另有 ${quick.length} 个快速单发不在图里` + (quickRunning.length ? `（其中 ${quickRunning.length} 个正在跑，见上方「正在跑」）` : '') : '')
+        + (planAllDone && quickRunning.length ? ' —— 图里是历史状态，今天在跑的是快速单发，所以不在路线图上' : '')
       : (!serverHasPlanMeta
         ? '⚠️ 当前 quest 服务是旧版（/api/status 还没有 inPlan/after 字段）——重启 quest 后路线图就能读到 plan 的依赖关系了'
-        : `这个工作区历史都是快速单发（${quick} 个）——用「任务线」页看它们；想让路线图有内容，就让 AI 写一份 plan.md 把流水固定下来`);
+        : `这个工作区还没有 plan.md（历史都是快速单发 ${quick.length} 个）——用下方明细看它们；想让路线图有内容，就让 AI 写一份 plan.md 把流水固定下来`);
   }
   const canvas = $('#rmCanvas');
   if (!canvas) return;
@@ -505,7 +494,10 @@ async function loadGate() {
   try {
     const d = await api('/api/gate/list');
     const night = d.night?.active ? `🌙 夜间自批中 · 剩余额度 ${d.night.quotaLeft}/${d.night.quota}` : '☀️ 白天模式（夜间窗口自批）';
-    $('#gateN').textContent = (d.pending || []).length ? `(${d.pending.length})` : '';
+    const np = (d.pending || []).length;
+    if ($('#gateN')) $('#gateN').textContent = np ? np : '';
+    if ($('#gateTop')) $('#gateTop').style.display = np ? 'inline-block' : 'none';
+    if ($('#gate')) $('#gate').style.display = np ? 'block' : 'none';
     const items = (d.pending || []).map((g) => `<div class="gate-item">
       <b class="mono">${esc(g.id)}</b> <span class="mut">${new Date(g.createdAt).toLocaleString('zh-CN',{hour12:false})} · ${esc(g.why)}</span>
       <code>${esc(g.command)}</code>
@@ -605,22 +597,22 @@ async function pump() {
         lastEvt = evs[evs.length - 1].at || lastEvt;
         $('#live').style.color = 'var(--ok)';
         await loadTasks();
-        if ($('#gate').classList.contains('on')) loadGate();
+        loadGate();
         if ($('#logs').classList.contains('on') && $('#logAuto').checked) loadLog();
       }
     } catch { $('#live').style.color = 'var(--bad)'; await new Promise((r) => setTimeout(r, 4000)); }
   }
 }
 async function refreshAll() {
-  try { await loadWs(); await loadTasks(); fillLogNodes(); if ($('#gate').classList.contains('on')) loadGate(); toast('已刷新'); }
+  try { await loadWs(); await loadTasks(); fillLogNodes(); loadGate(); toast('已刷新'); }
   catch (e) { toast('刷新失败：' + e.message); }
 }
 loadWs().then(() => { loadTasks(); fillLogNodes(); pump(); });
 // 运行中的"已跑 X分Y秒"要自己走动；同时兜住长轮询万一断线时的刷新
 setInterval(() => {
-  if (!lastStatus) return;
-  if ($('#route').classList.contains('on')) renderRoute(lastStatus);
-  if ($('#tasks').classList.contains('on')) renderTracker(lastStatus);
+  if (!lastStatus || !$('#tasks')) return;
+  // 路线图/追踪/正在跑现在都在「任务线」这一个页里，卡片直接重画（路线图只画 plan 节点，开销很小）
+  if ($('#tasks').classList.contains('on')) { renderTracker(lastStatus); renderRunning(lastStatus); renderRoute(lastStatus); }
 }, 5000);
 setInterval(() => { if ($('#logs').classList.contains('on') && $('#logAuto').checked) loadLog(); }, 8000);
 </script>

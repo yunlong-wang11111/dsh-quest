@@ -494,7 +494,9 @@ function mergedPlanNodes(plan, state) {
   const ids = new Set(plan.nodes.map((n) => n.id));
   const extra = Object.keys(state.nodes || {})
     .filter((id) => !ids.has(id) && state.nodes[id] && state.nodes[id].status)
-    .map((id) => ({ id, shell: 'windows', quiet: false, expectMinutes: 0 }));
+    // 车道从账本状态恢复（buildState 从 quick.dispatched 记了 shell）——原来硬编码 windows，
+    // 会把 WSL 车道的快速单发在控制台/进度里显示成 Windows（与对账那个 bug 同源，这里只是展示）
+    .map((id) => ({ id, shell: state.nodes[id]?.shell || 'windows', quiet: false, expectMinutes: state.nodes[id]?.expectMinutes ?? 0 }));
   return { meta: plan.meta, nodes: [...plan.nodes, ...extra] };
 }
 
