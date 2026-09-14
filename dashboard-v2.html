@@ -109,7 +109,9 @@
     <div class="rm-wrap"><div class="rm-canvas" id="rmCanvas"></div></div>
     <div class="rm-legend">
       图例：✔ 完成（盒右下角绿勾）· ✖ 失败 · ▶ 运行中 · ⛔ 冻结 · ⏭ 跳过 · ○ 待办 · ★ 人工门（manual: true）·
-      <b style="color:var(--ok)">绿框 = 现在可派发</b>（前置都已完成）· 点节点 → 看它的日志 · 箭头 = after 依赖（绿=上游已完成，红=上游失败）
+      <b style="color:var(--ok)">绿框 = 现在可派发</b>（前置都已完成）· 点节点 → 看它的日志 ·
+      <b>实线</b>箭头 = 相邻列的依赖（链上的下一步）· <b>虚线</b>箭头 = <b style="color:#9dc6ff">跳级依赖</b>（after 跨 ≥2 列，从盒子区外侧的留白绕行，所以不会穿过任何盒子）·
+      箭头颜色：绿=上游已完成，红=上游失败/冻结，灰=待办
     </div>
   </div>
 </section>
