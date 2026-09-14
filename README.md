@@ -285,6 +285,7 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 - **WSL(Ubuntu) 车道**：plan 头部写一行 `shell: wsl`，整条任务线跑进 WSL——bash 语法、Linux 路径、不经 cmd.exe（无引号剥离）、GPU 直通。负载由 systemd transient service 认养（会话清理与 VM 空闲关停都杀不死）+ 宿主侧 keepalive 保活会话——**quest 崩溃时 Linux 训练进程继续跑，quest 重启后按单元名自动接管**。日志写 WSL 内部、经 UNC 读取，判定/watch/产物全部适配
 - **HTTP 仪表盘**：`/dashboard` 单页驾驶舱——任务线（10 秒自刷，按"完成时间正序/运行中/异常/待办"分组）、文件浏览（Windows 与 `\wsl$` UNC 通吃，图片直接预览、大文本截尾）、门禁队列（挂起命令 + 夜间额度）。**不依赖 DSH 存活**，浏览器直开；可经中继映射到局域网/组网远程访问；better-sidebar 薄壳注册为侧边栏标签页（DSH 挂了仪表盘照常可用）
 - **`quest_probe` 诊断探针**：同步跑 ≤30 秒的白名单命令并取回尾部输出（解释器 + `-c` 内联放行）——fixer 的"改→试→知"闭环补齐，主对话查中间量也不用开终端；**车道按命令首词自动判**（Linux 绝对路径 → WSL 中继，盘符/UNC → Windows；WSL 车道 25 秒硬上限，留中继余量），到点杀整个进程组 + 账本留痕（`probe.run` 必有 `probe.done`/`probe.error`——悬着不返回是 bug）
+- **收线 `tools/close-line.mjs`（2026-09-14）**：宣布一条任务线结束，把还没开跑的节点冻结掉。为什么需要：`orchestrate` 只在**节点退出**时触发，所以被放弃的老线里遗留的 `pending` 节点是「休眠但挂着扳机」——同一工作区里任何一个节点跑完都会把它顺带派出去（老线抢机器、没人记得它为什么在跑）。收线只冻 pending/ready，**正在跑的不动**（跑完照常判定，不谎报「冻结但还在烧 CPU」）；**可逆**：重派该节点即解冻它，`/api/resume` 上游即解冻整条下游。用法：`node tools/close-line.mjs <工作区路径>` 预演、`--apply` 生效，或 `POST /api/close-line {apply:true, reason}`。一条线全部节点已是终态时：什么都不用做（冻结是空操作）。
 - **`quest_files` 文件浏览工具**：AI 直接列目录/读文件，含 `\wsl$` 路径——查 Linux 产物不必再靠人转述
 - **断点三层**：①派发前扫脚本（≥15 分钟任务无 `torch.save`/checkpoint 模式 → 提醒 + 收件箱）②运行中盯档案（20 分钟无新存档 → 告警）③**重派自动注入 `QUEST_RESUME_FROM`**（取 cwd 里最新 `.pt/.ckpt/.pth`）——崩溃/修复重跑从断点续，不再从零
 - **翻页升级**：翻页时**先把旧会话导出为可搜索 markdown**（`archive/flip-*.md`，fzstd 解压 + 工具输出修剪，89MB → ~10MB）再归档——AI 有了"冷存储"，`grep` 即可查历史细节；仪表盘内也能一键翻页

@@ -80,10 +80,6 @@
   .rm-crest { position:absolute; left:5px; bottom:3px; color:var(--warn); font-size:11px; }
   .rm-time { position:absolute; right:5px; top:3px; color:#5f6b7a; font-size:10px; }
   .rm-legend { color:var(--dim); font-size:11.5px; margin-top:7px; line-height:1.7; }
-  /* 图外补充列：快速单发（AI 直接用 quest_run 派的，没有依赖声明，不进 DAG） */
-  .rm-quick { border-style:dashed; background:#0e1218; }
-  .rm-qhead { position:absolute; width:186px; font-size:11px; color:var(--dim); line-height:1.3; }
-  .rm-div { position:absolute; border-left:1px dashed #2a333f; }
 </style>
 </head>
 <body>
@@ -378,12 +374,14 @@ function renderRoute(d) {
   const serverHasPlanMeta = all.length > 0 && ('inPlan' in (all[0] || {}));
   const planAllDone = plan.length > 0 && plan.every((n) => ['completed', 'failed', 'frozen', 'cancelled', 'skipped', 'timeout'].includes(n.status));
   const lastPlanAct = plan.length ? Math.max(0, ...plan.map((n) => nodeAt(n))) : 0;   // 这份 plan 最近一次动作（改"看着像没动"）
+  const closedAt = d.plan?.closedAt ? Date.parse(d.plan.closedAt) : 0;
   if ($('#rmWhy')) {
     $('#rmWhy').textContent = plan.length
-      ? `图里只有 plan.md 声明的 ${plan.length} 个节点`
-        + (quick.length ? `；另有 ${quick.length} 个快速单发不在图里` + (quickRunning.length ? `（其中 ${quickRunning.length} 个正在跑，见上方「正在跑」）` : '') : '')
-        + (planAllDone && quickRunning.length ? ' —— 图里是历史状态，今天在跑的是快速单发，所以不在路线图上' : '')
+      ? `画布只放 plan.md 声明的 ${plan.length} 个节点`
+        + (quick.length ? `；${quick.length} 个快速单发不进画布——正在跑的看上方「正在跑」，全量看下方明细` + (quickRunning.length ? `（此刻 ${quickRunning.length} 个在跑）` : '') : '')
+        + (planAllDone && quickRunning.length ? '。图里是这条线的历史状态，今天在跑的是快速单发' : '')
         + (lastPlanAct ? `。这份 plan 最近一次动作是 ${Math.round((Date.now() - lastPlanAct) / 3600000) >= 1 ? Math.round((Date.now() - lastPlanAct) / 3600000) + ' 小时' : '刚刚'}前` : '')
+        + (closedAt ? `。🔒 本线已收线（${new Date(closedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}）：未派发的节点已冻结，不会再被自动派出去` : '')
       : (!serverHasPlanMeta
         ? '⚠️ 当前 quest 服务是旧版（/api/status 还没有 inPlan/after 字段）——重启 quest 后路线图就能读到 plan 的依赖关系了'
         : `这个工作区还没有 plan.md（历史都是快速单发 ${quick.length} 个）——用下方明细看它们；想让路线图有内容，就让 AI 写一份 plan.md 把流水固定下来`);
@@ -476,38 +474,10 @@ function renderRoute(d) {
       ${n.manual ? '<span class="rm-crest" title="人工门：上游完成后停下等确认">★</span>' : ''}
     </div>`;
   }).join('');
-  // ── 图外补充列：右侧「快速单发」──────────────────────────────
-  // 加这一列的理由：plan 只管骨架；AI 用 quest_run 派的单发任务没有依赖声明、不进 DAG。
-  // 没有它时，"图上一动不动"会被误读成"什么都没在跑"——而实际在跑的全在右边这一列。
-  const quickShown = all.filter((n) => !n.inPlan).sort((a, b) => nodeAt(b) - nodeAt(a)).slice(0, 8);
-  let qHead = '', qDiv = '', qBoxes = '', W2 = W, H2 = H;
-  if (quickShown.length) {
-    const qx = maxX + GX, qy0 = PAD + LANE + 22;
-    W2 = qx + NW + PAD;
-    H2 = Math.max(H, qy0 + (quickShown.length - 1) * (NH + GY) + NH + PAD);
-    qDiv = `<div class="rm-div" style="left:${qx - GX / 2}px;top:0;height:${H2}px"></div>`;
-    qHead = `<div class="rm-qhead" style="left:${qx}px;top:${PAD}px" title="plan.md 之外的节点：调用方直接用 quest_run 派发的单发命令，没有声明 after，所以画不出依赖箭头">&gt; 快速单发 · 不在 plan 里（最近 ${quickShown.length} 个）</div>`;
-    qBoxes = quickShown.map((n, i) => {
-      const y = qy0 + i * (NH + GY);
-      const cls = [TRK_CLS[n.status] || '', 'rm-quick'].filter(Boolean).join(' ');
-      const bits = [];
-      if (n.status === 'running') {
-        const secs = n.startedAt ? Math.round((Date.now() - Date.parse(n.startedAt)) / 1000) : null;
-        if (secs != null) bits.push(`已跑 ${Math.floor(secs / 60)}分${secs % 60}秒`);
-      } else {
-        if (n.verdict) bits.push(n.verdict);
-        if (n.runSeconds != null) bits.push(`${Math.round(n.runSeconds / 60)}分`);
-      }
-      if (n.shell === 'wsl') bits.push('wsl');
-      return `<div class="rm-node ${cls}" style="left:${qx}px;top:${y}px" title="${esc(n.id)}&#10;${esc((n.command || '').slice(0, 300))}&#10;${esc(n.success || '')}" onclick="openLog('${esc(n.id)}')">
-        <div class="rid">${TRK_ICON[n.status] || '·'} ${esc(n.id)}</div>
-        <div class="rst">${esc(TRK_TXT[n.status] || n.status)}${bits.length ? ' · ' + esc(bits.join(' · ')) : ''}</div>
-        ${nodeAt(n) ? `<span class="rm-time">${new Date(nodeAt(n)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).replace(/\//g, '-')}</span>` : ''}
-      </div>`;
-    }).join('');
-  }
-  canvas.style.width = W2 + 'px'; canvas.style.height = H2 + 'px';
-  canvas.innerHTML = `<svg width="${W2}" height="${H2}" style="position:absolute;left:0;top:0;pointer-events:none"><defs>${markers}</defs>${paths.join('')}</svg>${qDiv}${qHead}${boxes}${qBoxes}`;
+  // 画布只放 plan 声明的节点（2026-09-14 按用户要求定稿）：快速单发不进画布——
+  // "现在在跑什么"看上方「正在跑」卡片，全量看下方「全部节点明细」，画布回答的是"plan 走到哪了"。
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  canvas.innerHTML = `<svg width="${W}" height="${H}" style="position:absolute;left:0;top:0;pointer-events:none"><defs>${markers}</defs>${paths.join('')}</svg>${boxes}`;
 }
 
 async function act(kind, node) {  try {

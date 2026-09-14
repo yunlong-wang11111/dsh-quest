@@ -201,6 +201,8 @@ function buildState(wsKey) {
         if (e.t === 'plan.created' || e.t === 'plan.reloaded') {
           for (const n2 of Object.values(state.nodes)) n2.fixCount = 0; // 新 plan = 新预算
         }
+        // 收线留痕（/api/close-line）：控制台据此显示"这条线已收"，不必靠人去记
+        if (e.t === 'plan.closed') { state.closedAt = e.at; state.closedReason = e.reason || ''; }
         continue;
       }
       // 只有"派发"事件才有资格新建节点。别的带 node 的事件（cancel.fallback、旧版写入的短后缀 id、
@@ -1949,7 +1951,7 @@ const server = http.createServer(async (req, res) => {
       // workspace 优先取 plan.md 里声明的绝对路径（权威），入参只做缺省——/q翻页 等下游要拿真路径去匹配 DSH 会话
       const act = lineActivity(state);
       return json(200, {
-        plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes },
+        plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes, closedAt: state.closedAt || null, closedReason: state.closedReason || '' },
         line: {
           active: act.active.length, nodes: act.nodes.length, counts: act.counts,
           idleMinutes: act.idleMinutes, quietMinutes: act.quietMinutes,
@@ -2198,6 +2200,41 @@ const server = http.createServer(async (req, res) => {
       }
       appendEvent(wsKey, { t: 'resume.dispatched', nodes: done, failed });
       return json(200, { ok: failed.length === 0, resumed: done, ...(failed.length ? { failed } : {}) });
+    }
+    // 收线（2026-09-14）：把本线所有非终态节点冻结，让"被放弃的老线"彻底失去扳机。
+    // 为什么需要：orchestrate 只由事件触发（写 plan / 节点退出 / 派发），所以遗留的 pending 节点
+    // 是"休眠但挂着扳机"的——同一工作区里下一次任何动作都会顺带把它派出去：老线节点会和新的
+    // quick 任务抢机器，而人/子对话早已不记得它为什么在那跑。
+    // 可逆：重派某个节点 = 解冻该节点（见 /api/dispatch）；/api/resume 祖先会解冻它整条下游。
+    if (req.method === 'POST' && u.pathname === '/api/close-line') {
+      const b = await readBody(req);
+      const state = buildState(wsKey);
+      const plan = state.plan ? parsePlan(state.plan) : { nodes: [] };
+      const inPlan = new Set(plan.nodes.map((n) => n.id));
+      const ids = [...new Set([...Object.keys(state.nodes), ...plan.nodes.map((n) => n.id)])];
+      const st = (id) => state.nodes[id]?.status ?? 'pending';
+      // 只冻"还没开跑"的（pending/ready）：这些才是挂着扳机的。正在跑的**不动**——它跑完照常判定，
+      // 否则会出现"状态写着 frozen、进程还在烧 CPU"的谎报；想连它一起停请用 /api/cancel。
+      const freezable = ids.filter((id) => ['pending', 'ready'].includes(st(id))).map((id) => ({ id, status: st(id), inPlan: inPlan.has(id) }));
+      const running = ids.filter((id) => st(id) === 'running').map((id) => ({ id, inPlan: inPlan.has(id) }));
+      const reason = String(b.reason || '').slice(0, 200) || '收线：宣布本线结束，未派发的节点不再执行';
+      if (b.apply !== true) {
+        return json(200, {
+          ok: true, dryRun: true, open: freezable, running,
+          note: freezable.length
+            ? `将冻结 ${freezable.length} 个未开跑的节点（${freezable.map((o) => o.id).join('、')}）；带 apply:true 生效`
+            : (running.length ? `没有未开跑的节点可冻；${running.length} 个还在跑（收线不动它们，跑完照常判定）` : '本线已全部终结：收线是空操作，什么都不用做'),
+        });
+      }
+      for (const o of freezable) appendEvent(wsKey, { t: 'node.frozen', node: o.id, reason });
+      appendEvent(wsKey, { t: 'plan.closed', reason, nodes: freezable.map((o) => o.id), running: running.map((o) => o.id) });
+      qqPush(wsKey, `[🔒 收线] ${freezable.length ? `已冻结 ${freezable.length} 个未开跑节点：${freezable.map((o) => o.id).join('、')}` : '没有未开跑的节点可冻'}${running.length ? `\n仍在跑（未动）：${running.map((o) => o.id).join('、')}` : ''}\n原因：${reason}\n复活办法：重派某个节点即可（或 resume 它的上游）。`).catch(() => {});
+      return json(200, {
+        ok: true, closed: freezable, running,
+        note: freezable.length
+          ? `已冻结 ${freezable.length} 个未开跑节点，这条线的扳机卸了；重派其中任何一个即可解冻`
+          : '没有未开跑的节点可冻',
+      });
     }
     // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
     if (req.method === 'POST' && u.pathname === '/api/cancel') {
