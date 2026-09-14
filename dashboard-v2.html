@@ -46,7 +46,6 @@
   #trkState.busy { border-color:var(--run); color:#bcd9ff; }
   #trkState.quiet { border-color:var(--ok); color:#bff0d0; }
   #trkState.bad { border-color:var(--bad); color:#ffc4b8; }
-  #trkList { display:grid; gap:1px; margin-top:2px; }
   .obj { display:flex; gap:7px; align-items:center; padding:3px 6px; border-radius:6px; }
   .obj:hover { background:#1b2129; }
   .obj .oi { flex:0 0 16px; text-align:center; }
@@ -374,7 +373,7 @@ function renderRoute(d) {
   if ($('#rmCount')) {
     $('#rmCount').textContent = plan.length
       ? `plan 节点 ${plan.length}｜完成 ${c.completed || 0} · 运行 ${c.running || 0} · 可派发 ${frontier.length} · 异常 ${(c.failed || 0) + (c.timeout || 0) + (c.frozen || 0) + (c.cancelled || 0)}`
-      : '没有 plan.md 节点';
+      : 'plan 里还没有节点（本工作区只有快速单发）';
   }
   const quick = all.filter((n) => !n.inPlan);
   const quickRunning = quick.filter((n) => n.status === 'running');
@@ -391,7 +390,7 @@ function renderRoute(d) {
         + (closedAt ? `。🔒 本线已收线（${new Date(closedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })}）：未派发的节点已冻结，不会再被自动派出去` : '')
       : (!serverHasPlanMeta
         ? '⚠️ 当前 quest 服务是旧版（/api/status 还没有 inPlan/after 字段）——重启 quest 后路线图就能读到 plan 的依赖关系了'
-        : `这个工作区还没有 plan.md（历史都是快速单发 ${quick.length} 个）——用下方明细看它们；想让路线图有内容，就让 AI 写一份 plan.md 把流水固定下来`);
+        : `这份 plan.md 里还没有声明任何节点（全是快速单发 ${quick.length} 个）：画布因此是空的——正在跑的看上方「正在跑」，全量见下方明细。要让画布有内容，就让 AI 写一份 plan.md（或往现有 plan 里追加一条链）`);
   }
   const canvas = $('#rmCanvas');
   if (!canvas) return;
