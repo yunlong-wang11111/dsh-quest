@@ -68,8 +68,13 @@ function analyze(key) {
       lastAct = Math.max(lastAct, at);
       continue;
     }
-    const n = nodes[e.node] ?? (nodes[e.node] = { status: 'pending' });
-    if (e.t === 'node.dispatched') { n.status = 'running'; n.at = at; }
+    // 只有"派发"事件才有资格新建节点。cancel.fallback 之类可能带一个不存在或短后缀的 id，
+    // 建出来的幽灵节点永远不终结（时长显示成 2900 万分钟 = epoch 0），并且让"还在跑"永远为真。
+    // 2026-09-14 实测：一句 `/q取消 mu0m8nck`（旧版没那么写全 id）就留下两个幽灵，重启门禁因此常关。
+    const CREATES = e.t === 'node.dispatched' || e.t === 'quick.dispatched';
+    const n = nodes[e.node] ?? (CREATES ? (nodes[e.node] = { status: 'pending' }) : null);
+    if (!n) { lastAct = Math.max(lastAct, at); continue; }
+    if (CREATES) { n.status = 'running'; n.at = at; }
     else if (e.t === 'node.completed') n.status = 'completed';
     else if (TERMINAL.has(e.t.replace('node.', ''))) n.status = e.t.replace('node.', '');
     lastAct = Math.max(lastAct, at);
@@ -101,7 +106,7 @@ for (const key of dirs) {
   console.log(`  工作区：${a.ws == null ? '（拿不到路径）' : a.ws.latest ? `最新改动 ${a.ws.latest.name}（${fmt(a.wsIdleMs)}前），近 ${QUIET_MIN} 分钟 ${a.ws.recent} 个文件被改 → ${a.wsQuiet ? '✓ 已静' : '✗ 有人正在改代码'}` : '无文件'}`);
   console.log(`  ⇒ ${quiet ? '静默（收敛）：没有在跑的任务，账本与工作区都安静了' : '仍在进行：上面 ✗ 的那一行就是它在干什么'}`);
   if (!quiet && a.active.length) {
-    const worst = a.active.map((id) => `${id.slice(0, 30)}（${fmt(Date.now() - (a.nodes[id].at || 0))}）`).join('、');
+    const worst = a.active.map((id) => `${id.slice(0, 30)}（${a.nodes[id].at ? fmt(Date.now() - a.nodes[id].at) : '起点不明'}）`).join('、');
     console.log(`     在跑：${worst}`);
   }
 }

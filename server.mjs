@@ -189,6 +189,8 @@ function buildState(wsKey) {
   try {
     const lines = fs.readFileSync(path.join(dir, 'ledger.jsonl'), 'utf8').split(/\r?\n/).filter(Boolean);
     state.lineEvents = [];
+    const declaredIds = new Set();
+    if (state.plan) { try { for (const n0 of parsePlan(state.plan).nodes) declaredIds.add(n0.id); } catch {} }
     for (const l of lines) {
       let e; try { e = JSON.parse(l); } catch { continue; }
       if (!e.node) {
@@ -201,7 +203,15 @@ function buildState(wsKey) {
         }
         continue;
       }
-      const n = state.nodes[e.node] ?? (state.nodes[e.node] = { status: 'pending', events: [] });
+      // 只有"派发"事件才有资格新建节点。别的带 node 的事件（cancel.fallback、旧版写入的短后缀 id、
+      // 任何异常/手写行）只能更新**已存在**的节点——否则会凭空长出 pending 幽灵节点：它永不终结，
+      // 于是 line.active 永远非 0 ⇒ 收敛信号永不触发、控制台明细多出重复条目。
+      // 2026-09-14 实测：两条旧版短 id cancel.fallback 让真实在跑 1 个虚报成 active=3。
+      // 例外：**plan.md 里声明过的节点**天然"已知"——冻结/等待派发的节点（node.frozen/node.ready…）
+      // 没有派发记录，靠这些事件更新状态，不能当幽灵丢掉。
+      const CREATES_NODE = e.t === 'node.dispatched' || e.t === 'quick.dispatched' || declaredIds.has(e.node);
+      const n = state.nodes[e.node] ?? (CREATES_NODE ? (state.nodes[e.node] = { status: 'pending', events: [] }) : null);
+      if (!n) { if (e.at) state.lastLineEventAt = e.at; continue; }   // 认不出所属节点的历史事件：只当活动，不建节点
       n.events.push(e.t);
       n.lastEventAt = e.at;
       if (e.t === 'node.dispatched') { n.status = 'running'; n.jobId = e.jobId; n.pid = e.pid; n.logTs = e.logTs; n.startedAt = e.at; n.verdict = undefined; n.via = undefined; n.detail = undefined; n.summary = undefined; }
