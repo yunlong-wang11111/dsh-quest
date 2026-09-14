@@ -178,6 +178,21 @@ handoff: |                   # 给 worker 的交接上下文（决定总结质�
 
 完整字段说明与五段科研流水（生成→训练→后处理→评估→可视化）标准骨架见 [PLAN-TEMPLATE.md](PLAN-TEMPLATE.md)；设计取舍（为什么不用现成工作流引擎、判定器与冻结策略怎么定的）见 [docs/DESIGN.md](docs/DESIGN.md)。
 
+## 重启服务前必读（2026-09-14 实测） / Before restarting
+
+**杀掉 quest 会连带杀死 Windows 车道的任务。** quest 用 fd 持有 stdio 派发的 Windows 子进程被放在 job object 里（libuv 的 KILL_ON_JOB_CLOSE 语义），父进程一死子进程立刻消失——实测确认（父进程被杀后 1.5 秒，子进程已不存在）。
+
+| 车道 | 重启 quest 的后果 |
+|---|---|
+| **Windows 车道**（缺省） | 任务被打断，**不会自愈**，只能重派 |
+| **WSL 车道**（`shell: wsl`） | 不受影响：负载由 systemd 单元持有，重启后启动对账按单元名认领并继续判定 |
+
+所以：
+
+- 重启前先跑 `node tools/restart-when-idle.mjs` —— 有任何节点在跑就**拒绝**并列出它们（已跑多久、在哪个工作区）；确认要打断才加 `--force`。
+- **不能白跑的长任务（训练、长扫描）请用 `shell: wsl`**；Windows 车道留给几分钟内能跑完的活。
+- 判定侧是诚实的：被重启打断的节点会标成 `suspect`，`via` 里写明"quest 重启期间进程已消失，按产物/关键词判定"，不会假装成功。
+
 ## 跨 Agent 使用（MCP） / Agent-agnostic via MCP
 
 quest 本体不绑定任何 AI 工具——它自己派进程、判定、重试、通知，全部零模型参与。因此**任何**能发 HTTP 的 agent（Claude Code、Codex、ZCode、Cursor、一段脚本）都能驱动它；仓库里的 `mcp-server.mjs` 进一步把这套能力做成标准 **MCP 工具**，模型不用再自己拼 curl。
