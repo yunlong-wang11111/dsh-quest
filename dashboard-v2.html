@@ -80,6 +80,8 @@
   .rm-rejudge { position:absolute; left:5px; top:3px; color:var(--acc); font-size:11px; }
   .rm-time { position:absolute; right:5px; top:3px; color:#5f6b7a; font-size:10px; }
   .rm-legend { color:var(--dim); font-size:11.5px; margin-top:7px; line-height:1.7; }
+  .rm-donebar { color:var(--fg); font-size:12.5px; line-height:1.7; padding:7px 10px; border:1px solid var(--line);
+                border-radius:8px; background:#0b0e12; }
 </style>
 </head>
 <body>
@@ -124,8 +126,9 @@
       <button class="act" onclick="renderRoute(lastStatus)">重画</button>
     </div>
     <div class="mut" id="rmWhy" style="margin-bottom:8px"></div>
+    <div id="rmDone" style="display:none"></div>
     <div class="rm-wrap"><div class="rm-canvas" id="rmCanvas"></div></div>
-    <div class="rm-legend">
+    <div class="rm-legend" id="rmLegend">
       图例：✔ 完成（盒右下角绿勾）· ✖ 失败 · ▶ 运行中 · ⛔ 冻结 · ⏭ 跳过 · ○ 待办 · ★ 人工门（manual: true）·
       <b style="color:var(--ok)">绿框 = 现在可派发</b>（前置都已完成）· 点节点 → 看它的日志 ·
       <b>实线</b>箭头 = 相邻列的依赖 · <b>虚线</b>箭头 = <b style="color:#9dc6ff">跳级依赖</b>（after 跨 ≥2 列，从盒子区外侧绕行）·
@@ -318,6 +321,10 @@ function trkStateText(line) {
 //   ② 新版服务端给了 endedAt（只认第一条终态事件），旧版没有 ⇒ 用 派发时刻+运行秒数 反推。
 const wasRejudged = (n) => n.rejudgedAt != null || (n.events || []).includes('node.rejudged');
 const rejudgeAt = (n) => Date.parse(n.rejudgedAt || (wasRejudged(n) ? (n.lastEventAt || '') : '')) || 0;
+// 一条**已经全部结束**的线：默认把画布收起成一行摘要（2026-09-14 用户反馈：全部结束的老 plan 一直占着
+// 画布，看着像"没清空"，而当下在跑的活其实全是快速单发）。要看随时展开，选择记在 localStorage。
+function routeOpen() { try { return localStorage.getItem('questRouteOpen') === '1'; } catch { return false; } }
+function toggleRoute() { try { localStorage.setItem('questRouteOpen', routeOpen() ? '0' : '1'); } catch {} renderRoute(lastStatus); }
 function nodeAt(n) {
   if (n.endedAt) return Date.parse(n.endedAt) || 0;
   if (wasRejudged(n) && n.startedAt) return (Date.parse(n.startedAt) || 0) + (n.runSeconds || 0) * 1000;
@@ -391,6 +398,7 @@ function renderRoute(d) {
   const quickRunning = quick.filter((n) => n.status === 'running');
   const serverHasPlanMeta = all.length > 0 && ('inPlan' in (all[0] || {}));
   const planAllDone = plan.length > 0 && plan.every((n) => ['completed', 'failed', 'frozen', 'cancelled', 'skipped', 'timeout'].includes(n.status));
+  const collapsed = planAllDone && !routeOpen();   // 全部结束的线默认收起（可展开，见 routeOpen/toggleRoute）
   const lastPlanAct = plan.length ? Math.max(0, ...plan.map((n) => nodeAt(n))) : 0;   // 这份 plan 最近一次动作（改"看着像没动"）
   const closedAt = d.plan?.closedAt ? Date.parse(d.plan.closedAt) : 0;
   if ($('#rmWhy')) {
@@ -406,6 +414,27 @@ function renderRoute(d) {
   }
   const canvas = $('#rmCanvas');
   if (!canvas) return;
+  // 收起态：画布/图例让位给一行摘要（展开按钮在摘要里）
+  const wrap = canvas.parentElement;
+  if ($('#rmLegend')) $('#rmLegend').style.display = collapsed ? 'none' : '';
+  if (wrap) wrap.style.display = collapsed ? 'none' : '';
+  if ($('#rmDone')) $('#rmDone').style.display = collapsed ? '' : 'none';
+  if (collapsed) {
+    if ($('#rmWhy')) $('#rmWhy').textContent = '';
+    if ($('#rmCount')) $('#rmCount').textContent = '（已结束，已收起）';
+    const c = {};
+    for (const n of plan) c[n.status] = (c[n.status] || 0) + 1;
+    const bad = plan.filter((n) => ['failed', 'timeout', 'frozen', 'cancelled'].includes(n.status)).map((n) => n.id);
+    const hrs = lastPlanAct ? (Date.now() - lastPlanAct) / 3600000 : null;
+    const ago = hrs == null ? '时间未知' : (hrs >= 1 ? `${Math.round(hrs)} 小时` : '刚刚');
+    $('#rmDone').innerHTML = `<div class="rm-donebar">`
+      + `<b>这条线已全部结束</b>：完成 ${c.completed || 0}`
+      + (bad.length ? ` · 失败/冻结 ${bad.length}（<span class="mono">${bad.map(esc).join('、')}</span>）` : '')
+      + ` · 最近动作 ${ago}前。`
+      + `<span class="mut"> 画布已收起——当下的活都在快速单发里（此刻在跑 ${quickRunning.length} 个，见上方「正在跑」；全量见下方明细）。</span>`
+      + `<button class="act" style="margin-left:8px" onclick="toggleRoute()">展开路线图</button></div>`;
+    return;
+  }
   if (!plan.length) { canvas.innerHTML = ''; canvas.style.height = '40px'; return; }
 
   const depth = new Map();
