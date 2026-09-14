@@ -251,35 +251,50 @@ async function loadWs() {
       + (typeof w.nodes === 'number' ? (w.nodes ? ` · ${w.nodes} 节点` : ' · 空') : '');
     sel.appendChild(o);
   }
-  // ?ws= 允许写路径（用户/AI 更习惯写路径）——转成 wsKey 再匹配；匹配不上就报出来，别静默落到别的目录
+  // 工作区从哪来：url（地址里带 ?ws=）> remembered（上次用的）> guessed（按"最近有活动"挑的第一个非残留）
+  // 2026-09-14：以前"没带 ws= 就猜"是静默的，猜错（落到残留键）时看不出原因；但猜对还每次报警也烦。
+  // 现在的做法：猜完就把 ?ws= 写回地址（刷新/收藏/分享都固定），并且只在真正"靠猜"时才提示一句。
   const q = new URLSearchParams(location.search).get('ws');
+  let wsSource = q ? 'url' : '';
   let note = '';
   let hit = null;
   if (q) {
     const asKey = String(q).replace(/^([A-Za-z]):[\\/]/, '$1-').replace(/[\\/]+/g, '-').replace(/-+$/, '');
     hit = [...sel.options].find((o) => o.value === q || o.value === asKey) || null;
     if (hit) sel.value = hit.value;
-    else note = `?ws= 没匹配上任何工作区（${q}）——已切到列表第一个，下拉里是 wsKey`;
+    else { wsSource = 'guessed'; note = `地址里的 ?ws= 没匹配上任何工作区（${q}）——已改用下面这个，并把地址修正过来`; }
   }
-  // 地址里没带 ws= 时：回到上次用的工作区，而不是列表第一项（第一项可能是个残留键或别的目录）
   if (!hit && !q) {
     let remembered = '';
     try { remembered = localStorage.getItem('questWs') || ''; } catch {}
     const h2 = remembered ? [...sel.options].find((o) => o.value === remembered) : null;
-    if (h2) { sel.value = h2.value; note = `地址里没带 ?ws=，已回到上次用的工作区（${remembered}）`; }
+    if (h2) { sel.value = h2.value; wsSource = 'remembered'; }   // 你上次自己选的，不吵你
     else {
+      wsSource = 'guessed';
       const isJunk = (k) => /^_orphaned/.test(k) || /^-mnt-/.test(k) || k === 'logs';
       const firstReal = [...sel.options].find((o) => !isJunk(o.value));
       if (firstReal) sel.value = firstReal.value;
-      note = `地址里没带 ?ws=，已按"最近有活动"选（${sel.value}）——左上角下拉可换；地址里带 ?ws= 可以固定`;
+      note = `地址里没带 ?ws=，这是按"最近有活动"替你挑的（${sel.value}）——左上角下拉可换；已写进地址，刷新/收藏都会保持`;
     }
+  }
+  curWs = sel.value;
+  // 把这次的工作区写回地址：控制台不跟着 DSH 对话走（它只知道地址/记忆），写回地址后就不用每次猜
+  if (wsSource !== 'url' && curWs) {
+    try {
+      const u = new URL(location.href); u.searchParams.set('ws', curWs); history.replaceState(null, '', u.toString());
+    } catch {}
   }
   // 提示写进独立元素：loadTasks 会把 #wsmeta 覆盖成工作区路径（2026-09-14 踩到，提示等于没说）
   if ($('#wsNote')) $('#wsNote').textContent = note ? '⚠️ ' + note : '';
   if (note) console.warn('[quest]', note);
-  curWs = sel.value;
   try { localStorage.setItem('questWs', curWs); } catch {}   // 记住这次用的，下次没带 ?ws= 就回到它
-  sel.onchange = () => { curWs = sel.value; pickedPlan = ''; try { localStorage.setItem('questWs', curWs); } catch {} loadTasks(); fillLogNodes(); };
+  sel.onchange = () => {
+    curWs = sel.value; pickedPlan = '';
+    try { localStorage.setItem('questWs', curWs); } catch {}
+    try { const u = new URL(location.href); u.searchParams.set('ws', curWs); history.replaceState(null, '', u.toString()); } catch {}
+    if ($('#wsNote')) $('#wsNote').textContent = '';
+    loadTasks(); fillLogNodes();
+  };
 }
 
 let nodesCache = [];
