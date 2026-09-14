@@ -4,6 +4,8 @@
 // 每次一份、做完就该能回看。而一个工作区只有一份 plan.md，覆盖即永久丢失依赖关系（箭头）与 handoff。
 // 本测试盯四件事：① 覆盖时旧 plan 被存档；② 存档里的 after 依赖仍在（这是最容易丢的东西）；
 // ③ 存档节点的状态从账本取（不是 pending）；④ 空壳 plan（快速单发自动补的）不存档（别把历史刷满噪音）。
+import fs from 'node:fs';
+import path from 'node:path';
 import { startSandbox, suite, waitFor } from './lib.mjs';
 
 const PORT = 3192;
@@ -47,6 +49,14 @@ try {
   await waitFor(async () => (await plans()).length > 0, 20000);
   const after = (await plans()).filter((p) => !p.current).length;
   s.check('⑨ 空 plan 不留存档（不刷噪音）', after <= before + 1, `存档数 ${before} → ${after}`);
+  // ⑥ 工作区列表排序：残留键（_orphaned/-mnt-/logs）必须排最后——
+  //    页面在没有 ?ws= 时会落到列表第一项，2026-09-14 用户刷新后"明细只剩 2 个节点"就是落到了残留键上
+  fs.mkdirSync(path.join(sb.home, '_orphaned-fake-20260101'), { recursive: true });
+  fs.writeFileSync(path.join(sb.home, '_orphaned-fake-20260101', 'ledger.jsonl'), '');
+  const wsList = (await sb.api('GET', '/api/workspaces')).json.workspaces || [];
+  const last3 = wsList.slice(-3).map((w) => w.wsKey);
+  s.check('⑩ 残留工作区排在最后（页面默认不会落到它）', !/^_orphaned/.test(wsList[0]?.wsKey || ''), JSON.stringify(wsList.slice(0, 2).map((w) => w.wsKey)));
+  s.check('⑪ 每个工作区带 nodes/junk 字段（页面据此标注）', typeof wsList[0]?.nodes === 'number' && typeof wsList[0]?.junk === 'boolean', JSON.stringify(wsList[0]));
 } finally {
   sb.stop();
 }

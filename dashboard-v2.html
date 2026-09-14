@@ -90,6 +90,7 @@
   <span class="pill" id="live">● 实时</span>
   <select id="ws" style="max-width:340px"></select>
   <span class="mut" id="wsmeta"></span>
+  <span class="mut" id="wsNote" style="color:var(--warn)"></span>
   <span style="flex:1"></span>
   <button class="act" id="gateTop" style="display:none" onclick="document.getElementById('gate').scrollIntoView({behavior:'smooth'})">门禁 <b id="gateN"></b></button>
   <button class="act" onclick="refreshAll()">刷新</button>
@@ -243,22 +244,42 @@ async function loadWs() {
   const sel = $('#ws'); sel.innerHTML = '';
   for (const w of d.workspaces) {
     const o = document.createElement('option');
-    o.value = w.wsKey; o.textContent = (w.running ? '▶ ' : '') + (w.title || w.wsKey);
+    o.value = w.wsKey;
+    // 标注"残留"工作区与节点数：2026-09-14 用户刷新后落到 _orphaned-… 那个残留键上，
+    // 明细里只剩它自己的 2 个节点，看着像"工作目录没绑定"。现在这种键会被明确标出来。
+    o.textContent = (w.running ? '▶ ' : '') + (w.junk ? '（残留）' : '') + (w.title || w.wsKey)
+      + (typeof w.nodes === 'number' ? (w.nodes ? ` · ${w.nodes} 节点` : ' · 空') : '');
     sel.appendChild(o);
   }
-  // ?ws= 允许写路径（用户/AI 更习惯写路径）——转成 wsKey 再匹配；匹配不上就报出来，别静默空白
+  // ?ws= 允许写路径（用户/AI 更习惯写路径）——转成 wsKey 再匹配；匹配不上就报出来，别静默落到别的目录
   const q = new URLSearchParams(location.search).get('ws');
+  let note = '';
+  let hit = null;
   if (q) {
     const asKey = String(q).replace(/^([A-Za-z]):[\\/]/, '$1-').replace(/[\\/]+/g, '-').replace(/-+$/, '');
-    const hit = [...sel.options].find((o) => o.value === q || o.value === asKey);
+    hit = [...sel.options].find((o) => o.value === q || o.value === asKey) || null;
     if (hit) sel.value = hit.value;
+    else note = `?ws= 没匹配上任何工作区（${q}）——已切到列表第一个，下拉里是 wsKey`;
+  }
+  // 地址里没带 ws= 时：回到上次用的工作区，而不是列表第一项（第一项可能是个残留键或别的目录）
+  if (!hit && !q) {
+    let remembered = '';
+    try { remembered = localStorage.getItem('questWs') || ''; } catch {}
+    const h2 = remembered ? [...sel.options].find((o) => o.value === remembered) : null;
+    if (h2) { sel.value = h2.value; note = `地址里没带 ?ws=，已回到上次用的工作区（${remembered}）`; }
     else {
-      $('#wsmeta').textContent = `⚠️ ?ws= 没匹配上任何工作区（${q}）——已切到列表第一个；下拉里是 wsKey`;
-      console.warn('[quest] ?ws= 未匹配：', q, '候选：', [...sel.options].map((o) => o.value).join(', '));
+      const isJunk = (k) => /^_orphaned/.test(k) || /^-mnt-/.test(k) || k === 'logs';
+      const firstReal = [...sel.options].find((o) => !isJunk(o.value));
+      if (firstReal) sel.value = firstReal.value;
+      note = `地址里没带 ?ws=，已按"最近有活动"选（${sel.value}）——左上角下拉可换；地址里带 ?ws= 可以固定`;
     }
   }
+  // 提示写进独立元素：loadTasks 会把 #wsmeta 覆盖成工作区路径（2026-09-14 踩到，提示等于没说）
+  if ($('#wsNote')) $('#wsNote').textContent = note ? '⚠️ ' + note : '';
+  if (note) console.warn('[quest]', note);
   curWs = sel.value;
-  sel.onchange = () => { curWs = sel.value; pickedPlan = ''; loadTasks(); fillLogNodes(); };
+  try { localStorage.setItem('questWs', curWs); } catch {}   // 记住这次用的，下次没带 ?ws= 就回到它
+  sel.onchange = () => { curWs = sel.value; pickedPlan = ''; try { localStorage.setItem('questWs', curWs); } catch {} loadTasks(); fillLogNodes(); };
 }
 
 let nodesCache = [];
