@@ -85,6 +85,20 @@ function dirOf(wsKey) {
 }
 
 /** plan.md 解析：`---node: <id>---` 分节，字段 key: value，handoff: | 为多行块。 */
+/**
+ * 把用户/AI 写的节点 id 解析成真 id：支持唯一后缀或唯一片段（像 git 的短哈希）。
+ * 返回 { id } 或 { error, matches }。2026-09-14：有人用短后缀取消，原样写进账本 → 冒出幽灵节点。
+ */
+function resolveNodeId(ids, wanted) {
+  const w = String(wanted || '').trim();
+  if (!w) return { error: '缺少 node' };
+  if (ids.includes(w)) return { id: w };
+  const hits = ids.filter((id) => id.endsWith(w) || id.includes(w));
+  if (hits.length === 1) return { id: hits[0], resolvedFrom: w };
+  if (hits.length > 1) return { error: `节点片段「${w}」不唯一，候选：${hits.slice(0, 5).join('、')}`, matches: hits.slice(0, 5) };
+  return { error: `没有节点匹配「${w}」`, matches: [] };
+}
+
 function parsePlan(markdown) {
   const errors = [];
   const meta = {};
@@ -937,12 +951,16 @@ function handleNodeExit(wsKey, node, ctx) {
     appendEvent(wsKey, { t: 'node.timeout', node: node.id, runSec });
     finishNode(wsKey, node, { verdict: 'timeout', via, logFile }, null, runSec, startedAt);
   } else {
+    // 认领的作业拿不到 waitpid 的退出码——但 WSL 包装器把真实码写进了日志（EXIT_CODE:<n>）。
+    // 先试着恢复：拿得到就用它，别一律标"退出码未知"（那行字会让人以为判定不可信）。
+    let codeEff = code;
+    if (codeEff == null && logFile) { try { const rc = recoverExitCode(logFile); if (rc != null) codeEff = rc; } catch {} }
     let j;
-    try { j = judge(node, code == null ? 0 : code, runSec, logFile); }
+    try { j = judge(node, codeEff == null ? 0 : codeEff, runSec, logFile); }
     catch (e) { j = { verdict: 'suspect', via: 'judge-error', detail: String(e && e.message || e).slice(0, 200) }; log('判定器异常:', e && e.message); }
-    if (code == null) j.via = `${j.via}（退出码未知：quest 重启后再认领）`;
+    if (codeEff == null) j.via = `${j.via}（退出码未知：quest 重启后再认领，日志里也没写 EXIT_CODE）`;
     appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined, ...(j.detail ? { detail: j.detail } : {}) });
-    finishNode(wsKey, node, { ...j, logFile }, code, runSec, startedAt);
+    finishNode(wsKey, node, { ...j, logFile }, codeEff, runSec, startedAt);
   }
 }
 
@@ -2170,6 +2188,16 @@ const server = http.createServer(async (req, res) => {
     // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
     if (req.method === 'POST' && u.pathname === '/api/cancel') {
       const body = await readBody(req);
+      {
+        // 先解析 id：短后缀/片段唯一就当成它；解析不到直接 404，不写账本（防幽灵节点）
+        const st0 = buildState(wsKey);
+        const plan0 = st0.plan ? parsePlan(st0.plan) : { nodes: [] };
+        const known = [...new Set([...Object.keys(st0.nodes), ...plan0.nodes.map((n) => n.id)])];
+        const r = resolveNodeId(known, body.node);
+        if (r.error) return json(404, { ok: false, error: r.error, matches: r.matches });
+        if (r.resolvedFrom) log(`cancel: 「${r.resolvedFrom}」→ ${r.id}`);
+        body.node = r.id;
+      }
       const job = activeJobs.get(`${wsKey}|${body.node}`);
       if (!job) {
         // 账本说它已终结，但进程可能还活着——例如重启后认领之前的窗口，
@@ -2206,6 +2234,12 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const state = buildState(wsKey);
       const plan = state.plan ? parsePlan(state.plan) : null;
+      {
+        const r = resolveNodeId((plan?.nodes || []).map((n) => n.id), body.node);
+        if (r.error) return json(404, { ok: false, error: r.error, matches: r.matches });
+        if (r.resolvedFrom) log(`dispatch: 「${r.resolvedFrom}」→ ${r.id}`);
+        body.node = r.id;
+      }
       const node = plan?.nodes.find((n) => n.id === body.node);
       if (!node) return json(404, { ok: false, error: `节点 ${body.node} 不在当前 plan.md 里` });
       const st = state.nodes[node.id]?.status;

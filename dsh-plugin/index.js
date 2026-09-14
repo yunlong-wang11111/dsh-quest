@@ -31,7 +31,16 @@ async function questCall(cfg, path, init = {}, timeoutMs = 4000) {
     if (!resp.ok) return { error: json.error || `HTTP ${resp.status}`, ...(json.hint ? { hint: json.hint } : {}), ...(json.dropped ? { dropped: json.dropped } : {}) };
     return json;
   } catch (err) {
-    return { error: `quest 服务不可达（${String(err && err.message || err)}）——服务在跑吗？` };
+    // 区分「本工具等超时」与「服务真连不上」——以前一律说"服务不可达"，把人误导成 quest 挂了；
+    // 实际多半是等待超时（服务那边可能还在跑，结果已落日志/账本），不该当故障重试。
+    const msg = String((err && err.message) || err);
+    if ((err && err.name === 'AbortError') || /abort/i.test(msg)) {
+      return {
+        error: `等待超时（${Math.round(timeoutMs / 1000)} 秒）：quest 可能还在跑这条命令，结果不一定丢——去 /api/log 或账本（probe.done / 节点日志）核实真实状态，别原样重试；长命令请改用 quest_run。`,
+        hint: '超时 ≠ 失败：先核实再决定。',
+      };
+    }
+    return { error: `quest 服务不可达（${msg}）——服务在跑吗？（可用 node tools/when-idle.mjs 查）` };
   } finally {
     clearTimeout(timer);
   }
