@@ -1873,7 +1873,15 @@ const server = http.createServer(async (req, res) => {
       const plan0 = state.plan ? parsePlan(state.plan) : { nodes: [] };
       const plan = mergedPlanNodes(plan0, state); // 并入账本独有节点（快速单发）
       // 展示排序与 progress.md 一致：已完成（时间正序）→运行中→异常→待办（声明序）
-      const nodes = nodeDisplayOrder(plan, state).map(({ n }) => ({ id: n.id, ...(state.nodes[n.id] || { status: 'pending' }), quiet: n.quiet, expectMinutes: n.expectMinutes }));
+      // 带上 plan 侧的元数据（after/manual/success/shell）——控制台要靠 after 画任务链路线图；
+      // inPlan 区分"plan.md 声明的节点"与"账本里的快速单发节点"（后者没有 after）。
+      const nodes = nodeDisplayOrder(plan, state).map(({ n }) => ({
+        id: n.id, ...(state.nodes[n.id] || { status: 'pending' }),
+        quiet: n.quiet, expectMinutes: n.expectMinutes,
+        inPlan: Array.isArray(n.after),
+        after: Array.isArray(n.after) ? n.after : [],
+        manual: !!n.manual, shell: n.shell || 'windows', success: n.success || '',
+      }));
       const unread = inbox.splice(0); // 取走即清
       writeProgress(wsKey); // 查询即刷新：progress.md 不再等下一个节点事件（排序/状态实时保鲜）
       // workspace 优先取 plan.md 里声明的绝对路径（权威），入参只做缺省——/q翻页 等下游要拿真路径去匹配 DSH 会话

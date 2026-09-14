@@ -60,6 +60,25 @@
   .obj.warn .oi, .obj.warn .ostat { color:var(--warn); }
   .trk-grp { margin:7px 0 1px; color:var(--dim); font-size:11.5px; }
   .trk-more { color:var(--dim); font-size:11.5px; padding:2px 0 2px 23px; }
+  /* ── 任务链路线图（BTWQuests 式约定：依赖箭头、完成打绿勾、可派发绿框、人工门金星）横排 ── */
+  .rm-hd { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-bottom:7px; }
+  .rm-hd b { font-size:13.5px; }
+  .rm-wrap { overflow:auto; border:1px solid var(--line); border-radius:10px; background:#0b0e12; padding:10px; max-height:62vh; }
+  .rm-canvas { position:relative; }
+  .rm-node { position:absolute; width:186px; height:44px; background:var(--card); border:1px solid var(--line);
+             border-radius:8px; padding:4px 8px; font-size:12px; overflow:hidden; cursor:pointer; }
+  .rm-node:hover { border-color:var(--acc); }
+  .rm-node .rid { font-family:ui-monospace,Consolas,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:170px; }
+  .rm-node .rst { color:var(--dim); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:170px; }
+  .rm-node.done { border-color:#2b5c3f; } .rm-node.done .rst { color:var(--ok); }
+  .rm-node.run { border-color:var(--run); animation:p 1s infinite alternate; } .rm-node.run .rst { color:#9dc6ff; }
+  .rm-node.bad { border-color:#6d2f24; } .rm-node.bad .rst { color:var(--bad); }
+  .rm-node.warn { border-color:#6b5320; } .rm-node.warn .rst { color:var(--warn); }
+  .rm-node.dim { opacity:.6; }
+  .rm-node.frontier { border-color:var(--ok); box-shadow:0 0 0 2px rgba(63,185,111,.25); }
+  .rm-check { position:absolute; right:5px; bottom:3px; color:var(--ok); font-size:12px; }
+  .rm-crest { position:absolute; left:5px; bottom:3px; color:var(--warn); font-size:11px; }
+  .rm-legend { color:var(--dim); font-size:11.5px; margin-top:7px; line-height:1.7; }
 </style>
 </head>
 <body>
@@ -70,13 +89,32 @@
   <button class="act" onclick="refreshAll()">刷新</button>
 </header>
 <nav>
-  <button data-t="tasks" class="on">任务线</button>
+  <button data-t="route" class="on">计划路线</button>
+  <button data-t="tasks">任务线</button>
   <button data-t="gate">门禁 <span id="gateN" class="mut"></span></button>
   <button data-t="logs">日志</button>
   <button data-t="files">文件</button>
 </nav>
 
-<section id="tasks" class="on">
+<section id="route" class="on">
+  <div class="card">
+    <div class="rm-hd">
+      <b>任务链路线图</b>
+      <span class="pill" id="rmState">读取中…</span>
+      <span class="mut" id="rmCount"></span>
+      <span style="flex:1"></span>
+      <button class="act" onclick="renderRoute(lastStatus)">重画</button>
+    </div>
+    <div class="mut" id="rmWhy" style="margin-bottom:8px"></div>
+    <div class="rm-wrap"><div class="rm-canvas" id="rmCanvas"></div></div>
+    <div class="rm-legend">
+      图例：✔ 完成（盒右下角绿勾）· ✖ 失败 · ▶ 运行中 · ⛔ 冻结 · ⏭ 跳过 · ○ 待办 · ★ 人工门（manual: true）·
+      <b style="color:var(--ok)">绿框 = 现在可派发</b>（前置都已完成）· 点节点 → 看它的日志 · 箭头 = after 依赖（绿=上游已完成，红=上游失败）
+    </div>
+  </div>
+</section>
+
+<section id="tasks">
   <div class="card" id="trk">
     <div class="trk-hd">
       <b>任务线追踪</b>
@@ -183,21 +221,35 @@ async function loadWs() {
     o.value = w.wsKey; o.textContent = (w.running ? '▶ ' : '') + (w.title || w.wsKey);
     sel.appendChild(o);
   }
+  // ?ws= 允许写路径（用户/AI 更习惯写路径）——转成 wsKey 再匹配；匹配不上就报出来，别静默空白
   const q = new URLSearchParams(location.search).get('ws');
-  if (q) sel.value = q;
+  if (q) {
+    const asKey = String(q).replace(/^([A-Za-z]):[\\/]/, '$1-').replace(/[\\/]+/g, '-').replace(/-+$/, '');
+    const hit = [...sel.options].find((o) => o.value === q || o.value === asKey);
+    if (hit) sel.value = hit.value;
+    else {
+      $('#wsmeta').textContent = `⚠️ ?ws= 没匹配上任何工作区（${q}）——已切到列表第一个；下拉里是 wsKey`;
+      console.warn('[quest] ?ws= 未匹配：', q, '候选：', [...sel.options].map((o) => o.value).join(', '));
+    }
+  }
   curWs = sel.value;
   sel.onchange = () => { curWs = sel.value; loadTasks(); fillLogNodes(); };
 }
 
 let nodesCache = [];
 async function loadTasks() {
-  if (!curWs) return;
+  if (!curWs) { // 没选到工作区：说清楚，别一直"读取中…"（静默空白最难查）
+    const el = $('#rmState'); if (el) { el.textContent = '没有选中工作区'; el.className = 'pill bad'; }
+    const t2 = $('#trkState'); if (t2) { t2.textContent = '没有选中工作区'; t2.className = 'pill bad'; }
+    return;
+  }
   const d = await api('/api/status?ws=' + encodeURIComponent(curWs));
   $('#ver').textContent = d.questVersion || '';
   $('#wsmeta').textContent = d.plan?.workspace || '';
   nodesCache = d.plan?.nodes || [];
   lastStatus = d;
   renderTracker(d);
+  renderRoute(d);
   $('#nodes').innerHTML = nodesCache.map((n) => {
     const canDispatch = ['failed','timeout','cancelled','pending','skipped','ready','frozen'].includes(n.status);
     const canCancel = n.status === 'running';
@@ -306,6 +358,103 @@ function renderTracker(d) {
     if (list.length > CAP) rows.push(`<div class="trk-more">… 还有 ${list.length - CAP} 条更早的（下面「全部节点明细」里有完整列表）</div>`);
   }
   $('#trkList').innerHTML = rows.join('') || '<div class="mut">这个工作区还没有节点</div>';
+}
+
+// ── 任务链路线图（横排；BTWQuests 式：依赖箭头 + 完成绿勾 + 可派发绿框 + 人工门金星）──
+// 只画 plan.md 声明的节点（快速单发不在图里）：回答"当下 plan 走到哪了"。
+// 布局：深度 = 最长前置链（Kahn 拓扑层次，带环保护）；同列按声明顺序。
+function renderRoute(d) {
+  if (!d) return;
+  const all = d.plan?.nodes || [];
+  const plan = all.filter((n) => n.inPlan);
+  const byId = new Map(all.map((n) => [n.id, n]));
+  const line = d.line || {};
+  const st = trkStateText(line);
+  const el = $('#rmState');
+  if (el) { el.textContent = st.t; el.className = 'pill ' + st.cls; }
+  const c = {};
+  for (const n of plan) c[n.status] = (c[n.status] ?? 0) + 1;
+  const depsOf = (n) => (n.after || []).filter((a) => byId.has(a));
+  const frontier = plan.filter((n) => ['pending', 'ready'].includes(n.status) && depsOf(n).every((a) => byId.get(a)?.status === 'completed'));
+  if ($('#rmCount')) {
+    $('#rmCount').textContent = plan.length
+      ? `plan 节点 ${plan.length}｜完成 ${c.completed || 0} · 运行 ${c.running || 0} · 可派发 ${frontier.length} · 异常 ${(c.failed || 0) + (c.timeout || 0) + (c.frozen || 0) + (c.cancelled || 0)}`
+      : '没有 plan.md 节点';
+  }
+  const quick = all.length - plan.length;
+  const serverHasPlanMeta = all.length > 0 && ('inPlan' in (all[0] || {}));
+  if ($('#rmWhy')) {
+    $('#rmWhy').textContent = plan.length
+      ? (quick ? `另有 ${quick} 个快速单发节点不在图里（见「任务线」页）` : '')
+      : (!serverHasPlanMeta
+        ? '⚠️ 当前 quest 服务是旧版（/api/status 还没有 inPlan/after 字段）——重启 quest 后路线图就能读到 plan 的依赖关系了'
+        : `这个工作区历史都是快速单发（${quick} 个）——用「任务线」页看它们；想让路线图有内容，就让 AI 写一份 plan.md 把流水固定下来`);
+  }
+  const canvas = $('#rmCanvas');
+  if (!canvas) return;
+  if (!plan.length) { canvas.innerHTML = ''; canvas.style.height = '40px'; return; }
+
+  const depth = new Map();
+  const calc = (id, seen) => {
+    if (depth.has(id)) return depth.get(id);
+    const deps = depsOf(byId.get(id));
+    if (!deps.length || seen.has(id)) { depth.set(id, 0); return 0; }
+    seen.add(id);
+    const d2 = 1 + Math.max(...deps.map((p) => calc(p, seen)));
+    depth.set(id, d2); return d2;
+  };
+  for (const n of plan) calc(n.id, new Set());
+  const cols = new Map();
+  for (const n of plan) { const dp = depth.get(n.id) || 0; if (!cols.has(dp)) cols.set(dp, []); cols.get(dp).push(n); }
+
+  const NW = 186, NH = 44, GX = 68, GY = 16, PAD = 10;
+  const pos = new Map();
+  let maxX = 0, maxY = 0;
+  for (const [dp, list] of cols) {
+    list.forEach((n, i) => {
+      const x = PAD + dp * (NW + GX);
+      const y = PAD + i * (NH + GY);
+      pos.set(n.id, { x, y });
+      maxX = Math.max(maxX, x + NW); maxY = Math.max(maxY, y + NH);
+    });
+  }
+  const W = maxX + PAD, H = maxY + PAD;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+
+  // 箭头：绿=上游完成，红=上游失败/冻结，灰=其它
+  const edgeColor = (p) => (p.status === 'completed' ? '#3fb96f' : ['failed', 'timeout', 'frozen'].includes(p.status) ? '#e0563f' : '#3a4350');
+  const paths = [];
+  for (const n of plan) {
+    for (const a of depsOf(n)) {
+      const p = byId.get(a), pp = pos.get(a), cp = pos.get(n.id);
+      if (!pp || !cp) continue;
+      const x1 = pp.x + NW, y1 = pp.y + NH / 2, x2 = cp.x - 6, y2 = cp.y + NH / 2;
+      const col = edgeColor(p);
+      paths.push(`<path d="M ${x1} ${y1} C ${x1 + 34} ${y1}, ${x2 - 34} ${y2}, ${x2} ${y2}" fill="none" stroke="${col}" stroke-width="1.6" marker-end="url(#arm-${col.slice(1)})"/>`);
+    }
+  }
+  const markers = ['#3fb96f', '#e0563f', '#3a4350'].map((col) => `<marker id="arm-${col.slice(1)}" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="${col}"/></marker>`).join('');
+  const boxes = plan.map((n) => {
+    const p = pos.get(n.id);
+    const cls = [TRK_CLS[n.status] || '', frontier.includes(n) ? 'frontier' : ''].filter(Boolean).join(' ');
+    const bits = [];
+    if (n.status === 'running') {
+      const secs = n.startedAt ? Math.round((Date.now() - Date.parse(n.startedAt)) / 1000) : n.runSeconds;
+      if (secs != null) bits.push(`已跑 ${Math.floor(secs / 60)}分${secs % 60}秒`);
+    } else {
+      if (n.verdict) bits.push(n.verdict);
+      if (n.runSeconds != null) bits.push(`${Math.round(n.runSeconds / 60)}分`);
+    }
+    if (n.metrics?.loss_last != null) bits.push(`loss ${n.metrics.loss_last}`);
+    if (n.shell === 'wsl') bits.push('wsl');
+    return `<div class="rm-node ${cls}" style="left:${p.x}px;top:${p.y}px" title="${esc(n.id)}&#10;${esc((n.after || []).join(', ') || '（链头）')}&#10;${esc(n.success || '')}" onclick="openLog('${esc(n.id)}')">
+      <div class="rid">${TRK_ICON[n.status] || '·'} ${esc(n.id)}</div>
+      <div class="rst">${esc(TRK_TXT[n.status] || n.status)}${bits.length ? ' · ' + esc(bits.join(' · ')) : ''}</div>
+      ${n.status === 'completed' ? '<span class="rm-check">✔</span>' : ''}
+      ${n.manual ? '<span class="rm-crest" title="人工门：上游完成后停下等确认">★</span>' : ''}
+    </div>`;
+  }).join('');
+  canvas.innerHTML = `<svg width="${W}" height="${H}" style="position:absolute;left:0;top:0;pointer-events:none"><defs>${markers}</defs>${paths.join('')}</svg>${boxes}`;
 }
 
 async function act(kind, node) {  try {
@@ -443,7 +592,11 @@ async function refreshAll() {
 }
 loadWs().then(() => { loadTasks(); fillLogNodes(); pump(); });
 // 运行中的"已跑 X分Y秒"要自己走动；同时兜住长轮询万一断线时的刷新
-setInterval(() => { if (lastStatus) renderTracker(lastStatus); }, 5000);
+setInterval(() => {
+  if (!lastStatus) return;
+  if ($('#route').classList.contains('on')) renderRoute(lastStatus);
+  if ($('#tasks').classList.contains('on')) renderTracker(lastStatus);
+}, 5000);
 setInterval(() => { if ($('#logs').classList.contains('on') && $('#logAuto').checked) loadLog(); }, 8000);
 </script>
 </body>
