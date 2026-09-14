@@ -686,6 +686,10 @@ const isQuestPid = (pid) => {
   return pid && questPids.has(Number(pid));
 };
 // 活跃作业注册表（P1-3/P1-4）：nodeKey -> { child, timers[], flags }
+// 单条命令的长度上限：超过就明确拒绝，绝不静默截断。
+// 2026-09-14 事故：一条 5 段流水命令被 .slice(0,500) 悄悄截断，尾部只剩 "; /"，
+// bash 退出 126 → 判定 crashed → 12 分钟的有效结果被判失败，且事后无法从账本看出命令被动过。
+const CMD_MAX_CHARS = 8000;
 const activeJobs = new Map();
 function dispatchJob(wsKey, node, body = {}) {
   return new Promise(async (resolve) => {
@@ -1772,6 +1776,13 @@ async function launchQuickRun(wsKey, node, extra = {}) {
     }
   } catch {}
   appendEvent(wsKey, { t: 'plan.created', nodes: [node.id] });
+  // 记下真正执行的命令：quick 节点不在 plan.md 里，账本若只留 id，事后无法审计或复现
+  // （2026-09-14「假崩溃」事故里，第一件想确认的就是"我们到底把什么命令发出去了"）
+  appendEvent(wsKey, {
+    t: 'quick.dispatched', node: node.id,
+    command: String(node.command || '').slice(0, 4000), cwd: node.cwd, shell: node.shell || 'windows',
+    success: String(node.success || ''), expectMinutes: node.expectMinutes ?? null,
+  });
   return dispatchJob(wsKey, node);
 }
 
@@ -1903,9 +1914,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && u.pathname === '/api/run') {
       const b = await readBody(req);
       if (!b.command || !b.cwd) return json(400, { ok: false, error: '缺少 command/cwd' });
+      if (String(b.command).length > CMD_MAX_CHARS) {
+        return json(200, {
+          ok: false,
+          error: `命令 ${String(b.command).length} 字符超过上限 ${CMD_MAX_CHARS}：请把多段流水写进工作区脚本（python / bash）再一次派发，或拆成多次 quest_run。长链式命令既容易出错，判定器/修复器也处理不了。`,
+        });
+      }
       const node = {
         id: `quick-${String(b.title || b.command).slice(0, 40).replace(/[^\w一-龥-]/g, '_')}-${Date.now().toString(36)}`,
-        command: String(b.command).slice(0, 500), cwd: b.cwd,
+        command: String(b.command), cwd: b.cwd,
         expectMinutes: Number(b.expectMinutes) || 30, quiet: b.quiet === true,
         autoFix: b.autoFix === true, fixBudget: 2,
         handoff: String(b.handoff || '快速单发任务').slice(0, 2000),
@@ -2183,7 +2200,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && u.pathname === '/api/probe') {
       const b = await readBody(req);
       if (!b.command || !b.cwd) return json(400, { ok: false, error: '缺少 command/cwd' });
-      const command = String(b.command).slice(0, 500);
+      if (String(b.command).length > CMD_MAX_CHARS) {
+        return json(200, { ok: false, error: `探测命令 ${String(b.command).length} 字符超过上限 ${CMD_MAX_CHARS}` });
+      }
+      const command = String(b.command);
       const cwd = String(b.cwd);
       const cls = classifyRunCommand(command, cwd);
       const allowC = cls.why === '解释器 -c 内联代码不可静态审查'; // 探针放行 -c（quest_run 依然要过门）

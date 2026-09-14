@@ -28,7 +28,7 @@ try {
 
   // ④ 脚本语法错：py_compile 预检当场拦下（需本机有 python，否则记跳过）
   const py = process.env.QUEST_TEST_PYTHON || (() => {
-    for (const c of ['python', 'python3']) {
+    for (const c of ['python', 'python3', 'py', 'py -3']) {
       try { require('node:child_process').execSync(`${c} -c "pass"`, { stdio: 'ignore' }); return c; } catch {}
     }
     return null;
@@ -55,6 +55,15 @@ try {
   const nodes = await sb.status(WS);
   const ran = nodes.filter((n) => ['running', 'completed'].includes(n.status));
   s.check('⑦ 失败节点确实没跑（只有 ③ 那条在跑/完成）', ran.length <= 1, ran.map((n) => `${n.id}:${n.status}`).join(',') || '无');
+
+  // ⑧ 超长命令：明确拒绝，绝不静默截断（2026-09-14 事故：被截到 500 字符，尾部只剩 "; /"，
+  //    bash 退出 126 → 判定 crashed → 12 分钟的有效结果被判失败，且谁也看不出命令被动过）
+  const longCmd = `node ok.js ${'#'.repeat(8200)}`;
+  r = await run({ command: longCmd, cwd: WS, title: 'pf-toolong' });
+  s.check('⑧ 超长命令 → 明确拒绝并给做法', r.json.ok === false && /超过上限/.test(r.json.error || ''), String(r.json.error || '').slice(0, 56));
+  // ⑨ 派发的命令原样落账（否则事后无法审计/复现）
+  const qs = ledgerOf(sb.home, WS).filter((e) => e.t === 'quick.dispatched');
+  s.check('⑨ 派发的命令原样记进账本', qs.some((e) => String(e.command || '').includes('node ok.js')), `quick.dispatched=${qs.length}`);
 } finally {
   sb.stop();
 }
