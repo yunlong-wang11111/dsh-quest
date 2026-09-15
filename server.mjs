@@ -2224,8 +2224,78 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
       const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
-      const results = { archived: [], created: null, errors: [], exported: null };
-      // 0) 导出旧会话为可搜索的 markdown（AI 的冷存储——翻页后仍可 grep 查旧细节）
+      const results = { archived: [], created: null, errors: [], exported: null, handoff: null };
+
+      // ── 0) 交接（2026-09-15）：归档前让老会话把 research-state.md 写新鲜 ──────────
+      // 模板模仿 Claude Code /compact 的 9 节与 Codex 的 checkpoint 4 节，融合并适配科研流：
+      // 目标/决策/进度/产物/坑/在跑/待办/用户口径/下一步。种子提示让新会话读的正是这份文件，
+      // 以前从没人负责写它 ⇒ 恢复质量全凭运气。
+      const HANDOFF_TMPL = [
+        '# 研究状态交接（research-state）',
+        '（翻页前由老会话写入；新会话靠它恢复上下文，写详细不写客气话）',
+        '',
+        '## 1. 目标与意图',
+        '这条线在验证什么假设；用户明确要的产出（论文表/图/结论句）。',
+        '',
+        '## 2. 已定决策（别再讨论）',
+        '每个决策一行：定了什么 + 一句理由。含参数基线、方法选型、命名约定。',
+        '',
+        '## 3. 当前进度',
+        '进行到哪一步；刚完成什么（带关键数字）；与目标的差距。',
+        '',
+        '## 4. 产物与文件清单',
+        '路径 → 干嘛的 → 关键数字/结论。只列这条线的核心产物，注明可信度（已验/待验）。',
+        '',
+        '## 5. 错误与坑（别再踩）',
+        '试过不行的路、踩过的坑、临时绕过。写"什么不行、为什么"，防止新会话重蹈。',
+        '',
+        '## 6. 正在跑 / 等待中',
+        'quest 节点 id、外部任务、等用户拍板的事项。',
+        '',
+        '## 7. 待办',
+        '按优先级列，带验收标准（怎样算完成）。',
+        '',
+        '## 8. 用户口径与红线',
+        '用户明确说过的偏好、口径、禁做的事（尽量原话）。',
+        '',
+        '## 9. 建议下一步',
+        '一两句：接着干什么、先查什么。',
+      ].join('\n');
+      if (b.handoff !== false) {
+        try {
+          const lh = await api.sessions.list({});
+          const items = lh.result.ok ? (lh.result.value?.items ?? []) : [];
+          const wsN = String(b.ws ?? '').replace(/\\/g, '/');
+          const mine = items
+            .filter((it) => String(it.cwd ?? '').replace(/\\/g, '/') === wsN)
+            .sort((x, y) => String(y.updatedAt ?? '').localeCompare(String(x.updatedAt ?? '')));
+          if (!mine.length) {
+            results.handoff = { prompted: 0, note: '没有活着的旧会话，跳过交接（新会话将读已有的 research-state.md）' };
+          } else {
+            const rsFile = path.join(String(b.ws), 'research-state.md');
+            const before = fs.existsSync(rsFile) ? fs.statSync(rsFile).mtimeMs : 0;
+            await api.sessions.prompt({
+              sessionId: mine[0].sessionId, mode: 'queue',
+              content: [{ type: 'text', text: [
+                '【翻页前交接】本会话即将被归档翻篇。请把工作区的 research-state.md **整个重写**为一份交接文档（覆盖旧内容，中文），严格按下面的模板逐节填写；没有的节写"无"；第 4/5 节要具体到文件路径和数字。除写这一个文件外不要做任何别的事，写完只回复"交接已写入"。',
+                '',
+                HANDOFF_TMPL,
+              ].join('\n') }],
+            });
+            // 等它写完（轮询 mtime；超时则如实记录并继续翻页——翻页本身不能被卡死的会话绑架）
+            const tmo = Math.min(600, Math.max(30, Number(b.handoffTimeoutSec) || 150)) * 1000;
+            const t0 = Date.now();
+            let wrote = false;
+            while (Date.now() - t0 < tmo) {
+              await new Promise((r) => setTimeout(r, 5000));
+              try { if (fs.existsSync(rsFile) && fs.statSync(rsFile).mtimeMs > before) { wrote = true; break; } } catch {}
+            }
+            results.handoff = { prompted: 1, sessionId: mine[0].sessionId, wrote, waitedSec: Math.round((Date.now() - t0) / 1000), note: wrote ? '老会话已把 research-state.md 写新鲜' : '等待超时（老会话可能卡死/繁忙），新会话将读旧版 research-state.md；旧对话全文在 archive/ 里可 grep' };
+          }
+        } catch (e) { results.handoff = { prompted: 0, note: '交接步骤出错：' + e.message }; }
+      }
+
+      // 1) 导出旧会话为可搜索的 markdown（AI 的冷存储——翻页后仍可 grep 查旧细节）
       try {
         const lr0 = await api.sessions.list({});
         const wsItems = lr0.result.ok
@@ -2235,9 +2305,9 @@ const server = http.createServer(async (req, res) => {
           results.exported = await exportSessionArchive(b.ws, wsItems, wsKeyOf);
         }
       } catch (e) { results.errors.push('export: ' + e.message); }
-      // 0.5) 重建 API 连接（导出大文件耗时，旧连接可能已断——0.1.5 实测踩过）
+      // 1.5) 重建 API 连接（导出大文件耗时，旧连接可能已断——0.1.5 实测踩过）
       const api2 = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
-      // 1) 归档旧会话（该工作区下所有会话）
+      // 2) 归档旧会话（该工作区下所有会话）
       try {
         const lr = await api2.sessions.list({});
         if (lr.result.ok) {
@@ -2251,18 +2321,26 @@ const server = http.createServer(async (req, res) => {
           }
         }
       } catch (e) { results.errors.push(`list: ${e.message}`); }
-      // 2) 开新会话
+      // 3) 开新会话
       try {
         const created = await api.sessions.create({ cwd: b.ws, agentPreset: b.preset || undefined });
         if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 150));
         results.created = created.result.value.sessionId;
       } catch (e) { results.errors.push(`create: ${e.message}`); }
-      // 3) 种子消息：让新会话读研究状态文件
+      // 4) 种子消息：装载交接文档 + 任务线全景，先复述确认再动手（防"上下文缺了变傻"——
+      //    复述逼它把情报装载到位，用户当场能看出丢了什么）
       if (results.created && b.seed !== false) {
         try {
+          const rsOk = fs.existsSync(path.join(String(b.ws), 'research-state.md'));
           await api.sessions.prompt({
             sessionId: results.created, mode: 'queue',
-            content: [{ type: 'text', text: `【翻篇恢复】工作区刚完成一次翻篇归档。请先读取 ${path.join(b.ws, 'research-state.md')} 恢复研究上下文（历史结论、参数基线、待办），读完后回复"上下文已恢复"并简述当前状态（3 行以内）。历史对话全文在 archive/flip-*.md（工具输出已修剪），需要查旧细节时用 grep 搜索此文件，不要整读。之后等待用户指示。` }],
+            content: [{ type: 'text', text: [
+              '【翻篇恢复】工作区刚完成一次翻篇归档。按顺序做三件事，然后停下等用户：',
+              `1. 读取 ${path.join(b.ws, 'research-state.md')} —— 这是老会话归档前写的交接文档${results.handoff?.wrote ? '（刚写新鲜的 ✓）' : rsOk ? '（注意：本次翻页老会话没来得及重写，内容可能是旧的，缺的部分去 archive/ 里 grep）' : '（文件不存在！先看第 3 步的任务线全景，并提醒用户补交接）'}。`,
+              '2. 调用 quest_status（brief 模式）拿任务线全景：在跑的、最近失败的、计划状态。',
+              '3. 用 5~8 行向用户复述你理解的现状：目标、已完成（带关键数字）、正在跑、坑（别再踩的）、建议下一步。**复述完就停，等用户确认后再动手**——宁可问，不要猜。',
+              '历史对话全文在 archive/flip-*.md（工具输出已修剪），要查旧细节用 grep 搜这个文件，不要整读。',
+            ].join('\n') }],
           });
         } catch (e) { results.errors.push(`seed: ${e.message}`); }
       }
