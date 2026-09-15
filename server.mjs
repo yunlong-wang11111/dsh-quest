@@ -2404,16 +2404,29 @@ const server = http.createServer(async (req, res) => {
       return json(200, r);
     }
     if (req.method === 'GET' && u.pathname === '/api/log') {
-      const node = u.searchParams.get('node') || '';
+      let node = u.searchParams.get('node') || '';
       const state = buildState(wsKey);
+      // 与 cancel/dispatch 一致：支持唯一短后缀（AI 常用短 id 查日志）；解析不到 404，不猜
+      {
+        const plan0 = state.plan ? parsePlan(state.plan) : { nodes: [] };
+        const known = [...new Set([...Object.keys(state.nodes), ...plan0.nodes.map((n) => n.id)])];
+        const r = resolveNodeId(known, node);
+        if (r.error) return json(404, { ok: false, error: r.error, matches: r.matches });
+        node = r.id;
+      }
       const n = state.nodes[node];
       if (!n?.logTs) return json(404, { error: '无日志' });
       const planN = state.plan ? parsePlan(state.plan).nodes.find((x) => x.id === node) : null;
+      // 车道判定（2026-09-15 修）：以前只看 planN?.shell —— **快速单发不在 plan 里**，planN 恒为 null
+      // ⇒ WSL 车道的 quick 节点会被当成 Windows 车道去 quests/<ws>/logs 找 ⇒ 永远 404"无日志"，
+      // 而日志其实好好躺在 /home/<user>/quest-logs/ 里（实测：三方对拍节点的日志读不到，就是它）。
+      // 正确来源：账本恢复的 n.shell（quick.dispatched 写入）优先，plan 声明兜底。
+      const lane = n.shell || planN?.shell || 'windows';
       let files = [];
       let file = null;
       // 注意：同目录还有同前缀的 .unit（单元名）/ .pid，只认 .log——否则排序后
       // 会把 .unit 当成"最新文件"，读日志读到单元名（曾误导排查，以为 WSL 没抓到 stdout）
-      if (planN?.shell === 'wsl') {
+      if (lane === 'wsl') {
         const safe = wsKey.replace(/[^a-zA-Z0-9_-]/g, '_').slice(-40);
         const wdir = wslUnc(`/home/${WSL_USER()}/quest-logs/${safe}`);
         try { files = fs.readdirSync(wdir).filter((f) => f.startsWith(`${node}-`) && f.endsWith('.log')).sort(); } catch {}
