@@ -97,11 +97,38 @@ server.tool(
 
 server.tool(
   'quest_status',
-  '查任务线全景：各节点状态/判定/指标 + 自上次查看以来的完成事件（unread）。',
-  { ws: z.string().optional().describe('工作区绝对路径（缺省=最近活跃工作区）') },
-  async ({ ws }) => {
+  [
+    '查任务线全景。默认 brief（推荐）：只回 当前状态/计数/在跑节点/异常节点/最近完成 —— 几百字符。',
+    '要看全部节点明细时才传 verbose:true（大工作区会到几十万字符，慎重）。',
+  ].join(' '),
+  {
+    ws: z.string().optional().describe('工作区绝对路径（缺省=最近活跃工作区）'),
+    verbose: z.boolean().optional().describe('true=返回全部节点明细（很大）；缺省=false 只回摘要'),
+  },
+  async ({ ws, verbose }) => {
     const r = await q('GET', `/api/status?ws=${encodeURIComponent(ws || '')}`);
-    return r.error ? fail(r) : ok(r);
+    if (r.error) return fail(r);
+    if (verbose) return ok(r);
+    // brief：省 token 的默认视图（2026-09-15 实测全量 28.9 万字符 → 摘要几百字符）
+    const nodes = r.plan?.nodes || [];
+    const c = {};
+    for (const n of nodes) c[n.status] = (c[n.status] || 0) + 1;
+    const line = r.line || {};
+    const running = nodes.filter((n) => n.status === 'running')
+      .map((n) => ({ id: n.id, shell: n.shell, startedAt: n.startedAt, success: n.success || '' }));
+    const bad = nodes.filter((n) => ['failed', 'timeout'].includes(n.status)).slice(0, 8)
+      .map((n) => ({ id: n.id, verdict: n.verdict, via: n.via, detail: String(n.judgeDetail || n.detail || '').slice(0, 120) }));
+    const planNodes = nodes.filter((n) => n.inPlan)
+      .map((n) => ({ id: n.id, status: n.status, verdict: n.verdict || null }));
+    return ok({
+      workspace: r.plan?.workspace || ws || '', title: r.plan?.title || '',
+      line: { active: line.active, counts: line.counts, idleMinutes: line.idleMinutes, quiet: line.quiet, dsh: line.dsh },
+      running, bad,
+      plan: { nodes: planNodes, closedAt: r.plan?.closedAt || null },
+      unread: (r.unread || []).slice(0, 10),
+      totals: { nodes: nodes.length, ...(c || {}) },
+      hint: '这是摘要视图；要全部节点明细用 verbose:true，要某个节点日志用 quest_log',
+    });
   },
 );
 
@@ -121,7 +148,9 @@ server.tool(
 
 server.tool(
   'quest_probe',
-  '诊断探针：同步跑一条 ≤30 秒的白名单命令并取回尾部输出（解释器跑工作区内脚本，或 -c 内联）。"现在就要看这个值"时用；超过 30 秒的任务用 quest_run。',
+  '诊断探针：同步跑一条白名单命令并取回尾部输出（解释器跑工作区内脚本，或 -c 内联）。"现在就要看这个值"时用。'
+    + '车道按命令首词自动判（Linux 绝对路径如 /home/…/bin/python → WSL；盘符 → Windows），不用说明。'
+    + '硬上限 30 秒（WSL 车道 25 秒，留中继余量），到点杀整个进程组并返回超时前输出（会标 ⏱）。超时的任务不是探针的事，用 quest_run。',
   {
     command: z.string().describe('诊断命令，如 python -c "print(x.shape)"'),
     cwd: z.string().describe('工作目录'),
