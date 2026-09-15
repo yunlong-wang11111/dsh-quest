@@ -2261,18 +2261,22 @@ const server = http.createServer(async (req, res) => {
         '## 9. 建议下一步',
         '一两句：接着干什么、先查什么。',
       ].join('\n');
+      // 匹配一律用 wsKeyOf 归一（2026-09-15 事故教训）：裸字符串比对吃不下 /mnt/c 与 C:\ 两种
+      // 形态、正反斜杠、以及**尾斜杠**（实测见过 "C:\...\piml_fingertip\" 这种 cwd）——
+      // 历史上 4 次翻页 archived 全是 0（9-11 三次 code_kl + 今晚 piml），根子就在这里。
+      const sameWs = (cwd) => { try { return wsKeyOf(String(cwd ?? '')) === wsKeyOf(String(b.ws ?? '')); } catch { return false; } };
       if (b.handoff !== false) {
         try {
           const lh = await api.sessions.list({});
-          const items = lh.result.ok ? (lh.result.value?.items ?? []) : [];
-          const wsN = String(b.ws ?? '').replace(/\\/g, '/');
+          if (!lh.result.ok) throw new Error('session/list 不可用: ' + JSON.stringify(lh.result.error ?? {}).slice(0, 120));
+          const items = lh.result.value?.items ?? [];
           const mine = items
-            .filter((it) => String(it.cwd ?? '').replace(/\\/g, '/') === wsN)
+            .filter((it) => sameWs(it.cwd))
             .sort((x, y) => String(y.updatedAt ?? '').localeCompare(String(x.updatedAt ?? '')));
           if (!mine.length) {
-            results.handoff = { prompted: 0, note: '没有活着的旧会话，跳过交接（新会话将读已有的 research-state.md）' };
+            results.handoff = { prompted: 0, matched: 0, note: '该工作区 0 个会话匹配（列表共 ' + items.length + ' 个）——翻错工作区了？回执会标明目标' };
           } else {
-            const rsFile = path.join(String(b.ws), 'research-state.md');
+            const rsFile = path.join(hostPathFor(String(b.ws ?? '')) || String(b.ws ?? ''), 'research-state.md');
             const before = fs.existsSync(rsFile) ? fs.statSync(rsFile).mtimeMs : 0;
             await api.sessions.prompt({
               sessionId: mine[0].sessionId, mode: 'queue',
@@ -2307,36 +2311,47 @@ const server = http.createServer(async (req, res) => {
       } catch (e) { results.errors.push('export: ' + e.message); }
       // 1.5) 重建 API 连接（导出大文件耗时，旧连接可能已断——0.1.5 实测踩过）
       const api2 = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
-      // 2) 归档旧会话（该工作区下所有会话）
+      // 2) 归档旧会话（该工作区下所有会话）——sameWs 归一匹配 + 假成功防线
+      results.matched = 0;
       try {
         const lr = await api2.sessions.list({});
-        if (lr.result.ok) {
-          for (const item of lr.result.value?.items ?? []) {
-            if (String(item.cwd ?? '').replace(/\\/g, '/') === String(b.ws ?? '').replace(/\\/g, '/')) {
-              try {
-                await api.workspace.archiveSession({ sessionId: item.sessionId });
-                results.archived.push(item.sessionId);
-              } catch (e) { results.errors.push(`archive ${item.sessionId}: ${e.message}`); }
-            }
+        if (!lr.result.ok) throw new Error('session/list 不可用: ' + JSON.stringify(lr.result.error ?? {}).slice(0, 120));
+        const items = lr.result.value?.items ?? [];
+        results.matched = items.filter((it) => sameWs(it.cwd)).length;
+        for (const item of items) {
+          if (sameWs(item.cwd)) {
+            try {
+              await api.workspace.archiveSession({ sessionId: item.sessionId });
+              results.archived.push(item.sessionId);
+            } catch (e) { results.errors.push(`archive ${item.sessionId}: ${e.message}`); }
           }
         }
+        // 匹配到了却一个都没归档成 ⇒ 如实报错（历史教训：4 次翻页全是"归档 0 个"的假成功）
+        if (results.matched > 0 && results.archived.length === 0) {
+          results.errors.push(`匹配到 ${results.matched} 个会话但归档全部失败`);
+        }
+        if (results.matched === 0) {
+          results.errors.push('该工作区 0 个会话匹配（要翻的可能不是这个目录）');
+        }
       } catch (e) { results.errors.push(`list: ${e.message}`); }
-      // 3) 开新会话
+      // 3) 开新会话（cwd 用 Windows 原生形态——/mnt/c 形态在 Windows 侧是无效路径）
       try {
-        const created = await api.sessions.create({ cwd: b.ws, agentPreset: b.preset || undefined });
+        const created = await api.sessions.create({ cwd: hostPathFor(String(b.ws ?? '')) || b.ws, agentPreset: b.preset || undefined });
         if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 150));
         results.created = created.result.value.sessionId;
+        if (!results.created) throw new Error('create 返回 ok 但没有 sessionId');
       } catch (e) { results.errors.push(`create: ${e.message}`); }
       // 4) 种子消息：装载交接文档 + 任务线全景，先复述确认再动手（防"上下文缺了变傻"——
       //    复述逼它把情报装载到位，用户当场能看出丢了什么）
+      const wsHost = hostPathFor(String(b.ws ?? '')) || String(b.ws ?? '');   // research-state.md 的真实路径（/mnt 形态转原生盘符）
       if (results.created && b.seed !== false) {
         try {
-          const rsOk = fs.existsSync(path.join(String(b.ws), 'research-state.md'));
+          const rsOk = fs.existsSync(path.join(wsHost, 'research-state.md'));
           await api.sessions.prompt({
             sessionId: results.created, mode: 'queue',
             content: [{ type: 'text', text: [
               '【翻篇恢复】工作区刚完成一次翻篇归档。按顺序做三件事，然后停下等用户：',
-              `1. 读取 ${path.join(b.ws, 'research-state.md')} —— 这是老会话归档前写的交接文档${results.handoff?.wrote ? '（刚写新鲜的 ✓）' : rsOk ? '（注意：本次翻页老会话没来得及重写，内容可能是旧的，缺的部分去 archive/ 里 grep）' : '（文件不存在！先看第 3 步的任务线全景，并提醒用户补交接）'}。`,
+              `1. 读取 ${path.join(wsHost, 'research-state.md')} —— 这是老会话归档前写的交接文档${results.handoff?.wrote ? '（刚写新鲜的 ✓）' : rsOk ? '（注意：本次翻页老会话没来得及重写，内容可能是旧的，缺的部分去 archive/ 里 grep）' : '（文件不存在！先看第 3 步的任务线全景，并提醒用户补交接）'}。`,
               '2. 调用 quest_status（brief 模式）拿任务线全景：在跑的、最近失败的、计划状态。',
               '3. 用 5~8 行向用户复述你理解的现状：目标、已完成（带关键数字）、正在跑、坑（别再踩的）、建议下一步。**复述完就停，等用户确认后再动手**——宁可问，不要猜。',
               '历史对话全文在 archive/flip-*.md（工具输出已修剪），要查旧细节用 grep 搜这个文件，不要整读。',
