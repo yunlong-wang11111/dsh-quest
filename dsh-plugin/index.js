@@ -74,7 +74,7 @@ function apply(ctx, config = {}) {
       force: { type: 'boolean', description: '确认丢弃旧计划里未完成的节点（默认 false）。仅在收到 409 且确认要丢弃时传 true。' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean' }, nodes: { type: 'array', items: { type: 'string' } }, errors: { type: 'array', items: { type: 'string' } }, workspace: { type: 'string' }, error: { type: 'string' }, hint: { type: 'string' }, dropped: { type: 'array', items: { type: 'object', additionalProperties: true, properties: { id: { type: 'string' }, status: { type: 'string' } } } } } },
+      schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean' }, nodes: { type: 'array', items: { type: 'string' } }, errors: { type: 'array', items: { type: 'string' } }, workspace: { type: 'string' }, error: { type: 'string' }, hint: { type: 'string' }, archived: { type: 'string' }, dropped: { type: 'array', items: { type: 'object', additionalProperties: true, properties: { id: { type: 'string' }, status: { type: 'string' } } } } } },
       render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 计划未替换：${v.error}${v.hint ? `\n${v.hint}` : ''}` : `任务线已保存，节点：${(v.nodes || []).join(', ')}` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/plan?ws=${encodeURIComponent(wsOf(args, exec))}`, {
@@ -156,7 +156,7 @@ function apply(ctx, config = {}) {
       ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, code: { type: 'number' }, killed: { type: 'boolean' }, ms: { type: 'number' }, log: { type: 'string' }, error: { type: 'string' } } },
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, code: { type: 'number' }, killed: { type: 'boolean' }, secs: { type: 'number' }, ms: { type: 'number' }, log: { type: 'string' }, error: { type: 'string' } } },
       render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 探针未执行：${v.error}` : `${v.killed ? `⏱ ${v.secs || 30}s 超时被杀（输出为超时前内容）` : `退出码 ${v.code}`} · ${(Math.round((v.ms || 0) / 100) / 10).toString()}s\n${String(v.log || '').slice(-2000)}` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/probe?ws=${encodeURIComponent(wsOf(args, exec))}`, {
@@ -218,14 +218,28 @@ function apply(ctx, config = {}) {
       handoff: { type: 'boolean', description: 'false=交接已由你写好（推荐流程）；缺省 true=让最活跃的老会话写（多等 1~2 分钟）' },
     },
     output: {
-      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, archived: { type: 'number' }, created: { type: 'string' }, error: { type: 'string' } } },
+      // 2026-09-16 修：以前把 archived 声明成 number，但 /api/flip 返回的是**会话 id 数组** ⇒
+      // harness 校验失败报 "value.archived must be a number"，翻页被当作工具错误（实测两次均未执行）。
+      // 现在在 execute 里先整理成标量（archivedCount/matched），schema 与实际严格一致。
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, archivedCount: { type: 'number' }, matched: { type: 'number' }, created: { type: 'string' }, handoffNote: { type: 'string' }, error: { type: 'string' } } },
       render: (_a, v) => [{ type: 'text', text: v.error
         ? `翻页失败：${v.error}（旧会话未被归档、原样保留）`
-        : `翻页完成：归档 ${v.archived ?? '?'} 个，新会话 ${String(v.created || '').slice(0, 18)}…（已注入恢复提示）。提醒用户去 DSH 前台打开最新会话。` }],
+        : `翻页完成：归档 ${v.archivedCount ?? '?'}/${v.matched ?? '?'} 个，新会话 ${String(v.created || '').slice(0, 18)}…${v.handoffNote ? '；' + v.handoffNote : ''}（已注入恢复提示）。提醒用户去 DSH 前台打开最新会话。` }],
     },
-    execute: async (args, exec) => questCall(cfg(), `/api/flip?ws=${encodeURIComponent(args.ws || wsOf(args, exec))}`, {
-      method: 'POST', body: JSON.stringify({ handoff: args.handoff !== false }),
-    }, 240000),   // 含交接阶段（最长约 150s），别提前断
+    execute: async (args, exec) => {
+      const r = await questCall(cfg(), `/api/flip?ws=${encodeURIComponent(args.ws || wsOf(args, exec))}`, {
+        method: 'POST', body: JSON.stringify({ handoff: args.handoff !== false }),
+      }, 240000);   // 含交接阶段（最长约 150s），别提前断
+      if (r.error) return r;
+      return {
+        ok: r.ok,
+        archivedCount: Array.isArray(r.archived) ? r.archived.length : r.archived,
+        matched: typeof r.matched === 'number' ? r.matched : undefined,
+        created: r.created || '',
+        handoffNote: r.handoff && r.handoff.wrote ? '交接已写新鲜 ✓' : (r.handoff && r.handoff.note ? '交接：' + r.handoff.note : ''),
+        error: (r.errors && r.errors.length) ? r.errors.join('；').slice(0, 200) : undefined,
+      };
+    },
   }));
 
   ctx.tools.register(defineTool({
