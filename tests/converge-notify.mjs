@@ -113,7 +113,7 @@ const sb2 = await startSandbox({
     dshBaseUrl: `http://127.0.0.1:${DSH}`,
     dshToken: 'stub-token',
     runGate: { enabled: false },
-    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, presenceMin: 60, reopenTimes: [] } },
+    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, reopenTimes: [] } },
     quietMinutes: 0.05, sweepSeconds: 5,
   },
 });
@@ -124,19 +124,11 @@ try {
   const r = await sb2.api('POST', `/api/run?ws=${encodeURIComponent(WS2)}`, { command: 'node job.js', cwd: WS2, title: 'p-1', expect_minutes: 1 });
   await waitFor(async () => (await sb2.status(WS2)).find((n) => n.id === r.json.nodeId)?.status === 'completed', 30000);
 
-  // ⑤ 场景：用户刚聊过（工作区会话 5 分钟前有动静）→ 收敛判定可以成立，但自动收尾必须退避
+  // ⑤ 在场也照样触发（2026-09-16 定稿：开关是唯一闸门，不再猜在不在场；防重复=冷却+手动关）
   sessions = [{ sessionId: 'sess-main2', cwd: WS2, running: false, updatedAt: Date.now() - 5 * 60000 }];
-  await sleep(8000);   // 过静默窗 + 一轮巡检
-  s.check('⑤ 老板在场（5 分钟前有动静）→ 不自动收尾（手动汇报优先）', prompts.length === prompts2Before,
-    `prompts ${prompts2Before}→${prompts.length}`);
+  const firedP = await waitFor(() => prompts.length > prompts2Before, 40000, 1000);
+  s.check('⑤ 老板在场（5 分钟前有动静）→ 照样自动收尾（开关是唯一闸门）', firedP, `prompts ${prompts2Before}→${prompts.length}`);
 
-  // ⑥ 用户离开 90 分钟 → 无人值守 → 自动收尾接管。
-  //    注意：静默只对**新的账本活动**触发（防自我续期），所以先再跑一个节点"上膛"，再让会话显得久无动静
-  const r3 = await sb2.api('POST', `/api/run?ws=${encodeURIComponent(WS2)}`, { command: 'node job.js', cwd: WS2, title: 'p-2', expect_minutes: 1 });
-  await waitFor(async () => (await sb2.status(WS2)).find((n) => n.id === r3.json.nodeId)?.status === 'completed', 30000);
-  sessions = [{ sessionId: 'sess-main2', cwd: WS2, running: false, updatedAt: Date.now() - 90 * 60000 }];
-  const fired2 = await waitFor(() => prompts.length > prompts2Before, 40000, 1000);
-  s.check('⑥ 老板离场（90 分钟无动静）→ 自动收尾唤醒', fired2, `prompts ${prompts2Before}→${prompts.length}`);
 } finally {
   sb2.stop();
 }

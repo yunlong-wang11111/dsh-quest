@@ -1580,7 +1580,7 @@ function lineActivity(state) {
  * 收尾自动开关（2026-09-16 用户定稿的"buff 式"语义）：
  *   · 自动收尾**默认开**；按钮/QQ 命令是开关（on/off），不是一次性触发；
  *   · 每天 reopenTimes（如 ["12:00","23:00"]）各重开一次——手动关了忘记开也没关系；
- *     重开后的下一次收敛**免等在场守卫**（presenceMin 直接跳过）；
+ *   · 在场守卫已删（2026-09-16 定稿：开关是唯一闸门，不再猜在不在场）；
  *   · 冷却（cooldownMin）防刷屏。状态按工作区持久化到 converge-state.json。
  */
 const CONVERGE_STATE_FILE = () => path.join(HOMEOverride, 'converge-state.json');
@@ -1594,7 +1594,7 @@ function convergeAutoOn(wsKey) {
   const st = loadConvergeState()[wsKey] || {};
   return st.auto !== false;   // 缺省=开（buff 默认生效；只有显式 off 才关）
 }
-/** 每日定时重开：过了任一 reopenTime 且今天还没重开过 → 开 + 免等在场（2 小时内巡检到都算，防错过）。 */
+/** 每日定时重开：过了任一 reopenTime 且今天还没重开过 → 开（2 小时内巡检到都算，防错过）。 */
 function checkReopenConverge(wsKey, nc) {
   const times = Array.isArray(nc?.reopenTimes) ? nc.reopenTimes : [];
   if (!times.length) return false;
@@ -1612,7 +1612,6 @@ function checkReopenConverge(wsKey, nc) {
       const wasOff = cur2.auto === false;
       cur2.lastReopen = dayKey;
       cur2.auto = true;
-      cur2.skipPresenceUntil = Date.now() + 30 * 60000;   // 重开后首次收敛免等在场
       saveConvergeState(all);
       if (wasOff) log(`converge ${wsKey}: 定时(${t})重开自动收尾（之前被手动关过）`);
       return true;
@@ -1643,19 +1642,11 @@ async function sendConvergePrompt(wsKey, wsPath, info, sid, { manual = false } =
 async function maybeNotifyConverge(wsKey, st, info) {
   const nc = CFG.notify?.converge;
   if (nc && nc.enabled === false) return;   // 配置级总闸（缺省开）
-  checkReopenConverge(wsKey, nc);           // 每日定时重开（12:00/23:00 这类；重开后首收敛免等在场）
-  if (!convergeAutoOn(wsKey)) return;       // 手动关着的 buff 不触发（等定时重开）
+  checkReopenConverge(wsKey, nc);           // 每日定时重开（12:00/23:00 这类；手动关了忘记开也没关系）
+  if (!convergeAutoOn(wsKey)) return;       // 唯一闸门=开关（buff 式：默认开，手动关才关——2026-09-16 用户定稿）
   const cooldownMs = Math.max(5, Number(nc?.cooldownMin) || 30) * 60000;
   const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
-  if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒
-  // 老板在场守卫（防与手动汇报重复）：工作区会话最近 presenceMin 分钟内有过动静 ⇒ 用户在场、会自己要总结。
-  // 定时重开后的 30 分钟免等（skipPresenceUntil）。跳过只 log 不写账本（防自我续期静默判定）。
-  const skip = (() => { const s = (loadConvergeState()[wsKey] || {}).skipPresenceUntil || 0; return Date.now() < s; })();
-  const presenceMin = Number(nc?.presenceMin ?? 60);
-  if (!skip && presenceMin > 0 && info.dsh && info.dsh.idleMinutes != null && info.dsh.idleMinutes < presenceMin) {
-    log(`notify.converge ${wsKey} 跳过：会话 ${info.dsh.idleMinutes} 分钟前有动静（老板在场，手动汇报优先）`);
-    return;
-  }
+  if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒（防重复靠冷却+手动关，不再猜在不在场）
   const wsPath = (() => { try { return parsePlan(st.plan).meta?.workspace || ''; } catch { return ''; } })();
   try {
     const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
@@ -2619,13 +2610,12 @@ const server = http.createServer(async (req, res) => {
         const action = String(b.action || 'toggle');
         const auto = action === 'on' ? true : action === 'off' ? false : !(cur.auto !== false);
         stateAll[wsKey] = { ...cur, auto };
-        if (auto) delete stateAll[wsKey].skipPresenceUntil; else stateAll[wsKey].skipPresenceUntil = 0;
         saveConvergeState(stateAll);
         appendEvent(wsKey, { t: 'converge.toggle', auto });
         return json(200, {
           ok: true, auto,
           note: auto
-            ? '自动收尾已开：全部节点终态 + 冷却后自动做全局总结（你在场 60 分钟内仍会让位给手动汇报；每日 ' + ((CFG.notify?.converge?.reopenTimes ?? []).join('/') || '—') + ' 定时重开）'
+            ? '自动收尾已开：全部节点终态 + 冷却后自动做全局总结（开关是唯一闸门，冷却内不重复；每日 ' + ((CFG.notify?.converge?.reopenTimes ?? []).join('/') || '—') + ' 定时重开）'
             : '自动收尾已关（一次性总结仍可用控制台收尾或 /q收尾 立即；' + ((CFG.notify?.converge?.reopenTimes ?? []).join('/') || '—') + ' 会自动帮你重开）',
         });
       }
