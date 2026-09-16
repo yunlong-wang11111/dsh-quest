@@ -94,6 +94,7 @@
   <span class="mut" id="wsNote" style="color:var(--warn)"></span>
   <span style="flex:1"></span>
   <button class="act" id="gateTop" style="display:none" onclick="document.getElementById('gate').scrollIntoView({behavior:'smooth'})">门禁 <b id="gateN"></b></button>
+  <button class="act" onclick="doFlip()" title="归档本工作区全部会话并开新会话：先让最活跃的老会话按模板写 research-state.md 交接，再归档、开新会话并注入恢复提示（读交接→查任务线→复述确认）。大约需要 1~3 分钟。">翻页</button>
   <button class="act" onclick="refreshAll()">刷新</button>
 </header>
 <nav>
@@ -746,6 +747,24 @@ async function pump() {
     } catch { $('#live').style.color = 'var(--bad)'; await new Promise((r) => setTimeout(r, 4000)); }
   }
 }
+// 翻页（2026-09-16）：把 QQ 的 /q翻页 搬到控制台——手机/网页上也能一键翻。
+// 确认框里把"会发生什么"说清楚；回执带交接结果（handoff.wrote / matched / archived）。
+async function doFlip() {
+  if (!curWs) { toast('没有选中工作区'); return; }
+  if (!confirm(`翻页当前工作区？\n\n会依次：①让最活跃的老会话把 research-state.md 写新鲜（按 9 节模板，最长约 2.5 分钟）\n②导出全部对话到 archive/flip-*.md（不删除）\n③归档该工作区全部会话\n④开新会话并注入恢复提示（读交接→查任务线→向你复述确认）\n\n翻完后要去 DSH 前台打开最新那条会话。继续？`)) return;
+  toast('翻页中（含交接阶段，最长约 3 分钟）…');
+  try {
+    const r = await post('/api/flip?ws=' + encodeURIComponent(curWs), {});
+    if (r.ok && r.created) {
+      const h = r.handoff || {};
+      toast(`翻页完成：归档 ${r.archived.length}/${r.matched ?? '?'} 个；新会话 ${String(r.created).slice(0, 16)}…${h.wrote ? '；交接已写新鲜 ✓' : '；交接未写成（' + (h.note || '') + '）'}`);
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      toast('翻页失败：' + ((r.errors || []).join('；') || '未知错误').slice(0, 160) + ' ——旧会话未被归档、原样保留');
+    }
+  } catch (e) { toast('翻页请求失败：' + e.message); }
+}
+
 async function refreshAll() {
   try { await loadWs(); await loadTasks(); fillLogNodes(); loadGate(); toast('已刷新'); }
   catch (e) { toast('刷新失败：' + e.message); }

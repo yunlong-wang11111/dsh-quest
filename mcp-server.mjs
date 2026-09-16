@@ -189,4 +189,27 @@ server.tool(
   },
 );
 
+server.tool(
+  'quest_flip',
+  [
+    '翻页：归档本工作区全部会话并开新会话（大上下文对话该翻篇时用，省 token 且恢复有保障）。',
+    '标准流程：①你先自己把工作区的 research-state.md 按 9 节模板重写好（目标/已定决策/进度/产物清单/坑/在跑/待办/用户口径/下一步）',
+    '②再以 handoff:false 调用本工具（交接已写好，不用再提示别的会话写）。',
+    '注意：只在用户明确要求翻页时调用；它会归档包括你自己在内的全部会话（归档≠删除，archive/flip-*.md 有全文）。若不先写交接就调用，服务端会尝试让最活跃的老会话写（约多等 1~2 分钟）。',
+  ].join(' '),
+  {
+    ws: z.string().describe('工作区绝对路径（一般=你的 cwd）'),
+    handoff: z.boolean().optional().describe('false=交接已由你写好，跳过提示老会话（推荐流程）；缺省 true'),
+  },
+  async ({ ws, handoff }) => {
+    const r = await q('POST', `/api/flip?ws=${encodeURIComponent(ws || '')}`, { handoff: handoff !== false }, 240000);
+    if (r.error) return fail(r);
+    return ok({
+      ok: r.ok, archived: (r.archived || []).length, matched: r.matched,
+      created: r.created, handoff: r.handoff || null, errors: r.errors || [],
+      note: '新会话已注入恢复提示（读交接→quest_status→向用户复述确认）。归档不删除：全文在 archive/flip-*.md。',
+    });
+  },
+);
+
 await server.connect(new StdioServerTransport());

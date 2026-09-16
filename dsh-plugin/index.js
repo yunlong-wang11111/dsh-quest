@@ -205,6 +205,30 @@ function apply(ctx, config = {}) {
   }));
 
   ctx.tools.register(defineTool({
+    name: 'quest_flip',
+    description: [
+      '翻页：归档本工作区全部会话并开新会话（大上下文对话该翻篇时用——省 token 且恢复有保障）。',
+      '标准流程：①你先自己把工作区的 research-state.md 按 9 节模板重写好（目标/已定决策/进度/产物清单/坑/在跑/待办/用户口径/下一步，写详细不写客气话）；',
+      '②再以 handoff:false 调用本工具（交接已写好，跳过提示其它会话）。',
+      '只在用户明确要求翻页时调用。它会归档包括你自己在内的全部会话（归档≠删除，archive/flip-*.md 留全文）。',
+      '新会话会被注入恢复提示：读交接 → quest_status → 向用户复述确认后才动手。',
+    ].join(' '),
+    parameters: {
+      ws: { type: 'string', description: '工作区绝对路径（一般=当前 cwd）' },
+      handoff: { type: 'boolean', description: 'false=交接已由你写好（推荐流程）；缺省 true=让最活跃的老会话写（多等 1~2 分钟）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, archived: { type: 'number' }, created: { type: 'string' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error
+        ? `翻页失败：${v.error}（旧会话未被归档、原样保留）`
+        : `翻页完成：归档 ${v.archived ?? '?'} 个，新会话 ${String(v.created || '').slice(0, 18)}…（已注入恢复提示）。提醒用户去 DSH 前台打开最新会话。` }],
+    },
+    execute: async (args, exec) => questCall(cfg(), `/api/flip?ws=${encodeURIComponent(args.ws || wsOf(args, exec))}`, {
+      method: 'POST', body: JSON.stringify({ handoff: args.handoff !== false }),
+    }, 240000),   // 含交接阶段（最长约 150s），别提前断
+  }));
+
+  ctx.tools.register(defineTool({
     name: 'quest_status',
     description: [
       '查询当前工作区任务线的全部节点状态（pending/running/completed/failed/timeout + 判定依据 + worker 总结）。',
