@@ -50,7 +50,7 @@ const sb = await startSandbox({
     dshBaseUrl: `http://127.0.0.1:${DSH}`,
     dshToken: 'stub-token',
     runGate: { enabled: false },
-    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5 } },   // 沙箱里显式开（生产默认关）
+    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, presenceMin: 0, autoWindows: [['00:00','23:59']] } },   // 第一幕关在场守卫（假会话 updatedAt=刚刚，会被误判在场）
     quietMinutes: 0.05, sweepSeconds: 5,
   },
 });
@@ -87,7 +87,7 @@ try {
     prompts.length >= 1 && prompts[prompts.length - 1].text.includes('line-summary') && prompts[prompts.length - 1].text.includes('只读与写总结'),
     'prompts=' + prompts.length);
   const ev = convEvents()[0];
-  s.check('② 事件记了目标会话且无错', ev && ev.sessionId && !ev.error, JSON.stringify(ev).slice(0, 120));
+  s.check('② 事件记了目标会话且无错', ev && ev.sessionId && !ev.error, JSON.stringify(ev ?? {}).slice(0, 120));
 
   // ③ 冷却：5 分钟内再收敛（再跑一个快节点又静默）→ line.quiet 可以再响，但绝不二次唤醒
   const promptsBefore = prompts.length;
@@ -104,6 +104,74 @@ try {
   s.check('④ 无关 cwd 且无父缘的在跑会话不拦本工作区', l4?.dsh?.total === 3 && l4?.dsh?.running === 0, JSON.stringify(l4?.dsh));
 } finally {
   sb.stop();
+}
+
+// ── 第二幕：老板在场守卫（防与手动汇报重复）────────────────────────────────
+const sb2 = await startSandbox({
+  name: 'converge-presence', port: 3135, wsDirs: ['ws'],
+  extraConfig: {
+    dshBaseUrl: `http://127.0.0.1:${DSH}`,
+    dshToken: 'stub-token',
+    runGate: { enabled: false },
+    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, presenceMin: 60, autoWindows: [['00:00','23:59']] } },
+    quietMinutes: 0.05, sweepSeconds: 5,
+  },
+});
+const WS2 = sb2.ws.ws;
+const prompts2Before = prompts.length;
+try {
+  fs.writeFileSync(path.join(WS2, 'job.js'), 'console.log(1);require("fs").writeFileSync("out.npz","x");\n');
+  const r = await sb2.api('POST', `/api/run?ws=${encodeURIComponent(WS2)}`, { command: 'node job.js', cwd: WS2, title: 'p-1', expect_minutes: 1 });
+  await waitFor(async () => (await sb2.status(WS2)).find((n) => n.id === r.json.nodeId)?.status === 'completed', 30000);
+
+  // ⑤ 场景：用户刚聊过（工作区会话 5 分钟前有动静）→ 收敛判定可以成立，但自动收尾必须退避
+  sessions = [{ sessionId: 'sess-main2', cwd: WS2, running: false, updatedAt: Date.now() - 5 * 60000 }];
+  await sleep(8000);   // 过静默窗 + 一轮巡检
+  s.check('⑤ 老板在场（5 分钟前有动静）→ 不自动收尾（手动汇报优先）', prompts.length === prompts2Before,
+    `prompts ${prompts2Before}→${prompts.length}`);
+
+  // ⑥ 用户离开 90 分钟 → 无人值守 → 自动收尾接管。
+  //    注意：静默只对**新的账本活动**触发（防自我续期），所以先再跑一个节点"上膛"，再让会话显得久无动静
+  const r3 = await sb2.api('POST', `/api/run?ws=${encodeURIComponent(WS2)}`, { command: 'node job.js', cwd: WS2, title: 'p-2', expect_minutes: 1 });
+  await waitFor(async () => (await sb2.status(WS2)).find((n) => n.id === r3.json.nodeId)?.status === 'completed', 30000);
+  sessions = [{ sessionId: 'sess-main2', cwd: WS2, running: false, updatedAt: Date.now() - 90 * 60000 }];
+  const fired2 = await waitFor(() => prompts.length > prompts2Before, 40000, 1000);
+  s.check('⑥ 老板离场（90 分钟无动静）→ 自动收尾唤醒', fired2, `prompts ${prompts2Before}→${prompts.length}`);
+} finally {
+  sb2.stop();
+}
+
+// ── 第三幕：手动收尾（/api/summarize）——不受窗口/冷却限制，排给本工作区最新会话 ──
+const sb3 = await startSandbox({
+  name: 'converge-manual', port: 3136, wsDirs: ['ws'],
+  extraConfig: {
+    dshBaseUrl: `http://127.0.0.1:${DSH}`,
+    dshToken: 'stub-token',
+    runGate: { enabled: false },
+    notify: { kind: 'off', converge: { enabled: true, autoWindows: [] } },   // 窗口为空=纯手动
+    quietMinutes: 0.05, sweepSeconds: 5,
+  },
+});
+const WS3 = sb3.ws.ws;
+const prompts3Before = prompts.length;
+try {
+  fs.writeFileSync(path.join(WS3, 'job.js'), 'console.log(1);require("fs").writeFileSync("out.npz","x");' + String.fromCharCode(10));
+  const r = await sb3.api('POST', `/api/run?ws=${encodeURIComponent(WS3)}`, { command: 'node job.js', cwd: WS3, title: 'm-1', expect_minutes: 1 });
+  await waitFor(async () => (await sb3.status(WS3)).find((n) => n.id === r.json.nodeId)?.status === 'completed', 30000);
+  // 工作区有一个"更新最新"的会话 sess-newest3（比 sess-old3 新）
+  sessions = [
+    { sessionId: 'sess-old3', cwd: WS3, running: false, updatedAt: Date.now() - 50 * 60000 },
+    { sessionId: 'sess-newest3', cwd: WS3, running: false, updatedAt: Date.now() },
+  ];
+  const m = await sb3.api('POST', `/api/summarize?ws=${encodeURIComponent(WS3)}`, {});
+  const createdBefore = created.length;
+  s.check('⑦ 手动收尾：排给本工作区最新的会话（不新开）', m.json?.ok === true && m.json.sessionId === 'sess-newest3' && created.length === createdBefore,
+    JSON.stringify(m.json).slice(0, 120));
+  s.check('⑦ 提示含排队语义与总结去向', /排队|忙则等/.test(String(m.json?.note || '')) && /line-summary/.test(String(m.json?.note || '')), String(m.json?.note || '').slice(0, 100));
+  const lastP = prompts[prompts.length - 1];
+  s.check('⑦ 指令带手动标记与只读闸', lastP?.sid === 'sess-newest3' && /手动点名/.test(lastP?.text || '') && /只读与写总结/.test(lastP?.text || ''), (lastP?.text || '').slice(0, 60));
+} finally {
+  sb3.stop();
 }
 stub.close();
 s.done();

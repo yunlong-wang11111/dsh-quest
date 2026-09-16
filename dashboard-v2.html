@@ -95,6 +95,7 @@
   <span style="flex:1"></span>
   <button class="act" id="gateTop" style="display:none" onclick="document.getElementById('gate').scrollIntoView({behavior:'smooth'})">门禁 <b id="gateN"></b></button>
   <button class="act" onclick="doFlip()" title="归档本工作区全部会话并开新会话：先让最活跃的老会话按模板写 research-state.md 交接，再归档、开新会话并注入恢复提示（读交接→查任务线→复述确认）。大约需要 1~3 分钟。">翻页</button>
+  <button class="act" onclick="doSummarize()" title="给本工作区最新的会话排一条全局总结指令：quest_status 拿全景→对照 research-state→写 line-summary-日期.md→8 行内复述。它忙则排队，不打断当前回合。">收尾</button>
   <button class="act" onclick="refreshAll()">刷新</button>
 </header>
 <nav>
@@ -389,7 +390,7 @@ function trkStateText(line) {
   const ago = (m) => (m == null ? '' : m < 1 ? `${Math.round(m * 60)} 秒前` : `${Math.round(m)} 分钟前`);
   if (line.dsh?.running) return { t: `子对话正在工作（${line.dsh.running} 个会话在跑）`, cls: 'busy' };
   const ws = line.workspace;
-  if (ws?.recent) return { t: `正在改代码（最近 ${ws.windowMinutes} 分钟改了 ${ws.recent} 个文件，最新 ${ws.latest?.name || '?'}）`, cls: 'busy' };
+  if (ws?.recent) return { t: `工作区有文件变动（最近 ${ws.windowMinutes} 分钟 ${ws.recent} 个，最新 ${ws.latest?.name || '?'}）——多半是任务在写产物，不一定是有人在改代码`, cls: 'busy' };
   if (line.active) return { t: `${line.active} 个任务在跑`, cls: 'busy' };
   if (line.quiet) return { t: '静默（收敛）', cls: 'quiet' };
   return { t: `刚有动作（${ago(line.idleMinutes)}）· 还没到静默窗口（${line.quietMinutes} 分钟）`, cls: '' };
@@ -763,6 +764,17 @@ async function doFlip() {
       toast('翻页失败：' + ((r.errors || []).join('；') || '未知错误').slice(0, 160) + ' ——旧会话未被归档、原样保留');
     }
   } catch (e) { toast('翻页请求失败：' + e.message); }
+}
+
+// 手动收尾（2026-09-16 用户定稿：手动优先于自动）：给最新会话排全局总结指令（queue 语义，忙则等）
+async function doSummarize() {
+  if (!curWs) { toast('没有选中工作区'); return; }
+  if (!confirm(`对本工作区做收尾总结？\n\n会给最新的会话排一条指令：quest_status 拿全景 → 对照 research-state → 写 line-summary-今天.md → 8 行内复述。\n它正在忙则排队（不打断当前回合）。继续？`)) return;
+  toast('收尾指令发送中…');
+  try {
+    const r = await post('/api/summarize?ws=' + encodeURIComponent(curWs), {});
+    toast(r.ok ? `已排给 ${String(r.sessionId).slice(0, 16)}…${r.created ? '（新会话）' : ''}：${r.note}` : '收尾失败：' + (r.error || ''));
+  } catch (e) { toast('收尾请求失败：' + e.message); }
 }
 
 async function refreshAll() {

@@ -1521,12 +1521,58 @@ function lineActivity(state) {
  *   "notify": { "kind": "...", "converge": { "enabled": true, "cooldownMin": 30, "targetSessionId": "" } }
  * targetSessionId 缺省=新开一个 cwd=工作区的收尾会话。
  */
+/** 当前时间是否落在自动窗口内（如 ["23:00","08:00"] 支持跨午夜）。windows 缺省/空 = 永不自动。 */
+function inAutoWindow(windows) {
+  if (!Array.isArray(windows) || !windows.length) return false;
+  const now = new Date();
+  const cur = now.getHours() * 60 + now.getMinutes();
+  for (const w of windows) {
+    const a = String(w?.[0] ?? ''), b = String(w?.[1] ?? '');
+    const [ah, am] = a.split(':').map(Number), [bh, bm] = b.split(':').map(Number);
+    if (!Number.isFinite(ah) || !Number.isFinite(bh)) continue;
+    const s = ah * 60 + (am || 0), e = bh * 60 + (bm || 0);
+    if (s === e) continue;
+    if (s < e ? (cur >= s && cur < e) : (cur >= s || cur < e)) return true;   // 跨午夜：起点在晚上、终点在早上
+  }
+  return false;
+}
+
+/** 发送收尾汇报提示到目标会话（自动/手动共用；queue 语义：目标忙则排队，绝不打断）。 */
+async function sendConvergePrompt(wsKey, wsPath, info, sid, { manual = false } = {}) {
+  const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+  const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+  const stamp = new Date().toISOString().slice(0, 10);
+  await api.sessions.prompt({
+    sessionId: sid, mode: 'queue',
+    content: [{ type: 'text', text: [
+      `【收尾汇报${manual ? '·用户手动点名' : '·定时自动'}】对当前工作区的任务线做一次全局总结。只做四件事，然后停下等用户：`,
+      '1. 调 quest_status（brief）拿任务线全景。',
+      '2. 若存在 research-state.md / progress.md，读它们对照既定目标。',
+      '3. 写 ' + (wsPath ? wsPath + '/' : '') + `line-summary-${stamp}.md：各节点成败与关键数字、与目标的差距、明显异常（数字互相矛盾/缺产物）、建议下一步（≤40 行）。`,
+      '4. 用 ≤8 行向我复述总结要点（会转给用户）。**不要开新实验、不要改任何脚本、不要派任务——只读与写总结。**',
+      `背景：共 ${info.nodes.length} 个节点，${Object.entries(info.counts).map(([k, v]) => v + ' ' + k).join(' / ') || '无终态'}。`,
+    ].join('\n') }],
+  });
+  return stamp;
+}
+
 async function maybeNotifyConverge(wsKey, st, info) {
   const nc = CFG.notify?.converge;
   if (!nc || nc.enabled !== true) return;
+  // 自动模式只在配置的时间窗口内活（2026-09-16 用户定稿：手动随时可点，自动只在他不在的时段开——
+  // 中午 12-15 / 夜里 23-08 这类；窗口缺省为空 = 纯手动，收敛判定的不可靠性从关键路径上摘掉）
+  if (!inAutoWindow(nc.autoWindows)) return;
   const cooldownMs = Math.max(5, Number(nc.cooldownMin) || 30) * 60000;
   const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
   if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒
+  // 老板在场守卫（2026-09-16，防与手动汇报重复）：工作区会话最近 presenceMin 分钟内有过动静
+  // ⇒ 用户在场、会自己要总结，自动收尾退避。只 log 不写账本（写了会自我续期静默判定）。
+  // presenceMin=0 关闭守卫；缺省 60。自动收尾由此定位成"无人值守"（过夜批跑）专用。
+  const presenceMin = Number(nc.presenceMin ?? 60);
+  if (presenceMin > 0 && info.dsh && info.dsh.idleMinutes != null && info.dsh.idleMinutes < presenceMin) {
+    log(`notify.converge ${wsKey} 跳过：会话 ${info.dsh.idleMinutes} 分钟前有动静（老板在场，手动汇报优先）`);
+    return;
+  }
   const wsPath = (() => { try { return parsePlan(st.plan).meta?.workspace || ''; } catch { return ''; } })();
   try {
     const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
@@ -1539,18 +1585,7 @@ async function maybeNotifyConverge(wsKey, st, info) {
       sid = r.result.value.sessionId;
       created = true;
     }
-    const stamp = new Date().toISOString().slice(0, 10);
-    await api.sessions.prompt({
-      sessionId: sid, mode: 'queue',
-      content: [{ type: 'text', text: [
-        '【收尾汇报】本工作区任务线已收敛（无在跑节点 · 账本安静 · 无人改代码 · 无会话在跑）。只做四件事，然后停下等用户：',
-        '1. 调 quest_status（brief）拿任务线全景。',
-        '2. 若存在 research-state.md / progress.md，读它们对照既定目标。',
-        '3. 写 ' + (wsPath ? wsPath + '/' : '') + `line-summary-${stamp}.md：各节点成败与关键数字、与目标的差距、明显异常（数字互相矛盾/缺产物）、建议下一步（≤40 行）。`,
-        '4. 用 ≤8 行向我复述总结要点（会转给用户）。**不要开新实验、不要改任何脚本、不要派任务——只读与写总结。**',
-        `背景：共 ${info.nodes.length} 个节点，${Object.entries(info.counts).map(([k, v]) => v + ' ' + k).join(' / ') || '无终态'}。`,
-      ].join('\n') }],
-    });
+    const stamp = await sendConvergePrompt(wsKey, wsPath, info, sid);
     appendEvent(wsKey, { t: 'notify.converge', sessionId: sid, created: created || undefined, counts: info.counts });
     if (notifyKind(CFG) !== 'off') {
       qqPush(wsKey, `[🏁 收尾汇报] 任务线已收敛（${info.nodes.length} 个节点）。已唤醒${created ? '新' : ''}收尾会话 ${String(sid).slice(0, 14)}… 做全局总结（AI 过一遍手），完成后写入 line-summary-${stamp}.md。`.slice(0, 300)).catch(() => {});
@@ -2487,6 +2522,44 @@ const server = http.createServer(async (req, res) => {
           ? `已冻结 ${freezable.length} 个未开跑节点，这条线的扳机卸了；重派其中任何一个即可解冻`
           : '没有未开跑的节点可冻',
       });
+    }
+    // 手动收尾（2026-09-16 用户定稿：手动优先于自动——按钮/QQ 命令随时点，queue 语义不打断对话）：
+    // 给目标会话（缺省=本工作区最新的会话，通常是你正在用的那条；没有则新开）排一条全局总结指令。
+    if (req.method === 'POST' && u.pathname === '/api/summarize') {
+      const b = await readBody(req);
+      const state = buildState(wsKey);
+      const info = lineActivity(state);
+      const wsPath = (() => { try { return parsePlan(state.plan || '').meta?.workspace || ws; } catch { return ws; } })();
+      try {
+        const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+        const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+        let sid = String(b.sessionId || '');
+        let created = false;
+        if (!sid) {
+          // 缺省目标：本工作区最新的会话（queue 语义：它忙就排队，绝不打断当前回合）
+          const lr = await api.sessions.list({});
+          const items = lr.result.ok ? (lr.result.value?.items ?? []) : [];
+          let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
+          const mine = items.filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
+          if (mine.length) {
+            sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
+          } else {
+            const r = await api.sessions.create({ cwd: wsPath || undefined });
+            if (!r.result.ok) throw new Error('create: ' + JSON.stringify(r.result.error ?? {}).slice(0, 120));
+            sid = r.result.value.sessionId;
+            created = true;
+          }
+        }
+        const stamp = await sendConvergePrompt(wsKey, wsPath, info, sid, { manual: true });
+        appendEvent(wsKey, { t: 'notify.converge', manual: true, sessionId: sid, created: created || undefined, counts: info.counts });
+        return json(200, {
+          ok: true, sessionId: sid, created,
+          note: created ? '工作区没有现存会话，已新开收尾会话' : `指令已排给 ${String(sid).slice(0, 18)}…（它忙则等当前回合结束后执行；总结将写入 line-summary-${stamp}.md）`,
+        });
+      } catch (e) {
+        appendEvent(wsKey, { t: 'notify.converge', manual: true, error: String(e?.message || e).slice(0, 160) });
+        return json(200, { ok: false, error: String(e?.message || e).slice(0, 200) });
+      }
     }
     // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
     if (req.method === 'POST' && u.pathname === '/api/cancel') {
