@@ -1641,11 +1641,11 @@ async function sendConvergePrompt(wsKey, wsPath, info, sid, { manual = false } =
   await api.sessions.prompt({
     sessionId: sid, mode: 'queue',
     content: [{ type: 'text', text: [
-      `【收尾汇报${manual ? '·用户手动点名' : '·定时自动'}】对当前工作区的任务线做一次全局总结。只做四件事，然后停下等用户：`,
+      `【收尾汇报${manual ? '·用户手动点名' : '·定时自动'}】对当前工作区的任务线做一次全局总结。只做四件事，然后停下：`,
       '1. 调 quest_status（brief）拿任务线全景。',
       '2. 若存在 research-state.md / progress.md，读它们对照既定目标。',
       '3. 写 ' + (wsPath ? wsPath + '/' : '') + `line-summary-${stamp}.md：各节点成败与关键数字、与目标的差距、明显异常（数字互相矛盾/缺产物）、建议下一步（≤40 行）。`,
-      '4. 用 ≤8 行向我复述总结要点（会转给用户）。**不要开新实验、不要改任何脚本、不要派任务——只读与写总结。**',
+      '4. 用 ≤8 行复述总结要点（会转给主对话，由它决定是否继续推进）。**只读与写总结，不要开新实验、不要派任务——推进由主对话负责。**',
       `背景：共 ${info.nodes.length} 个节点，${Object.entries(info.counts).map(([k, v]) => v + ' ' + k).join(' / ') || '无终态'}。`,
     ].join('\n') }],
   });
@@ -1707,7 +1707,7 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false } = {}
     content: [{ type: 'text', text: [
       `【全线收敛·总结已完成${manual ? '·手动' : ''}】任务线全部结束（${info.nodes.length} 节点：${Object.entries(info.counts).map(([k, v]) => v + ' ' + k).join(' / ')}）。`,
       wrote ? `全局总结已由收尾会话写入 line-summary-${stamp}.md。要点：\n${headline}` : `收尾会话可能超时，总结文件在 line-summary-${stamp}.md（自己去读）。`,
-      '请向用户复述要点并建议下一步（≤8 行），然后**停下等用户决定**——不要自行开新实验或派任务。',
+      '**接下来自动推进**：读 research-state.md 的待办清单——有下一项就直接写新 plan 派发（不用等用户）；全部完成或遇到需拍板的事项才向用户复述并等待。',
     ].join('\n') }],
   });
   log(`converge ${wsKey}: 已通知主对话 ${String(mainSid).slice(8, 16)}（总结${wrote ? '✓' : '超时'}）`);
@@ -2223,7 +2223,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.2.0',
+        unread, questVersion: '0.6.0',
       });
     }
     // 历史计划列表（2026-09-14）：控制台用下拉栏调出以前那些短流程 plan。

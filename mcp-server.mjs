@@ -49,7 +49,7 @@ async function q(method, pathname, body, timeoutMs = 60000) {
 const ok = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] });
 const fail = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }], isError: true });
 
-const server = new McpServer({ name: 'quest', version: '0.5.0' });
+const server = new McpServer({ name: 'quest', version: '0.6.0' });
 
 server.tool(
   'quest_plan',
