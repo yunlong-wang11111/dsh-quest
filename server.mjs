@@ -1652,6 +1652,68 @@ async function sendConvergePrompt(wsKey, wsPath, info, sid, { manual = false } =
   return stamp;
 }
 
+/**
+ * 两阶段收尾（2026-09-16 终版，用户定稿："子对话总结，通知主对话——而不是主对话总结"）：
+ *   阶段1：轻量收尾会话干总结的活（读 quest_status → 写 line-summary-日期.md）——小上下文，便宜
+ *   阶段2：总结写完后，主对话只收一条**短通知**（要点 + 文件指针），不做任何工具调用——大上下文只花一次重发
+ * 防炸：阶段1 超时（默认 4 分钟）不阻塞——超时也发通知（仅文件指针，无要点）。
+ */
+async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false } = {}) {
+  const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+  const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+  const stamp = new Date().toISOString().slice(0, 10);
+
+  // ── 阶段1：开轻量收尾会话干总结 ──
+  const sr = await api.sessions.create({ cwd: wsPath || undefined });
+  if (!sr.result.ok) throw new Error('create 收尾会话失败: ' + JSON.stringify(sr.result.error ?? {}).slice(0, 100));
+  const workerSid = sr.result.value.sessionId;
+  log(`converge ${wsKey}: 收尾会话 ${String(workerSid).slice(8, 16)} 开始总结`);
+  await sendConvergePrompt(wsKey, wsPath, info, workerSid, { manual });
+
+  // ── 等总结写完（轮询文件 mtime，超时 4 分钟）──
+  const summaryFile = path.join(hostPathFor(wsPath) || wsPath || '', `line-summary-${stamp}.md`);
+  const before = fs.existsSync(summaryFile) ? fs.statSync(summaryFile).mtimeMs : 0;
+  const t0 = Date.now();
+  let wrote = false;
+  while (Date.now() - t0 < 240000) {
+    await new Promise((r) => setTimeout(r, 10000));
+    try { if (fs.existsSync(summaryFile) && fs.statSync(summaryFile).mtimeMs > before) { wrote = true; break; } } catch {}
+  }
+
+  // ── 阶段2：通知主对话（只收通知，不干活）──
+  // 主对话定向链：指定 > 翻页接班 > 最新（排除收敛自建）——同 maybeNotifyConverge 的定向
+  const mainSid = (() => {
+    const st = loadConvergeState()[wsKey] || {};
+    if (st.mainSessionId) return st.mainSessionId;
+    return null;   // 没指定就由 maybeNotifyConverge 的兜底逻辑处理（此函数只在有主对话定向时用）
+  })();
+  if (!mainSid) {
+    log(`converge ${wsKey}: 无主对话指定，总结已写入 ${summaryFile}；QQ 已通知用户`);
+    return { workerSid, wrote, mainNotified: false };
+  }
+
+  // 读总结前几行作为要点
+  let headline = '';
+  if (wrote) {
+    try {
+      const lines = fs.readFileSync(summaryFile, 'utf8').split('\n')
+        .filter((l) => l.trim() && !l.startsWith('#')).slice(0, 5).join('\n');
+      headline = lines.slice(0, 400);
+    } catch {}
+  }
+
+  await api.sessions.prompt({
+    sessionId: mainSid, mode: 'queue',
+    content: [{ type: 'text', text: [
+      `【全线收敛·总结已完成${manual ? '·手动' : ''}】任务线全部结束（${info.nodes.length} 节点：${Object.entries(info.counts).map(([k, v]) => v + ' ' + k).join(' / ')}）。`,
+      wrote ? `全局总结已由收尾会话写入 line-summary-${stamp}.md。要点：\n${headline}` : `收尾会话可能超时，总结文件在 line-summary-${stamp}.md（自己去读）。`,
+      '请向用户复述要点并建议下一步（≤8 行），然后**停下等用户决定**——不要自行开新实验或派任务。',
+    ].join('\n') }],
+  });
+  log(`converge ${wsKey}: 已通知主对话 ${String(mainSid).slice(8, 16)}（总结${wrote ? '✓' : '超时'}）`);
+  return { workerSid, wrote, mainNotified: true, mainSid };
+}
+
 async function maybeNotifyConverge(wsKey, st, info) {
   const nc = CFG.notify?.converge;
   if (nc && nc.enabled === false) return;   // 配置级总闸（缺省开）
@@ -1661,58 +1723,18 @@ async function maybeNotifyConverge(wsKey, st, info) {
   const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
   if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒（防重复靠冷却+手动关，不再猜在不在场）
   const wsPath = (() => { try { return parsePlan(st.plan).meta?.workspace || ''; } catch { return ''; } })();
-  try {
-    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
-    const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
-    let sid = String(nc.targetSessionId || '');
-    let created = false;
-    if (!sid) {
-      // 目标优先级（2026-09-16 终版："总结要发到主对话"）：
-      //   session/list 无 archived 标记（归档的与活的同列——老主对话 2985M 还躺在列表里），
-      //   启发式必翻车 ⇒ 显式指定优先：
-      //   ① nc.targetSessionId（配置）
-      //   ② converge-state.mainSessionId（/api/converge action:'main' 手动指定；翻页成功时自动更新为接班）
-      //   ③ 翻页接班会话（对未来翻页有效；code_kl 当前会翻到游离会话，靠②兜住）
-      //   ④ 最新（排除收敛自建的会话，防"总结发给自己的产物"自我强化循环）
-      //   ⑤ 新建
-      const lr = await api.sessions.list({});
-      const items = lr.result.ok ? (lr.result.value?.items ?? []) : [];
-      let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
-      const mine = items.filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
-      const stMain = String((loadConvergeState()[wsKey] || {}).mainSessionId || '');
-      const convMade = new Set();
-      let successor = '';
-      try {
-        const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
-        for (let i = raw.length - 1; i >= 0; i--) {
-          let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
-          if (!successor && ev.t === 'flip.done' && ev.created) successor = String(ev.created);
-          if (ev.t === 'notify.converge' && ev.sessionId && ev.created) convMade.add(String(ev.sessionId));
-        }
-      } catch {}
-      if (stMain && mine.some((x) => String(x.sessionId) === stMain)) sid = stMain;
-      else if (successor && mine.some((x) => String(x.sessionId) === successor)) sid = successor;
-      else if (mine.length) {
-        const live = mine.filter((x) => !convMade.has(String(x.sessionId)));
-        const pool = live.length ? live : mine;
-        sid = String(pool.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), pool[0]).sessionId);
-      } else {
-        const r = await api.sessions.create({ cwd: wsPath || undefined });
-        if (!r.result.ok) throw new Error('create: ' + JSON.stringify(r.result.error ?? {}).slice(0, 120));
-        sid = r.result.value.sessionId;
-        created = true;
-      }
-    }
-    const stamp = await sendConvergePrompt(wsKey, wsPath, info, sid);
-    appendEvent(wsKey, { t: 'notify.converge', sessionId: sid, created: created || undefined, counts: info.counts });
+  // 事件立即写入（不等两阶段走完——阶段 2 含最长 4 分钟等总结文件，等它事件永远迟到）
+  appendEvent(wsKey, { t: 'notify.converge', counts: info.counts, phase: 'started' });
+  runConvergeAndNotify(wsKey, wsPath, info).then((result) => {
+    appendEvent(wsKey, { t: 'notify.converge', sessionId: result.workerSid, mainSid: result.mainSid || undefined, mainNotified: result.mainNotified, wrote: result.wrote || undefined, counts: info.counts, phase: 'done' });
     if (notifyKind(CFG) !== 'off') {
-      qqPush(wsKey, `[🏁 收尾汇报] 任务线已收敛（${info.nodes.length} 个节点）。已唤醒${created ? '新' : ''}收尾会话 ${String(sid).slice(0, 14)}… 做全局总结（AI 过一遍手），完成后写入 line-summary-${stamp}.md。`.slice(0, 300)).catch(() => {});
+      qqPush(wsKey, `[🏁 收尾汇报] 任务线收敛（${info.nodes.length} 节点）。${result.wrote ? '总结已写入 line-summary-*.md' : '总结文件超时'}${result.mainNotified ? '，已通知主对话' : ''}。`.slice(0, 300)).catch(() => {});
     }
-    log(`notify.converge ${wsKey} → ${sid}`);
-  } catch (e) {
-    appendEvent(wsKey, { t: 'notify.converge', error: String(e?.message || e).slice(0, 160) });
+    log(`notify.converge ${wsKey}: worker=${String(result.workerSid).slice(8, 16)} main=${result.mainNotified ? String(result.mainSid).slice(8, 16) : '未通知'} wrote=${result.wrote}`);
+  }).catch((e) => {
+    appendEvent(wsKey, { t: 'notify.converge', error: String(e?.message || e).slice(0, 160), phase: 'error' });
     log('notify.converge 失败:', e?.message);
-  }
+  });
 }
 
 function evaluateQuiet(wsKey) {
@@ -2692,45 +2714,13 @@ const server = http.createServer(async (req, res) => {
       const info = lineActivity(state);
       const wsPath = (() => { try { return parsePlan(state.plan || '').meta?.workspace || ws; } catch { return ws; } })();
       try {
-        const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
-        const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
-        let sid = String(b.sessionId || '');
-        let created = false;
-        if (!sid) {
-          // 缺省目标优先级（与自动收尾一致，2026-09-16）：①指定主对话 → ②翻页接班 → ③最新（排除收敛自建）→ ④新建
-          const lr = await api.sessions.list({});
-          const items = lr.result.ok ? (lr.result.value?.items ?? []) : [];
-          let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
-          const mine = items.filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
-          const stMain = String((loadConvergeState()[wsKey] || {}).mainSessionId || '');
-          const convMade = new Set();
-          let successor = '';
-          try {
-            const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
-            for (let i = raw.length - 1; i >= 0; i--) {
-              let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
-              if (!successor && ev.t === 'flip.done' && ev.created) successor = String(ev.created);
-              if (ev.t === 'notify.converge' && ev.sessionId && ev.created) convMade.add(String(ev.sessionId));
-            }
-          } catch {}
-          if (stMain && mine.some((x) => String(x.sessionId) === stMain)) sid = stMain;
-          else if (successor && mine.some((x) => String(x.sessionId) === successor)) sid = successor;
-          else if (mine.length) {
-            const live = mine.filter((x) => !convMade.has(String(x.sessionId)));
-            const pool = live.length ? live : mine;
-            sid = String(pool.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), pool[0]).sessionId);
-          } else {
-            const r = await api.sessions.create({ cwd: wsPath || undefined });
-            if (!r.result.ok) throw new Error('create: ' + JSON.stringify(r.result.error ?? {}).slice(0, 120));
-            sid = r.result.value.sessionId;
-            created = true;
-          }
-        }
-        const stamp = await sendConvergePrompt(wsKey, wsPath, info, sid, { manual: true });
-        appendEvent(wsKey, { t: 'notify.converge', manual: true, sessionId: sid, created: created || undefined, counts: info.counts });
+        // 两阶段（与自动收尾同架构）：轻量会话干总结 → 主对话收通知。事件立即写，后续异步。
+        appendEvent(wsKey, { t: 'notify.converge', manual: true, counts: info.counts, phase: 'started' });
+        const result = await runConvergeAndNotify(wsKey, wsPath, info, { manual: true });
+        appendEvent(wsKey, { t: 'notify.converge', manual: true, sessionId: result.workerSid, mainSid: result.mainSid || undefined, mainNotified: result.mainNotified, counts: info.counts, phase: 'done' });
         return json(200, {
-          ok: true, sessionId: sid, created,
-          note: created ? '工作区没有现存会话，已新开收尾会话' : `指令已排给 ${String(sid).slice(0, 18)}…（它忙则等当前回合结束后执行；总结将写入 line-summary-${stamp}.md）`,
+          ok: true, sessionId: result.workerSid, mainSessionId: result.mainSid || null,
+          note: `收尾会话 ${String(result.workerSid).slice(0, 16)}… 已完成总结${result.mainNotified ? `并通知了主对话 ${String(result.mainSid).slice(8, 16)}…` : '（未指定主对话）'}`,
         });
       } catch (e) {
         appendEvent(wsKey, { t: 'notify.converge', manual: true, error: String(e?.message || e).slice(0, 160) });

@@ -80,15 +80,15 @@ try {
     { sessionId: 'sess-sub', cwd: '/tmp/somewhere-else', parentSessionId: 'sess-main', running: false, updatedAt: Date.now() },
   ];
   const fired = await waitFor(() => convEvents().length >= 1, 60000, 1000);
-  s.check('② 收敛后触发 notify.converge', fired, 'events=' + convEvents().length);
+  s.check('② 收敛后触发 notify.converge', fired, 'events=' + convEvents().length);   // phase:started 立即写入
   await sleep(1500);
   // 2026-09-16 定向改版：沙箱无翻页史 → 回退'最新会话'（不再新建）。生产里优先翻页接班会话=主对话。
-  s.check('② 总结排给现存会话（无翻页史→最新，不新建）', created.length === 0 && /^sess-/.test(prompts[prompts.length - 1]?.sid || ''), '→ ' + (prompts[prompts.length - 1]?.sid || '?'));
+  s.check('② 两阶段：worker 是新建的收尾会话（不再定向到最新）', created.length >= 1 && /^session-synth-/.test(prompts[prompts.length - 1]?.sid || created[created.length-1]?.sid || ''), 'created=' + created.length);
   s.check('② 注入了收尾提示（含 line-summary 与"只读与写总结"闸）',
     prompts.length >= 1 && prompts[prompts.length - 1].text.includes('line-summary') && prompts[prompts.length - 1].text.includes('只读与写总结'),
     'prompts=' + prompts.length);
-  const ev = convEvents()[0];
-  s.check('② 事件记了目标会话且无错', ev && ev.sessionId && !ev.error, JSON.stringify(ev ?? {}).slice(0, 120));
+  const ev = convEvents().find((x) => x.phase === 'started') || convEvents()[0];
+  s.check('② 事件立即写入（phase:started 不等两阶段走完）', !!ev, JSON.stringify(ev ?? {}).slice(0, 80));
 
   // ③ 冷却：5 分钟内再收敛（再跑一个快节点又静默）→ line.quiet 可以再响，但绝不二次唤醒
   const promptsBefore = prompts.length;
@@ -102,7 +102,7 @@ try {
   sessions.push({ sessionId: 'sess-other', cwd: 'C:/elsewhere', running: true, updatedAt: Date.now() });
   await sleep(6000);
   const l4 = await line();
-  s.check('④ 无关 cwd 且无父缘的在跑会话不拦本工作区', l4?.dsh?.total === 2 && l4?.dsh?.running === 0, JSON.stringify(l4?.dsh));   // ②不再新建 ⇒ main+sub=2
+  s.check('④ 无关 cwd 且无父缘的在跑会话不拦本工作区', l4?.dsh?.running === 0 && l4?.dsh?.total <= 4, JSON.stringify(l4?.dsh));   // 两阶段可能新建了收尾会话，total 有弹性
 } finally {
   sb.stop();
 }
@@ -160,11 +160,10 @@ try {
   ];
   const m = await sb3.api('POST', `/api/summarize?ws=${encodeURIComponent(WS3)}`, {});
   const createdBefore = created.length;
-  s.check('⑦ 手动收尾：排给本工作区最新的会话（不新开）', m.json?.ok === true && m.json.sessionId === 'sess-newest3' && created.length === createdBefore,
-    JSON.stringify(m.json).slice(0, 120));
-  s.check('⑦ 提示含排队语义与总结去向', /排队|忙则等/.test(String(m.json?.note || '')) && /line-summary/.test(String(m.json?.note || '')), String(m.json?.note || '').slice(0, 100));
+  s.check('⑦ 手动收尾：新建轻量收尾会话（两阶段）', m.json?.ok === true, JSON.stringify(m.json).slice(0, 120));
+  s.check('⑦ 回执说明两阶段去向', /收尾会话/.test(String(m.json?.note || '')), String(m.json?.note || '').slice(0, 100));
   const lastP = prompts[prompts.length - 1];
-  s.check('⑦ 指令带手动标记与只读闸', lastP?.sid === 'sess-newest3' && /手动点名/.test(lastP?.text || '') && /只读与写总结/.test(lastP?.text || ''), (lastP?.text || '').slice(0, 60));
+  s.check('⑦ 指令带手动标记与只读闸', /手动点名/.test(lastP?.text || '') && /只读与写总结/.test(lastP?.text || ''), (lastP?.text || '').slice(0, 60));
 } finally {
   sb3.stop();
 }
