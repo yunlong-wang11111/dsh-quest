@@ -2222,6 +2222,10 @@ const server = http.createServer(async (req, res) => {
     // 流程：AI 先写好 research-state.md → 调本端点 → 本端点做会话切换
     if (req.method === 'POST' && u.pathname === '/api/flip') {
       const b = await readBody(req);
+      // ws 双通道兜底（2026-09-16 事故）：桥放 body.ws，插件放 URL query —— 以前只读 body，
+      // 插件不显式传 ws 且 wsOf(exec) 取不到 cwd 时 b.ws=undefined ⇒ matched=0、create 进默认目录
+      // （AI 两次翻页各建出一个游离会话、一个会话都没归档，就是它）。现在 query/body 谁有听谁的。
+      b.ws = b.ws || u.searchParams.get('ws') || '';
       const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
       const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
       const results = { archived: [], created: null, errors: [], exported: null, handoff: null };

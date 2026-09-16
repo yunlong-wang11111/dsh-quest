@@ -227,8 +227,9 @@ function apply(ctx, config = {}) {
         : `翻页完成：归档 ${v.archivedCount ?? '?'}/${v.matched ?? '?'} 个，新会话 ${String(v.created || '').slice(0, 18)}…${v.handoffNote ? '；' + v.handoffNote : ''}（已注入恢复提示）。提醒用户去 DSH 前台打开最新会话。` }],
     },
     execute: async (args, exec) => {
-      const r = await questCall(cfg(), `/api/flip?ws=${encodeURIComponent(args.ws || wsOf(args, exec))}`, {
-        method: 'POST', body: JSON.stringify({ handoff: args.handoff !== false }),
+      const ws = args.ws || wsOf(args, exec) || '';
+      const r = await questCall(cfg(), `/api/flip?ws=${encodeURIComponent(ws)}`, {
+        method: 'POST', body: JSON.stringify({ ws, handoff: args.handoff !== false }),   // ws 同时放 body（服务端双通道）
       }, 240000);   // 含交接阶段（最长约 150s），别提前断
       if (r.error) return r;
       return {
