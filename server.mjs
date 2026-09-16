@@ -2657,7 +2657,7 @@ const server = http.createServer(async (req, res) => {
       const stateAll = loadConvergeState();
       const cur = stateAll[wsKey] || {};
       if (req.method === 'GET') {
-        return json(200, { ok: true, auto: cur.auto !== false, reopenTimes: CFG.notify?.converge?.reopenTimes ?? [] });
+        return json(200, { ok: true, auto: cur.auto !== false, mainSessionId: cur.mainSessionId || null, reopenTimes: CFG.notify?.converge?.reopenTimes ?? [] });
       }
       if (req.method === 'POST') {
         const b = await readBody(req);
