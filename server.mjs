@@ -1009,6 +1009,58 @@ function handleNodeExit(wsKey, node, ctx) {
   }
 }
 
+/**
+ * 第 2 级·失败上报（2026-09-16）：节点失败（且没有 auto_fix 修复会话接手）时，
+ * 给本工作区**最新的会话**（通常是派发任务的主对话）排一条指针式短讯。
+ * 为什么需要：QQ 通知只到用户手机；派发任务的 AI 若收不到失败，就永远蒙在鼓里（除非主动拉）。
+ * 防轰炸：逐工作区冷却（默认 10 分钟，config notify.escalate.cooldownMin）；消息只带指针不带日志。
+ * queue 语义：目标忙则排队，不打断当前回合。默认开（notify.escalate.enabled=false 可关）。
+ */
+async function maybeNotifyFailure(wsKey, node, j, summary) {
+  const ne = CFG.notify?.escalate;
+  if (ne && ne.enabled === false) return;
+  const cooldownMs = Math.max(1, Number(ne?.cooldownMin) || 10) * 60000;
+  // 冷却判据直接读账本原文：notify.escalate 带着 node 字段，buildState 会把它归进节点事件
+  // （lineEvents 查不到——测试②正是抓出这个），扫原文最稳。
+  let lastEscAt = 0;
+  try {
+    const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+    for (let i = raw.length - 1; i >= 0; i--) {
+      let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+      if (ev.t === 'notify.escalate') { lastEscAt = tsOf(ev.at); break; }
+    }
+  } catch {}
+  if (lastEscAt && Date.now() - lastEscAt < cooldownMs) return;   // 冷却内：这批失败靠 QQ/收敛汇报兜底
+  const st = buildState(wsKey);
+  const wsPath = (() => { try { return parsePlan(st.plan || '').meta?.workspace || ''; } catch { return ''; } })();
+  try {
+    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+    const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    // 目标：本工作区最新会话（queue；没有则放弃——不值得为一条失败上报新开会话）
+    const lr = await api.sessions.list({});
+    if (!lr.result.ok) return;
+    let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
+    const mine = (lr.result.value?.items ?? []).filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
+    if (!mine.length) return;
+    const sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
+    await api.sessions.prompt({
+      sessionId: sid, mode: 'queue',
+      content: [{ type: 'text', text: [
+        `❌【失败上报】节点 ${node.id} 判定 ${j.verdict}（${j.via || '无判定路径'}）${runSecText(j)}`,
+        String(summary || j.detail || '').slice(0, 200) || '（无摘要）',
+        '详情：quest_log 读该节点日志尾；判据/产物情况见 quest_status。',
+        '如果你是派发者：定位修复后 quest_dispatch 重派；与本线无关请忽略本消息。',
+      ].join('\n') }],
+    });
+    appendEvent(wsKey, { t: 'notify.escalate', node: node.id, verdict: j.verdict, sessionId: sid });
+    log(`notify.escalate ${wsKey}: ${node.id} → ${sid}`);
+  } catch (e) {
+    appendEvent(wsKey, { t: 'notify.escalate', node: node.id, error: String(e?.message || e).slice(0, 140) });
+    log('notify.escalate 失败:', e?.message);
+  }
+}
+const runSecText = (j) => (j.runSec != null ? ` · 跑了 ${Math.round(j.runSec)}s` : '');
+
 /** 判定后的收尾：worker 总结（P2）→ 账本终结 → QQ（P3）→ 收件箱。 */
 async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() - runSec * 1000) {
   let summary = '';
@@ -1017,6 +1069,9 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   }
   const ok = j.verdict === 'ok';
   try { appendEvent(wsKey, { t: ok ? 'node.completed' : 'node.failed', node: node.id, verdict: j.verdict }); } catch (e) { log('落账本失败:', e?.message); }
+  // 第 2 级·失败上报（2026-09-16 用户定稿）：失败要报告给派发它的主对话——否则派发者永远蒙在鼓里。
+  // 指针式短讯（不带日志）+ 冷却防轰炸；目标=本工作区最新会话（queue 语义，忙则等）。auto_fix 已接手的跳过（修复者自己知道）。
+  if (!ok && !node.quiet && !node.autoFix) maybeNotifyFailure(wsKey, node, j, summary).catch((e) => log('失败上报异常:', e?.message));
   try { pushInbox({ node: node.id, verdict: j.verdict, summary }); } catch {}
   if (!node.quiet && !node.__suppressFinishPush && notifyKind(CFG) !== 'off') {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
