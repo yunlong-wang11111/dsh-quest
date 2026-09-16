@@ -82,7 +82,8 @@ try {
   const fired = await waitFor(() => convEvents().length >= 1, 60000, 1000);
   s.check('② 收敛后触发 notify.converge', fired, 'events=' + convEvents().length);
   await sleep(1500);
-  s.check('② 唤醒的是新收尾会话（create 被调，cwd=工作区）', created.length === 1 && String(created[0].cwd || '').replace(/\\/g, '/').endsWith('/ws'), JSON.stringify(created));
+  // 2026-09-16 定向改版：沙箱无翻页史 → 回退'最新会话'（不再新建）。生产里优先翻页接班会话=主对话。
+  s.check('② 总结排给现存会话（无翻页史→最新，不新建）', created.length === 0 && /^sess-/.test(prompts[prompts.length - 1]?.sid || ''), '→ ' + (prompts[prompts.length - 1]?.sid || '?'));
   s.check('② 注入了收尾提示（含 line-summary 与"只读与写总结"闸）',
     prompts.length >= 1 && prompts[prompts.length - 1].text.includes('line-summary') && prompts[prompts.length - 1].text.includes('只读与写总结'),
     'prompts=' + prompts.length);
@@ -101,7 +102,7 @@ try {
   sessions.push({ sessionId: 'sess-other', cwd: 'C:/elsewhere', running: true, updatedAt: Date.now() });
   await sleep(6000);
   const l4 = await line();
-  s.check('④ 无关 cwd 且无父缘的在跑会话不拦本工作区', l4?.dsh?.total === 3 && l4?.dsh?.running === 0, JSON.stringify(l4?.dsh));
+  s.check('④ 无关 cwd 且无父缘的在跑会话不拦本工作区', l4?.dsh?.total === 2 && l4?.dsh?.running === 0, JSON.stringify(l4?.dsh));   // ②不再新建 ⇒ main+sub=2
 } finally {
   sb.stop();
 }

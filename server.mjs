@@ -1667,10 +1667,30 @@ async function maybeNotifyConverge(wsKey, st, info) {
     let sid = String(nc.targetSessionId || '');
     let created = false;
     if (!sid) {
-      const r = await api.sessions.create({ cwd: wsPath || undefined });
-      if (!r.result.ok) throw new Error('create: ' + JSON.stringify(r.result.error ?? {}).slice(0, 120));
-      sid = r.result.value.sessionId;
-      created = true;
+      // 目标优先级（2026-09-16 用户定稿："总结要发到主对话"）：
+      //   ① 最近一次翻页的接班会话 = 用户正在用的主对话（翻页是主对话的出生证明，比"最新"可靠——
+      //      工作线会话比主对话更新得勤，猜"最新"永远猜到干活的，不是看板的）
+      //   ② 没翻过页 → 最新会话；③ 一个会话都没有 → 新建
+      const lr = await api.sessions.list({});
+      const items = lr.result.ok ? (lr.result.value?.items ?? []) : [];
+      let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
+      const mine = items.filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
+      let successor = '';
+      try {
+        const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+        for (let i = raw.length - 1; i >= 0; i--) {
+          let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+          if (ev.t === 'flip.done' && ev.created) { successor = String(ev.created); break; }
+        }
+      } catch {}
+      if (successor && mine.some((x) => String(x.sessionId) === successor)) sid = successor;
+      else if (mine.length) sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
+      else {
+        const r = await api.sessions.create({ cwd: wsPath || undefined });
+        if (!r.result.ok) throw new Error('create: ' + JSON.stringify(r.result.error ?? {}).slice(0, 120));
+        sid = r.result.value.sessionId;
+        created = true;
+      }
     }
     const stamp = await sendConvergePrompt(wsKey, wsPath, info, sid);
     appendEvent(wsKey, { t: 'notify.converge', sessionId: sid, created: created || undefined, counts: info.counts });
@@ -2647,12 +2667,21 @@ const server = http.createServer(async (req, res) => {
         let sid = String(b.sessionId || '');
         let created = false;
         if (!sid) {
-          // 缺省目标：本工作区最新的会话（queue 语义：它忙就排队，绝不打断当前回合）
+          // 缺省目标优先级（与自动收尾一致，2026-09-16）：①翻页接班会话=主对话 → ②最新会话 → ③新建
           const lr = await api.sessions.list({});
           const items = lr.result.ok ? (lr.result.value?.items ?? []) : [];
           let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
           const mine = items.filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
-          if (mine.length) {
+          let successor = '';
+          try {
+            const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+            for (let i = raw.length - 1; i >= 0; i--) {
+              let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+              if (ev.t === 'flip.done' && ev.created) { successor = String(ev.created); break; }
+            }
+          } catch {}
+          if (successor && mine.some((x) => String(x.sessionId) === successor)) sid = successor;
+          else if (mine.length) {
             sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
           } else {
             const r = await api.sessions.create({ cwd: wsPath || undefined });
