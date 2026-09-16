@@ -1873,6 +1873,10 @@ async function orchestrate(wsKey) {
     const bad = plan.nodes.filter((n) => ['failed', 'timeout', 'frozen'].includes(stOf(n.id)));
     const parts = bad.map((n) => `${stOf(n.id) === 'frozen' ? '⛔' : stOf(n.id) === 'timeout' ? '⏹' : '❌'} ${n.id}（${state.nodes[n.id]?.verdict ? state.nodes[n.id].verdict + '/' : ''}${stOf(n.id)}）`);
     appendEvent(wsKey, { t: 'line.concluded', counts });
+    // 立即触发收敛通知（2026-09-16 用户定稿：plan 最后一环落定→不等 10 分钟静默窗→直接通知主对话）。
+    // orchestrate 在这里已经确认"plan 全部节点终态"——这不是猜测，是事实；10 分钟窗是为无 plan 结构的
+    // quick 活动兜底的，有 plan 结构就不需要等。冷却（默认 30 分钟）防"全线刚结束又派新活"的连发。
+    maybeNotifyConverge(wsKey, state, lineActivity(state)).catch((e) => log('立即收敛通知失败:', e?.message));
     // P2：研究状态文件自动追加——主对话"下次开口时已知一切"的共享内存
     try {
       const wsDir = plan.meta.workspace || '';
