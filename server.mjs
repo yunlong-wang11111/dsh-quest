@@ -1674,11 +1674,13 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false } = {}
   const summaryFile = path.join(hostPathFor(wsPath) || wsPath || '', `line-summary-${stamp}.md`);
   const before = fs.existsSync(summaryFile) ? fs.statSync(summaryFile).mtimeMs : 0;
   const t0 = Date.now();
+  const timeoutMs = Number(CFG.notify?.converge?.summaryTimeoutSec) > 0 ? Number(CFG.notify?.converge?.summaryTimeoutSec) * 1000 : 360000;   // 默认 6 分钟（4 分钟对冷启动会话太紧——2026-09-16 实测 17:43→17:47 踩线超时）
   let wrote = false;
-  while (Date.now() - t0 < 240000) {
+  while (Date.now() - t0 < timeoutMs) {
     await new Promise((r) => setTimeout(r, 10000));
     try { if (fs.existsSync(summaryFile) && fs.statSync(summaryFile).mtimeMs > before) { wrote = true; break; } } catch {}
   }
+  if (!wrote) log(`converge ${wsKey}: 总结文件在 ${Math.round(timeoutMs / 60000)} 分钟内未更新（可能超时）`);
 
   // ── 阶段2：通知主对话（只收通知，不干活）──
   // 主对话定向链：指定 > 翻页接班 > 最新（排除收敛自建）——同 maybeNotifyConverge 的定向
@@ -1714,14 +1716,18 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false } = {}
   return { workerSid, wrote, mainNotified: true, mainSid };
 }
 
-async function maybeNotifyConverge(wsKey, st, info) {
+async function maybeNotifyConverge(wsKey, st, info, { immediate = false } = {}) {
   const nc = CFG.notify?.converge;
   if (nc && nc.enabled === false) return;   // 配置级总闸（缺省开）
   checkReopenConverge(wsKey, nc);           // 每日定时重开（12:00/23:00 这类；手动关了忘记开也没关系）
   if (!convergeAutoOn(wsKey)) return;       // 唯一闸门=开关（buff 式：默认开，手动关才关——2026-09-16 用户定稿）
-  const cooldownMs = Math.max(5, Number(nc?.cooldownMin) || 30) * 60000;
-  const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
-  if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒（防重复靠冷却+手动关，不再猜在不在场）
+  // 冷却只挡定时兜底路径（sweep），不挡即时路径（plan 最后一环落定→立刻通知，不等也不冷却——
+  // 2026-09-16 用户定稿：多线并行时 A 线和 B 线各自结束都该立刻通知，冷却会把 B 线的总结吞掉）
+  if (!immediate) {
+    const cooldownMs = Math.max(5, Number(nc?.cooldownMin) || 30) * 60000;
+    const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
+    if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒
+  }
   const wsPath = (() => { try { return parsePlan(st.plan).meta?.workspace || ''; } catch { return ''; } })();
   // 事件立即写入（不等两阶段走完——阶段 2 含最长 4 分钟等总结文件，等它事件永远迟到）
   appendEvent(wsKey, { t: 'notify.converge', counts: info.counts, phase: 'started' });
@@ -1867,16 +1873,20 @@ async function orchestrate(wsKey) {
   // 就全终态，之后 29 个 quick 任务跑完都没有任何汇总）。用户侧的可重复信号由 sweepQuiet 推。
   const lineNodes = mergedPlanNodes(plan, state).nodes;
   const allStopped = lineNodes.every((n) => TERMINAL_STATUS.includes(stOf(n.id)));
-  if (allStopped && !(state.lineEvents ?? []).some((e) => e.t === 'line.concluded')) {
+  // 防重发：只检查**当前 plan** 之后有没有 line.concluded（不是历史有没有——一旦第一条线
+  // concluded 过，后来所有新 plan 都不会再触发了。2026-09-16 用户发现的：9/14 多线并行，
+  // A线concluded后B线永远不响。正确语义：每次 plan.reloaded 重置"已concluded"标记）
+  const lastPlanAt = tsOf((state.lineEvents ?? []).filter((e) => e.t === 'plan.created' || e.t === 'plan.reloaded').pop()?.at) || 0;
+  const concludedAfterThisPlan = (state.lineEvents ?? []).some((e) => e.t === 'line.concluded' && tsOf(e.at) > lastPlanAt);
+  if (allStopped && !concludedAfterThisPlan) {
     const counts = {};
     for (const n of lineNodes) counts[stOf(n.id)] = (counts[stOf(n.id)] ?? 0) + 1;
     const bad = plan.nodes.filter((n) => ['failed', 'timeout', 'frozen'].includes(stOf(n.id)));
     const parts = bad.map((n) => `${stOf(n.id) === 'frozen' ? '⛔' : stOf(n.id) === 'timeout' ? '⏹' : '❌'} ${n.id}（${state.nodes[n.id]?.verdict ? state.nodes[n.id].verdict + '/' : ''}${stOf(n.id)}）`);
     appendEvent(wsKey, { t: 'line.concluded', counts });
     // 立即触发收敛通知（2026-09-16 用户定稿：plan 最后一环落定→不等 10 分钟静默窗→直接通知主对话）。
-    // orchestrate 在这里已经确认"plan 全部节点终态"——这不是猜测，是事实；10 分钟窗是为无 plan 结构的
-    // quick 活动兜底的，有 plan 结构就不需要等。冷却（默认 30 分钟）防"全线刚结束又派新活"的连发。
-    maybeNotifyConverge(wsKey, state, lineActivity(state)).catch((e) => log('立即收敛通知失败:', e?.message));
+    // immediate=true ⇒ 不走冷却（多线并行各自结束都立刻通知），line.concluded 守卫已改为按 plan 周期防重。
+    maybeNotifyConverge(wsKey, state, lineActivity(state), { immediate: true }).catch((e) => log('立即收敛通知失败:', e?.message));
     // P2：研究状态文件自动追加——主对话"下次开口时已知一切"的共享内存
     try {
       const wsDir = plan.meta.workspace || '';
