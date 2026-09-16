@@ -1667,25 +1667,36 @@ async function maybeNotifyConverge(wsKey, st, info) {
     let sid = String(nc.targetSessionId || '');
     let created = false;
     if (!sid) {
-      // 目标优先级（2026-09-16 用户定稿："总结要发到主对话"）：
-      //   ① 最近一次翻页的接班会话 = 用户正在用的主对话（翻页是主对话的出生证明，比"最新"可靠——
-      //      工作线会话比主对话更新得勤，猜"最新"永远猜到干活的，不是看板的）
-      //   ② 没翻过页 → 最新会话；③ 一个会话都没有 → 新建
+      // 目标优先级（2026-09-16 终版："总结要发到主对话"）：
+      //   session/list 无 archived 标记（归档的与活的同列——老主对话 2985M 还躺在列表里），
+      //   启发式必翻车 ⇒ 显式指定优先：
+      //   ① nc.targetSessionId（配置）
+      //   ② converge-state.mainSessionId（/api/converge action:'main' 手动指定；翻页成功时自动更新为接班）
+      //   ③ 翻页接班会话（对未来翻页有效；code_kl 当前会翻到游离会话，靠②兜住）
+      //   ④ 最新（排除收敛自建的会话，防"总结发给自己的产物"自我强化循环）
+      //   ⑤ 新建
       const lr = await api.sessions.list({});
       const items = lr.result.ok ? (lr.result.value?.items ?? []) : [];
       let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
       const mine = items.filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
+      const stMain = String((loadConvergeState()[wsKey] || {}).mainSessionId || '');
+      const convMade = new Set();
       let successor = '';
       try {
         const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
         for (let i = raw.length - 1; i >= 0; i--) {
           let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
-          if (ev.t === 'flip.done' && ev.created) { successor = String(ev.created); break; }
+          if (!successor && ev.t === 'flip.done' && ev.created) successor = String(ev.created);
+          if (ev.t === 'notify.converge' && ev.sessionId && ev.created) convMade.add(String(ev.sessionId));
         }
       } catch {}
-      if (successor && mine.some((x) => String(x.sessionId) === successor)) sid = successor;
-      else if (mine.length) sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
-      else {
+      if (stMain && mine.some((x) => String(x.sessionId) === stMain)) sid = stMain;
+      else if (successor && mine.some((x) => String(x.sessionId) === successor)) sid = successor;
+      else if (mine.length) {
+        const live = mine.filter((x) => !convMade.has(String(x.sessionId)));
+        const pool = live.length ? live : mine;
+        sid = String(pool.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), pool[0]).sessionId);
+      } else {
         const r = await api.sessions.create({ cwd: wsPath || undefined });
         if (!r.result.ok) throw new Error('create: ' + JSON.stringify(r.result.error ?? {}).slice(0, 120));
         sid = r.result.value.sessionId;
@@ -2569,6 +2580,15 @@ const server = http.createServer(async (req, res) => {
       // 记账要记到**被翻的工作区**（2026-09-15 教训）：wsKey 来自 URL query（不带参=默认工作区），
       // 而 flip 操作的是 body.ws —— 9-11 翻 piml 的三次事件全记进了 code_kl 的账本，
       // 导致"piml 从没被翻过"的误判（实际 piml/archive/flip-2026-09-11.md 5.36MB 真实存在）。
+      // 翻页成功 ⇒ 接班会话即新主对话（总结/收尾的定向目标自动跟着换，无需手动重新指定）
+      if (results.created) {
+        try {
+          const fk = wsKeyOf(String(b.ws ?? '')) || wsKey;
+          const all = loadConvergeState();
+          all[fk] = { ...(all[fk] || {}), mainSessionId: results.created };
+          saveConvergeState(all);
+        } catch {}
+      }
       appendEvent(wsKeyOf(String(b.ws ?? '')) || wsKey, { t: 'flip.done', ws: b.ws, archived: results.archived.length, matched: results.matched ?? null, created: results.created });
       return json(200, { ok: results.errors.length === 0, ...results });
     }
@@ -2642,12 +2662,22 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST') {
         const b = await readBody(req);
         const action = String(b.action || 'toggle');
+        if (action === 'main') {
+          // 指定主对话（2026-09-16）：总结/收尾的定向目标。session/list 无 archived 标记，
+          // 启发式必翻车（老主对话 2985M 还躺在列表里）⇒ 允许显式指定；翻页成功时自动更新为接班。
+          const sid = String(b.sessionId || '');
+          if (!sid) return json(200, { ok: false, error: '缺 sessionId' });
+          stateAll[wsKey] = { ...cur, mainSessionId: sid };
+          saveConvergeState(stateAll);
+          appendEvent(wsKey, { t: 'converge.main', sessionId: sid });
+          return json(200, { ok: true, mainSessionId: sid, note: '主对话已指定：后续总结/收尾都发给它（直到下次翻页自动换新接班）' });
+        }
         const auto = action === 'on' ? true : action === 'off' ? false : !(cur.auto !== false);
         stateAll[wsKey] = { ...cur, auto };
         saveConvergeState(stateAll);
         appendEvent(wsKey, { t: 'converge.toggle', auto });
         return json(200, {
-          ok: true, auto,
+          ok: true, auto, mainSessionId: cur.mainSessionId || null,
           note: auto
             ? '自动收尾已开：全部节点终态 + 冷却后自动做全局总结（开关是唯一闸门，冷却内不重复；每日 ' + ((CFG.notify?.converge?.reopenTimes ?? []).join('/') || '—') + ' 定时重开）'
             : '自动收尾已关（一次性总结仍可用控制台收尾或 /q收尾 立即；' + ((CFG.notify?.converge?.reopenTimes ?? []).join('/') || '—') + ' 会自动帮你重开）',
@@ -2667,22 +2697,28 @@ const server = http.createServer(async (req, res) => {
         let sid = String(b.sessionId || '');
         let created = false;
         if (!sid) {
-          // 缺省目标优先级（与自动收尾一致，2026-09-16）：①翻页接班会话=主对话 → ②最新会话 → ③新建
+          // 缺省目标优先级（与自动收尾一致，2026-09-16）：①指定主对话 → ②翻页接班 → ③最新（排除收敛自建）→ ④新建
           const lr = await api.sessions.list({});
           const items = lr.result.ok ? (lr.result.value?.items ?? []) : [];
           let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
           const mine = items.filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
+          const stMain = String((loadConvergeState()[wsKey] || {}).mainSessionId || '');
+          const convMade = new Set();
           let successor = '';
           try {
             const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
             for (let i = raw.length - 1; i >= 0; i--) {
               let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
-              if (ev.t === 'flip.done' && ev.created) { successor = String(ev.created); break; }
+              if (!successor && ev.t === 'flip.done' && ev.created) successor = String(ev.created);
+              if (ev.t === 'notify.converge' && ev.sessionId && ev.created) convMade.add(String(ev.sessionId));
             }
           } catch {}
-          if (successor && mine.some((x) => String(x.sessionId) === successor)) sid = successor;
+          if (stMain && mine.some((x) => String(x.sessionId) === stMain)) sid = stMain;
+          else if (successor && mine.some((x) => String(x.sessionId) === successor)) sid = successor;
           else if (mine.length) {
-            sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
+            const live = mine.filter((x) => !convMade.has(String(x.sessionId)));
+            const pool = live.length ? live : mine;
+            sid = String(pool.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), pool[0]).sessionId);
           } else {
             const r = await api.sessions.create({ cwd: wsPath || undefined });
             if (!r.result.ok) throw new Error('create: ' + JSON.stringify(r.result.error ?? {}).slice(0, 120));
