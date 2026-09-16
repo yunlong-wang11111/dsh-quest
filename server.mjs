@@ -1521,18 +1521,47 @@ function lineActivity(state) {
  *   "notify": { "kind": "...", "converge": { "enabled": true, "cooldownMin": 30, "targetSessionId": "" } }
  * targetSessionId 缺省=新开一个 cwd=工作区的收尾会话。
  */
-/** 当前时间是否落在自动窗口内（如 ["23:00","08:00"] 支持跨午夜）。windows 缺省/空 = 永不自动。 */
-function inAutoWindow(windows) {
-  if (!Array.isArray(windows) || !windows.length) return false;
+/**
+ * 收尾自动开关（2026-09-16 用户定稿的"buff 式"语义）：
+ *   · 自动收尾**默认开**；按钮/QQ 命令是开关（on/off），不是一次性触发；
+ *   · 每天 reopenTimes（如 ["12:00","23:00"]）各重开一次——手动关了忘记开也没关系；
+ *     重开后的下一次收敛**免等在场守卫**（presenceMin 直接跳过）；
+ *   · 冷却（cooldownMin）防刷屏。状态按工作区持久化到 converge-state.json。
+ */
+const CONVERGE_STATE_FILE = () => path.join(HOMEOverride, 'converge-state.json');
+function loadConvergeState() {
+  try { return JSON.parse(fs.readFileSync(CONVERGE_STATE_FILE(), 'utf8')); } catch { return {}; }
+}
+function saveConvergeState(st) {
+  try { fs.writeFileSync(CONVERGE_STATE_FILE(), JSON.stringify(st, null, 2)); } catch (e) { log('converge-state 写失败:', e?.message); }
+}
+function convergeAutoOn(wsKey) {
+  const st = loadConvergeState()[wsKey] || {};
+  return st.auto !== false;   // 缺省=开（buff 默认生效；只有显式 off 才关）
+}
+/** 每日定时重开：过了任一 reopenTime 且今天还没重开过 → 开 + 免等在场（2 小时内巡检到都算，防错过）。 */
+function checkReopenConverge(wsKey, nc) {
+  const times = Array.isArray(nc?.reopenTimes) ? nc.reopenTimes : [];
+  if (!times.length) return false;
   const now = new Date();
   const cur = now.getHours() * 60 + now.getMinutes();
-  for (const w of windows) {
-    const a = String(w?.[0] ?? ''), b = String(w?.[1] ?? '');
-    const [ah, am] = a.split(':').map(Number), [bh, bm] = b.split(':').map(Number);
-    if (!Number.isFinite(ah) || !Number.isFinite(bh)) continue;
-    const s = ah * 60 + (am || 0), e = bh * 60 + (bm || 0);
-    if (s === e) continue;
-    if (s < e ? (cur >= s && cur < e) : (cur >= s || cur < e)) return true;   // 跨午夜：起点在晚上、终点在早上
+  for (const t of times) {
+    const [h, m] = String(t).split(':').map(Number);
+    if (!Number.isFinite(h)) continue;
+    const tm = h * 60 + (m || 0);
+    const dayKey = now.toISOString().slice(0, 10) + 'T' + t;
+    if (cur >= tm && cur < tm + 120) {
+      const all = loadConvergeState();
+      const cur2 = all[wsKey] || (all[wsKey] = {});
+      if (cur2.lastReopen === dayKey) return false;
+      const wasOff = cur2.auto === false;
+      cur2.lastReopen = dayKey;
+      cur2.auto = true;
+      cur2.skipPresenceUntil = Date.now() + 30 * 60000;   // 重开后首次收敛免等在场
+      saveConvergeState(all);
+      if (wasOff) log(`converge ${wsKey}: 定时(${t})重开自动收尾（之前被手动关过）`);
+      return true;
+    }
   }
   return false;
 }
@@ -1558,18 +1587,17 @@ async function sendConvergePrompt(wsKey, wsPath, info, sid, { manual = false } =
 
 async function maybeNotifyConverge(wsKey, st, info) {
   const nc = CFG.notify?.converge;
-  if (!nc || nc.enabled !== true) return;
-  // 自动模式只在配置的时间窗口内活（2026-09-16 用户定稿：手动随时可点，自动只在他不在的时段开——
-  // 中午 12-15 / 夜里 23-08 这类；窗口缺省为空 = 纯手动，收敛判定的不可靠性从关键路径上摘掉）
-  if (!inAutoWindow(nc.autoWindows)) return;
-  const cooldownMs = Math.max(5, Number(nc.cooldownMin) || 30) * 60000;
+  if (nc && nc.enabled === false) return;   // 配置级总闸（缺省开）
+  checkReopenConverge(wsKey, nc);           // 每日定时重开（12:00/23:00 这类；重开后首收敛免等在场）
+  if (!convergeAutoOn(wsKey)) return;       // 手动关着的 buff 不触发（等定时重开）
+  const cooldownMs = Math.max(5, Number(nc?.cooldownMin) || 30) * 60000;
   const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
   if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒
-  // 老板在场守卫（2026-09-16，防与手动汇报重复）：工作区会话最近 presenceMin 分钟内有过动静
-  // ⇒ 用户在场、会自己要总结，自动收尾退避。只 log 不写账本（写了会自我续期静默判定）。
-  // presenceMin=0 关闭守卫；缺省 60。自动收尾由此定位成"无人值守"（过夜批跑）专用。
-  const presenceMin = Number(nc.presenceMin ?? 60);
-  if (presenceMin > 0 && info.dsh && info.dsh.idleMinutes != null && info.dsh.idleMinutes < presenceMin) {
+  // 老板在场守卫（防与手动汇报重复）：工作区会话最近 presenceMin 分钟内有过动静 ⇒ 用户在场、会自己要总结。
+  // 定时重开后的 30 分钟免等（skipPresenceUntil）。跳过只 log 不写账本（防自我续期静默判定）。
+  const skip = (() => { const s = (loadConvergeState()[wsKey] || {}).skipPresenceUntil || 0; return Date.now() < s; })();
+  const presenceMin = Number(nc?.presenceMin ?? 60);
+  if (!skip && presenceMin > 0 && info.dsh && info.dsh.idleMinutes != null && info.dsh.idleMinutes < presenceMin) {
     log(`notify.converge ${wsKey} 跳过：会话 ${info.dsh.idleMinutes} 分钟前有动静（老板在场，手动汇报优先）`);
     return;
   }
@@ -2523,7 +2551,31 @@ const server = http.createServer(async (req, res) => {
           : '没有未开跑的节点可冻',
       });
     }
-    // 手动收尾（2026-09-16 用户定稿：手动优先于自动——按钮/QQ 命令随时点，queue 语义不打断对话）：
+    // 收尾开关（2026-09-16 定稿"buff 式"）：默认开；按钮/QQ 是 on/off 开关而非一次性触发；
+    // 每日 reopenTimes 定时重开（关了忘了开也没关系）。GET=status，POST={action:'on'|'off'|'toggle'}。
+    if (u.pathname === '/api/converge') {
+      const stateAll = loadConvergeState();
+      const cur = stateAll[wsKey] || {};
+      if (req.method === 'GET') {
+        return json(200, { ok: true, auto: cur.auto !== false, reopenTimes: CFG.notify?.converge?.reopenTimes ?? [] });
+      }
+      if (req.method === 'POST') {
+        const b = await readBody(req);
+        const action = String(b.action || 'toggle');
+        const auto = action === 'on' ? true : action === 'off' ? false : !(cur.auto !== false);
+        stateAll[wsKey] = { ...cur, auto };
+        if (auto) delete stateAll[wsKey].skipPresenceUntil; else stateAll[wsKey].skipPresenceUntil = 0;
+        saveConvergeState(stateAll);
+        appendEvent(wsKey, { t: 'converge.toggle', auto });
+        return json(200, {
+          ok: true, auto,
+          note: auto
+            ? '自动收尾已开：全部节点终态 + 冷却后自动做全局总结（你在场 60 分钟内仍会让位给手动汇报；每日 ' + ((CFG.notify?.converge?.reopenTimes ?? []).join('/') || '—') + ' 定时重开）'
+            : '自动收尾已关（一次性总结仍可用控制台收尾或 /q收尾 立即；' + ((CFG.notify?.converge?.reopenTimes ?? []).join('/') || '—') + ' 会自动帮你重开）',
+        });
+      }
+    }
+    // 手动收尾（一次性，不受开关影响）：给目标会话（缺省=本工作区最新的会话）排一条全局总结指令。
     // 给目标会话（缺省=本工作区最新的会话，通常是你正在用的那条；没有则新开）排一条全局总结指令。
     if (req.method === 'POST' && u.pathname === '/api/summarize') {
       const b = await readBody(req);

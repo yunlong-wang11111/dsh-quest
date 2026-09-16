@@ -95,7 +95,7 @@
   <span style="flex:1"></span>
   <button class="act" id="gateTop" style="display:none" onclick="document.getElementById('gate').scrollIntoView({behavior:'smooth'})">门禁 <b id="gateN"></b></button>
   <button class="act" onclick="doFlip()" title="归档本工作区全部会话并开新会话：先让最活跃的老会话按模板写 research-state.md 交接，再归档、开新会话并注入恢复提示（读交接→查任务线→复述确认）。大约需要 1~3 分钟。">翻页</button>
-  <button class="act" onclick="doSummarize()" title="给本工作区最新的会话排一条全局总结指令：quest_status 拿全景→对照 research-state→写 line-summary-日期.md→8 行内复述。它忙则排队，不打断当前回合。">收尾</button>
+  <button class="act" onclick="doConverge()" title="自动收尾开关（buff 式，默认开）：全部节点终态+冷却后自动做全局总结。你在场 60 分钟内会让位给手动汇报；每日 12:00/23:00 定时重开（关了忘了开也没关系）。要一次性总结用 QQ /q收尾。">自动收尾</button>
   <button class="act" onclick="refreshAll()">刷新</button>
 </header>
 <nav>
@@ -766,15 +766,16 @@ async function doFlip() {
   } catch (e) { toast('翻页请求失败：' + e.message); }
 }
 
-// 手动收尾（2026-09-16 用户定稿：手动优先于自动）：给最新会话排全局总结指令（queue 语义，忙则等）
-async function doSummarize() {
+// 自动收尾开关（2026-09-16 定稿 buff 式）：按钮=on/off 开关，显示当前状态并说明后果
+async function doConverge() {
   if (!curWs) { toast('没有选中工作区'); return; }
-  if (!confirm(`对本工作区做收尾总结？\n\n会给最新的会话排一条指令：quest_status 拿全景 → 对照 research-state → 写 line-summary-今天.md → 8 行内复述。\n它正在忙则排队（不打断当前回合）。继续？`)) return;
-  toast('收尾指令发送中…');
   try {
-    const r = await post('/api/summarize?ws=' + encodeURIComponent(curWs), {});
-    toast(r.ok ? `已排给 ${String(r.sessionId).slice(0, 16)}…${r.created ? '（新会话）' : ''}：${r.note}` : '收尾失败：' + (r.error || ''));
-  } catch (e) { toast('收尾请求失败：' + e.message); }
+    const st = await api('/api/converge?ws=' + encodeURIComponent(curWs));
+    const to = st.auto ? '关' : '开';
+    if (!confirm(`自动收尾当前：${st.auto ? '开' : '关'}。切换为「${to}」？\n\n${st.auto ? '关掉后：全线收敛不再自动总结（一次性手动仍可用）。' : '开启后：全部节点终态 + 冷却 30 分钟自动做全局总结（你在场 1 小时内会让位给手动汇报；每日 12:00/23:00 也会自动重开）。'}\n（要立即做一次总结而不改开关：QQ 发 /q收尾）`)) return;
+    const r = await post('/api/converge?ws=' + encodeURIComponent(curWs), { action: 'toggle' });
+    toast(r.ok ? `自动收尾已${r.auto ? '开' : '关'}：${(r.note || '').slice(0, 90)}` : '失败：' + (r.error || ''));
+  } catch (e) { toast('请求失败：' + e.message); }
 }
 
 async function refreshAll() {

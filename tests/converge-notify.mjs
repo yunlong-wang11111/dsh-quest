@@ -50,7 +50,7 @@ const sb = await startSandbox({
     dshBaseUrl: `http://127.0.0.1:${DSH}`,
     dshToken: 'stub-token',
     runGate: { enabled: false },
-    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, presenceMin: 0, autoWindows: [['00:00','23:59']] } },   // 第一幕关在场守卫（假会话 updatedAt=刚刚，会被误判在场）
+    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, presenceMin: 0, reopenTimes: [] } },   // 第一幕关在场守卫（假会话 updatedAt=刚刚，会被误判在场）
     quietMinutes: 0.05, sweepSeconds: 5,
   },
 });
@@ -113,7 +113,7 @@ const sb2 = await startSandbox({
     dshBaseUrl: `http://127.0.0.1:${DSH}`,
     dshToken: 'stub-token',
     runGate: { enabled: false },
-    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, presenceMin: 60, autoWindows: [['00:00','23:59']] } },
+    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, presenceMin: 60, reopenTimes: [] } },
     quietMinutes: 0.05, sweepSeconds: 5,
   },
 });
@@ -148,12 +148,14 @@ const sb3 = await startSandbox({
     dshBaseUrl: `http://127.0.0.1:${DSH}`,
     dshToken: 'stub-token',
     runGate: { enabled: false },
-    notify: { kind: 'off', converge: { enabled: true, autoWindows: [] } },   // 窗口为空=纯手动
+    notify: { kind: 'off', converge: { enabled: true, cooldownMin: 5, reopenTimes: [] } },   // buff 默认开；第三幕先手动关掉
     quietMinutes: 0.05, sweepSeconds: 5,
   },
 });
 const WS3 = sb3.ws.ws;
-const prompts3Before = prompts.length;
+const off = await sb3.api('POST', `/api/converge?ws=${encodeURIComponent(WS3)}`, { action: 'off' });
+  s.check('⑦ 开关可关（buff 式，非一次性）', off.json?.ok === true && off.json.auto === false, JSON.stringify(off.json).slice(0, 80));
+  const prompts3Before = prompts.length;
 try {
   fs.writeFileSync(path.join(WS3, 'job.js'), 'console.log(1);require("fs").writeFileSync("out.npz","x");' + String.fromCharCode(10));
   const r = await sb3.api('POST', `/api/run?ws=${encodeURIComponent(WS3)}`, { command: 'node job.js', cwd: WS3, title: 'm-1', expect_minutes: 1 });
