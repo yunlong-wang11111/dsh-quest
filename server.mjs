@@ -222,7 +222,7 @@ function buildState(wsKey) {
         state.lineEvents.push(e);
         // quest 自己的记账事件（line.quiet/line.concluded）不算"工作区活动"——否则静默通知
         // 一推、活动时钟立刻被自己刷新，状态又变回"不静默"（实测踩到过）。
-        if (e.at && !['line.quiet', 'line.concluded'].includes(e.t)) state.lastLineEventAt = e.at;
+        if (e.at && !['line.quiet', 'line.concluded', 'notify.converge'].includes(e.t)) state.lastLineEventAt = e.at;
         if (e.t === 'plan.created' || e.t === 'plan.reloaded') {
           for (const n2 of Object.values(state.nodes)) n2.fixCount = 0; // 新 plan = 新预算
         }
@@ -1415,10 +1415,19 @@ function dshActivity(wsDir) {
   if (!items || !wsDir) return null;
   let key;
   try { key = wsKeyOf(wsDir); } catch { return null; }
-  const mine = items.filter((s) => {
-    if (!s?.cwd) return false;
-    try { return wsKeyOf(String(s.cwd)) === key; } catch { return false; }
-  });
+  // 2026-09-16 父会话归因：DSH 子代理常带临时 cwd（不在工作区目录）——只按 cwd 匹配会漏数，
+  // 导致收敛误报。归因规则：cwd 匹配，或**任一祖先**（沿 parentSessionId 上溯）的 cwd 匹配。
+  const byId = new Map(items.map((s) => [s.sessionId, s]));
+  const rootedHere = (s) => {
+    let cur = s, hops = 0;
+    while (cur && hops < 10) {
+      if (cur.cwd) { try { if (wsKeyOf(String(cur.cwd)) === key) return true; } catch { return false; } }
+      cur = cur.parentSessionId ? byId.get(cur.parentSessionId) : null;
+      hops++;
+    }
+    return false;
+  };
+  const mine = items.filter((s) => s?.sessionId && rootedHere(s));
   if (!mine.length) return { total: 0, running: 0, idleMinutes: null, ageSeconds: Math.round((Date.now() - dshSessCache.at) / 1000) };
   const running = mine.filter((s) => s.running === true);
   const newest = mine.reduce((a, b) => (Number(b.updatedAt || 0) > Number(a.updatedAt || 0) ? b : a), mine[0]);
@@ -1503,6 +1512,56 @@ function lineActivity(state) {
  * 巡检一个工作区：满足静默条件就推一条可解释的收敛信号（并记 line.quiet 供下次比对）。
  * 返回 null 表示"无需处理/不适用"，{quiet:false} 表示还在活跃期。
  */
+/**
+ * 收敛汇报（第 1 级通知，2026-09-16，默认关）：任务线收敛时唤醒一个**轻量收尾会话**做全局 AI 审
+ * （机械验收 judge 与各 worker 自述之上加一道"看全景的人"），写收尾总结后停下——绝不自动开新实验。
+ * 防炸三件套：逐工作区冷却（默认 30 分钟）+ 只唤醒轻量目标（新会话或指定 sessionId，绝不碰大上下文主对话）
+ * + 提示词末尾带"复述+停"闸。
+ * 配置（quest-config.json）：
+ *   "notify": { "kind": "...", "converge": { "enabled": true, "cooldownMin": 30, "targetSessionId": "" } }
+ * targetSessionId 缺省=新开一个 cwd=工作区的收尾会话。
+ */
+async function maybeNotifyConverge(wsKey, st, info) {
+  const nc = CFG.notify?.converge;
+  if (!nc || nc.enabled !== true) return;
+  const cooldownMs = Math.max(5, Number(nc.cooldownMin) || 30) * 60000;
+  const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
+  if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒
+  const wsPath = (() => { try { return parsePlan(st.plan).meta?.workspace || ''; } catch { return ''; } })();
+  try {
+    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+    const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    let sid = String(nc.targetSessionId || '');
+    let created = false;
+    if (!sid) {
+      const r = await api.sessions.create({ cwd: wsPath || undefined });
+      if (!r.result.ok) throw new Error('create: ' + JSON.stringify(r.result.error ?? {}).slice(0, 120));
+      sid = r.result.value.sessionId;
+      created = true;
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    await api.sessions.prompt({
+      sessionId: sid, mode: 'queue',
+      content: [{ type: 'text', text: [
+        '【收尾汇报】本工作区任务线已收敛（无在跑节点 · 账本安静 · 无人改代码 · 无会话在跑）。只做四件事，然后停下等用户：',
+        '1. 调 quest_status（brief）拿任务线全景。',
+        '2. 若存在 research-state.md / progress.md，读它们对照既定目标。',
+        '3. 写 ' + (wsPath ? wsPath + '/' : '') + `line-summary-${stamp}.md：各节点成败与关键数字、与目标的差距、明显异常（数字互相矛盾/缺产物）、建议下一步（≤40 行）。`,
+        '4. 用 ≤8 行向我复述总结要点（会转给用户）。**不要开新实验、不要改任何脚本、不要派任务——只读与写总结。**',
+        `背景：共 ${info.nodes.length} 个节点，${Object.entries(info.counts).map(([k, v]) => v + ' ' + k).join(' / ') || '无终态'}。`,
+      ].join('\n') }],
+    });
+    appendEvent(wsKey, { t: 'notify.converge', sessionId: sid, created: created || undefined, counts: info.counts });
+    if (notifyKind(CFG) !== 'off') {
+      qqPush(wsKey, `[🏁 收尾汇报] 任务线已收敛（${info.nodes.length} 个节点）。已唤醒${created ? '新' : ''}收尾会话 ${String(sid).slice(0, 14)}… 做全局总结（AI 过一遍手），完成后写入 line-summary-${stamp}.md。`.slice(0, 300)).catch(() => {});
+    }
+    log(`notify.converge ${wsKey} → ${sid}`);
+  } catch (e) {
+    appendEvent(wsKey, { t: 'notify.converge', error: String(e?.message || e).slice(0, 160) });
+    log('notify.converge 失败:', e?.message);
+  }
+}
+
 function evaluateQuiet(wsKey) {
   try {
     const st = buildState(wsKey);
@@ -1520,6 +1579,7 @@ function evaluateQuiet(wsKey) {
     const need = info.nodes.filter((n) => ['failed', 'timeout', 'frozen'].includes(st.nodes[n.id]?.status))
       .slice(0, 4).map((n) => `${n.id.slice(0, 26)}（${st.nodes[n.id]?.verdict || st.nodes[n.id]?.status}）`);
     appendEvent(wsKey, { t: 'line.quiet', counts: info.counts, idleMinutes: info.idleMinutes, nodes: info.nodes.length });
+    maybeNotifyConverge(wsKey, st, info).catch((e) => log('收敛汇报失败:', e?.message));   // 第1级：唤醒收尾会话（默认关）
     if (notifyKind(CFG) !== 'off') {
       const summary = Object.entries(info.counts).map(([k, v]) => `${v} ${k}`).join(' / ');
       const idleTxt = info.idleMinutes >= 1 ? Math.round(info.idleMinutes) + " 分钟前" : '不到 1 分钟前';
