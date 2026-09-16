@@ -861,7 +861,7 @@ function dispatchJob(wsKey, node, body = {}) {
       const ckW = findLatestCheckpoint(node.cwd || '.');
       child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', job.outFd, job.outFd], env: ckW ? { ...process.env, QUEST_RESUME_FROM: ckW.file } : process.env });
     }
-    appendEvent(wsKey, { t: 'node.dispatched', node: node.id, jobId, pid: child.pid, logTs });
+    appendEvent(wsKey, { t: 'node.dispatched', node: node.id, jobId, pid: child.pid, logTs, dispatchedBy: body.dispatchedBy || undefined });   // 派发者会话（失败上报点名回它）
     // P4 进程树：同步 run 实例
     try {
       const runId = body?.runId || findRunId(wsKey, node.id);
@@ -1042,17 +1042,30 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
     let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
     const mine = (lr.result.value?.items ?? []).filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
     if (!mine.length) return;
-    const sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
+    // 定向优先级（2026-09-16 防双重修改）：①账本里记录的派发者会话（点名回它——派发者若是子对话，
+    // 也只回它，绝不扩散到主对话）；②没有记录（旧节点/插件未升级）才退回"最新会话"启发式。
+    let by = '';
+    try {
+      const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+      for (let i = raw.length - 1; i >= 0; i--) {
+        let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+        if (ev.node === node.id && (ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.dispatchedBy) { by = String(ev.dispatchedBy); break; }
+      }
+    } catch {}
+    let sid = by;
+    if (!sid || !mine.some((x) => String(x.sessionId) === sid)) {
+      sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
+    }
     await api.sessions.prompt({
       sessionId: sid, mode: 'queue',
       content: [{ type: 'text', text: [
         `❌【失败上报】节点 ${node.id} 判定 ${j.verdict}（${j.via || '无判定路径'}）${runSecText(j)}`,
         String(summary || j.detail || '').slice(0, 200) || '（无摘要）',
         '详情：quest_log 读该节点日志尾；判据/产物情况见 quest_status。',
-        '如果你是派发者：定位修复后 quest_dispatch 重派；与本线无关请忽略本消息。',
+        by ? '你是本节点的派发者：定位修复后 quest_dispatch 重派。' : '如果你是派发者：定位修复后 quest_dispatch 重派；与本线无关请忽略本消息。',
       ].join('\n') }],
     });
-    appendEvent(wsKey, { t: 'notify.escalate', node: node.id, verdict: j.verdict, sessionId: sid });
+    appendEvent(wsKey, { t: 'notify.escalate', node: node.id, verdict: j.verdict, sessionId: sid, dispatchedBy: by || undefined });
     log(`notify.escalate ${wsKey}: ${node.id} → ${sid}`);
   } catch (e) {
     appendEvent(wsKey, { t: 'notify.escalate', node: node.id, error: String(e?.message || e).slice(0, 140) });
@@ -2064,6 +2077,7 @@ async function launchQuickRun(wsKey, node, extra = {}) {
     t: 'quick.dispatched', node: node.id,
     command: String(node.command || '').slice(0, 4000), cwd: node.cwd, shell: node.shell || 'windows',
     success: String(node.success || ''), expectMinutes: node.expectMinutes ?? null,
+    dispatchedBy: extra.dispatchedBy || undefined,   // 派发者会话（失败上报点名回它，不猜"最新"）
   });
   return dispatchJob(wsKey, node);
 }

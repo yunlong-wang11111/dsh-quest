@@ -53,6 +53,14 @@ function wsOf(args, exec) {
   return cwd || process.cwd();
 }
 
+// 派发者身份（2026-09-16）：让 quest 知道是谁派的——失败上报才能点名回派发者，
+// 而不是猜"最新会话"（派发者若是子对话，猜最新可能落到主对话 ⇒ 双重修改）。
+function sessOf(exec) {
+  const s = exec?.agent?.session;
+  const id = s?.sessionId || s?.id || s?.header?.sessionId || s?.header?.id || '';
+  return String(id || '');
+}
+
 function apply(ctx, config = {}) {
   const cfg = () => questConfig(config);
 
@@ -78,7 +86,7 @@ function apply(ctx, config = {}) {
       render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 计划未替换：${v.error}${v.hint ? `\n${v.hint}` : ''}` : `任务线已保存，节点：${(v.nodes || []).join(', ')}` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/plan?ws=${encodeURIComponent(wsOf(args, exec))}`, {
-      method: 'POST', body: JSON.stringify({ markdown: String(args.markdown || ''), ...(args.force === true ? { force: true } : {}) }),
+      method: 'POST', body: JSON.stringify({ markdown: String(args.markdown || ''), ...(args.force === true ? { force: true } : {}), ...(sessOf(exec) ? { dispatchedBy: sessOf(exec) } : {}) }),
     }, 8000),
   }));
 
@@ -94,7 +102,7 @@ function apply(ctx, config = {}) {
       render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 未派发：${v.error}${v.hint ? `\n${v.hint}` : ''}` : `已派发 ${v.jobId}（后台执行中，完成后自动通知）` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/dispatch?ws=${encodeURIComponent(wsOf(args, exec))}`, {
-      method: 'POST', body: JSON.stringify({ node: String(args.node || '') }),
+      method: 'POST', body: JSON.stringify({ node: String(args.node || ''), ...(sessOf(exec) ? { dispatchedBy: sessOf(exec) } : {}) }),
     }, 25000),
   }));
 
@@ -161,7 +169,7 @@ function apply(ctx, config = {}) {
     },
     execute: async (args, exec) => questCall(cfg(), `/api/probe?ws=${encodeURIComponent(wsOf(args, exec))}`, {
       method: 'POST',
-      body: JSON.stringify({ command: String(args.command || ''), cwd: String(args.cwd || wsOf(args, exec)) }),
+      body: JSON.stringify({ command: String(args.command || ''), cwd: String(args.cwd || wsOf(args, exec)), ...(sessOf(exec) ? { dispatchedBy: sessOf(exec) } : {}) }),
     }, 35000),
   }));
 

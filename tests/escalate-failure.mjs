@@ -27,7 +27,7 @@ const sb = await startSandbox({
   name: 'escalate-failure', port: PORT, wsDirs: ['ws'],
   extraConfig: {
     dshBaseUrl: `http://127.0.0.1:${DSH}`, dshToken: 'stub',
-    runGate: { enabled: false }, notify: { kind: 'off' },
+    runGate: { enabled: false }, notify: { kind: 'off', escalate: { cooldownMin: 1 } },
     workersEnabled: false,
   },
 });
@@ -50,6 +50,17 @@ try {
   await waitFor(async () => (await sb.status(WS)).find((n) => n.id === r2.json.nodeId)?.status === 'failed', 30000);
   await sleep(3000);
   s.check('② 冷却内不重复上报', prompts.length === n1, `${n1}→${prompts.length}`);
+
+  // ④ 派发者点名：带 dispatchedBy 的失败 → 回派发者本人，即使存在更新的会话（防双重修改）
+  await sleep(61 * 1000);   // 等冷却过（本沙箱配了 1 分钟）
+  sessions = [
+    { sessionId: 'session-sess-newest-x', cwd: WS, running: false, updatedAt: Date.now() },       // 更新，但不是派发者
+    { sessionId: 'session-sess-old-dispatcher', cwd: WS, running: false, updatedAt: Date.now() - 90 * 60000 }, // 派发者，旧
+  ];
+  const r4 = await sb.api('POST', `/api/run?ws=${encodeURIComponent(WS)}`, { command: 'node bad.js', cwd: WS, title: 'fail-3', expect_minutes: 1, dispatchedBy: 'session-sess-old-dispatcher' });
+  await waitFor(async () => (await sb.status(WS)).find((n) => n.id === r4.json.nodeId)?.status === 'failed', 30000);
+  const fired4 = await waitFor(() => prompts.some((x) => x.sid === 'session-sess-old-dispatcher' && x.text.includes('fail-3')), 30000, 1000);
+  s.check('④ 点名回派发者（不猜最新会话）', fired4, '最后目标: ' + (prompts[prompts.length - 1]?.sid || '无'));
 
   // ③ 成功节点 → 绝不上报
   const n2 = prompts.length;
