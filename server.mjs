@@ -1674,13 +1674,19 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false } = {}
   const summaryFile = path.join(hostPathFor(wsPath) || wsPath || '', `line-summary-${stamp}.md`);
   const before = fs.existsSync(summaryFile) ? fs.statSync(summaryFile).mtimeMs : 0;
   const t0 = Date.now();
-  const timeoutMs = Number(CFG.notify?.converge?.summaryTimeoutSec) > 0 ? Number(CFG.notify?.converge?.summaryTimeoutSec) * 1000 : 360000;   // 默认 6 分钟（4 分钟对冷启动会话太紧——2026-09-16 实测 17:43→17:47 踩线超时）
+  // 默认 15 分钟（2026-09-16 用户定稿："不用截断"——超时不截断流程，照样通知主对话 + QQ 发超时警告知用户）
+  const timeoutMs = Number(CFG.notify?.converge?.summaryTimeoutSec) > 0 ? Number(CFG.notify?.converge?.summaryTimeoutSec) * 1000 : 900000;
   let wrote = false;
   while (Date.now() - t0 < timeoutMs) {
     await new Promise((r) => setTimeout(r, 10000));
     try { if (fs.existsSync(summaryFile) && fs.statSync(summaryFile).mtimeMs > before) { wrote = true; break; } } catch {}
   }
-  if (!wrote) log(`converge ${wsKey}: 总结文件在 ${Math.round(timeoutMs / 60000)} 分钟内未更新（可能超时）`);
+  if (!wrote) {
+    log(`converge ${wsKey}: 总结文件在 ${Math.round(timeoutMs / 60000)} 分钟内未更新（超时，仍将通知主对话）`);
+    if (notifyKind(CFG) !== 'off') {
+      qqPush(wsKey, `[⚠️ 收尾超时] 收尾会话 ${String(workerSid).slice(8, 16)}… 在 ${Math.round(timeoutMs / 60000)} 分钟内没有写出 line-summary-${stamp}.md（可能卡住或上下文太重）。总结仍会以文件指针形式通知主对话。`.slice(0, 400)).catch(() => {});
+    }
+  }
 
   // ── 阶段2：通知主对话（只收通知，不干活）──
   // 主对话定向链：指定 > 翻页接班 > 最新（排除收敛自建）——同 maybeNotifyConverge 的定向
