@@ -2359,7 +2359,10 @@ const server = http.createServer(async (req, res) => {
           });
         } catch (e) { results.errors.push(`seed: ${e.message}`); }
       }
-      appendEvent(wsKey, { t: 'flip.done', archived: results.archived.length, created: results.created });
+      // 记账要记到**被翻的工作区**（2026-09-15 教训）：wsKey 来自 URL query（不带参=默认工作区），
+      // 而 flip 操作的是 body.ws —— 9-11 翻 piml 的三次事件全记进了 code_kl 的账本，
+      // 导致"piml 从没被翻过"的误判（实际 piml/archive/flip-2026-09-11.md 5.36MB 真实存在）。
+      appendEvent(wsKeyOf(String(b.ws ?? '')) || wsKey, { t: 'flip.done', ws: b.ws, archived: results.archived.length, matched: results.matched ?? null, created: results.created });
       return json(200, { ok: results.errors.length === 0, ...results });
     }
     // v0.5 一键续跑：重派被中断的节点（dispatchJob 会自动注入 QUEST_RESUME_FROM 断点）
