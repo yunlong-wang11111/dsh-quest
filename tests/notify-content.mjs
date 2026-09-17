@@ -18,7 +18,7 @@ await new Promise((r) => hook.listen(HOOK, '127.0.0.1', r));
 
 const sb = await startSandbox({
   name: 'notify-content', port: PORT, wsDirs: ['ws'],
-  extraConfig: { notify: { kind: 'webhook', url: `http://127.0.0.1:${HOOK}/hook` }, runGate: { enabled: false } },
+  extraConfig: { notify: { kind: 'webhook', url: `http://127.0.0.1:${HOOK}/hook`, failureBatchSec: 1 }, runGate: { enabled: false } },
 });
 const WS = sb.ws.ws;
 
@@ -30,10 +30,10 @@ try {
   await sleep(1200);
   await sb.api('POST', `/api/dispatch?ws=${encodeURIComponent(WS)}`, { node: 'up' });
   await waitFor(async () => ['running', 'completed', 'failed'].includes((await sb.status(WS)).find((n) => n.id === 'down')?.status), 30000);
-  await sleep(2500); // 等推送落地
+  await sleep(4500); // 等推送落地（失败聚合窗口 1s + 收尾链路）
 
   const all = got.join('\n');
-  s.check('收到多条通知（判定 + soft-pass + 收尾）', got.length >= 3, `条数=${got.length}`);
+  s.check('失败聚合(2失败合1条)+soft-pass 都送达', got.length >= 2 && /失败汇总·2 个节点/.test(all), `条数=${got.length}`); // 2026-09-17 起失败走聚合窗，不再是逐条
   s.check('soft-pass 通知送达', /疑似但放行/.test(all));
   s.check('soft-pass 通知点名了上游节点', /up\(suspect/.test(all), all.match(/上游 [^\n]{0,40}/)?.[0] || '');
   s.check('soft-pass 通知给出探针指令（AI 该怎么查）', /quest_probe/.test(all));

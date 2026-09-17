@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const WS = process.argv[2] || '__HOME__/Desktop/V8/code_kl';
+const WS = process.argv[2] || 'C:/Users/Solanine/Desktop/V8/code_kl';
 const APPLY = process.argv.includes('--apply');
 const HOME = path.join(os.homedir(), '.dsh', 'quests');
 const token = fs.readFileSync(path.join(HOME, '.token'), 'utf8').trim();

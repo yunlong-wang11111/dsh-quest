@@ -68,7 +68,7 @@ function apply(ctx, config = {}) {
     name: 'quest_plan',
     description: [
       '写入/替换当前工作区的任务线计划（quest 系统的源头定义，markdown 格式）。',
-      '⚠️ 写之前必须先用 read 工具读模板：__HOME__\\dsh-plugins\\quest\\PLAN-TEMPLATE.md',
+      '⚠️ 写之前必须先用 read 工具读模板：C:\\Users\\Solanine\\dsh-plugins\\quest\\PLAN-TEMPLATE.md',
       '（含五段科研流水标准骨架、handoff 写作指南与红线——handoff 质量决定 worker 总结质量）。',
       '要点速览：节点用 "---node: <id>---" 分节；command 必填（解释器绝对路径）；',
       'expect_minutes 写真实值（超时护栏=2倍）；after 声明依赖（上游成功自动派发、失败冻结下游；',
@@ -174,6 +174,26 @@ function apply(ctx, config = {}) {
   }));
 
   ctx.tools.register(defineTool({
+    name: 'quest_lit',
+    description: [
+      '文献检索：一次调用拿 10-25 篇的 标题/作者/年份/venue/摘要（≤700字/篇）——替代 web_search+web_fetch 手爬（那是调研子代理贵的原因：一个子代理曾爬 376 次）。',
+      '三个源：arxiv（预印本，最快）；crossref（SCI 主力：Elsevier/Springer/Wiley/IEEE/MDPI 等的 DOI 元数据）；openalex（全覆盖兜底，带引用数 cited_by）。',
+      '找创新点/benchmark 表的正确打法：同一检索词 2-3 源各搜一次 → 圈定候选 → 只对最关键的 1-2 篇再 fetch 全文。',
+      '只读外部 API，不入账本。返回紧凑 JSON，直接可用。',
+    ].join(' '),
+    parameters: {
+      query: { type: 'string', description: '检索词（英文效果最好），如 "tactile sensor contact force reconstruction"' },
+      source: { type: 'string', description: 'arxiv | crossref | openalex（缺省 arxiv）' },
+      limit: { type: 'number', description: '条数 1-25（缺省 10）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, source: { type: 'string' }, count: { type: 'number' }, items: { type: 'array', items: { type: 'object', additionalProperties: true } }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 检索失败：${v.error}` : `${v.source} 命中 ${v.count} 条：\n${(v.items || []).map((x, i) => `${i + 1}. [${x.year || '?'}] ${x.title} — ${x.authors || '?'}${x.venue ? ` (${x.venue})` : ''}${x.cited_by != null ? ` 被引${x.cited_by}` : ''}\n   ${x.id || ''}${x.abstract ? `\n   ${x.abstract.slice(0, 200)}` : ''}`).join('\n')}` }],
+    },
+    execute: async (args) => questCall(cfg(), `/api/lit?q=${encodeURIComponent(String(args.query || ''))}&source=${encodeURIComponent(String(args.source || 'arxiv'))}&limit=${Number(args.limit) || 10}`, undefined, 20000),
+  }));
+
+  ctx.tools.register(defineTool({
     name: 'quest_files',
     description: [
       '浏览/读取任意路径的文件（Windows 绝对路径或 \\\\wsl$\\Ubuntu\\... UNC 路径，即 WSL 内部文件）。',
@@ -181,7 +201,7 @@ function apply(ctx, config = {}) {
       '典型用途：查 WSL 里的实验产物（\\\\wsl$\\Ubuntu\\home\\solanine\\...）、看 checkpoint 目录、翻日志文件。',
     ].join(' '),
     parameters: {
-      path: { type: 'string', description: '绝对路径，如 \\\\wsl$\\Ubuntu\\home\\solanine\\exp 或 __HOME__\\Desktop\\V8' },
+      path: { type: 'string', description: '绝对路径，如 \\\\wsl$\\Ubuntu\\home\\solanine\\exp 或 C:\\Users\\Solanine\\Desktop\\V8' },
       mode: { type: 'string', description: 'list（列目录，缺省）或 read（读文件内容）' },
     },
     output: {

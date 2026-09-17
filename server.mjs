@@ -729,6 +729,9 @@ const uncToLinux = (p) => {
  */
 const hostPathFor = (linuxPath) => {
   const s = String(linuxPath || '');
+  // 2026-09-16 修复：Windows 盘符/UNC 路径直接原样返回。之前会落进 wslUnc 拼成
+  // \\wsl$\Ubuntu\C:\… 这种死路径——收尾总结轮询 100% 超时的根因（等的是不存在的文件）。
+  if (/^[a-zA-Z]:[\\/]/.test(s) || s.startsWith('\\\\') || s.startsWith('//')) return s;
   const m = s.match(/^\/mnt\/([a-zA-Z])(\/.*)?$/);
   if (m) return `${m[1].toUpperCase()}:${(m[2] || '/').replace(/\//g, '\\')}`;
   return wslUnc(s);
@@ -1074,6 +1077,35 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
 }
 const runSecText = (j) => (j.runSec != null ? ` · 跑了 ${Math.round(j.runSec)}s` : '');
 
+// ── 失败风暴聚合（2026-09-17 用户定稿："同一波失败只发一条汇总"）──────────────
+// Tier-0 逐节点 QQ 推送在风暴日会打爆桥的 8/分钟、60/小时限额（当日实测 60/60 顶满 + 429 丢信）。
+// 失败类（suspect/failed/timeout…一切非 ok）进缓冲，窗口 notify.failureBatchSec（默认 45s，显式 0=关）内合并成一条；
+// ok 仍即时推——成功稀罕且有产物图跟随。单个失败不聚（免延迟）。
+const FAIL_BATCH = new Map();   // wsKey -> { items: [{icon, text}], timer }
+function batchFailPush(wsKey, icon, text) {
+  const winRaw = Number(CFG.notify?.failureBatchSec);
+  const win = Number.isFinite(winRaw) && winRaw >= 0 ? winRaw : 45;
+  if (win === 0) { qqPush(wsKey, text).catch((e) => log('qqPush 异常:', e?.message)); return; }
+  let b = FAIL_BATCH.get(wsKey);
+  if (!b) { b = { items: [], timer: null }; FAIL_BATCH.set(wsKey, b); }
+  b.items.push({ icon, text });
+  if (b.timer) return;
+  b.timer = setTimeout(() => {
+    const cur = FAIL_BATCH.get(wsKey);
+    FAIL_BATCH.delete(wsKey);
+    if (!cur || !cur.items.length) return;
+    if (cur.items.length === 1) {
+      qqPush(wsKey, cur.items[0].text).catch((e) => log('qqPush 异常:', e?.message));
+      return;
+    }
+    const lines = cur.items.slice(0, 10).map((it, i) => `${i + 1}. ${it.text.split('\n')[0].slice(0, 130)}`);
+    const more = cur.items.length > 10 ? `\n…共 ${cur.items.length} 个` : '';
+    qqPush(wsKey, `[❌ 失败汇总·${cur.items.length} 个节点（${win}s 窗口聚合，防刷屏限流）]\n${lines.join('\n')}${more}\n逐个排查用 quest_log；全景与判据见 quest_status。`.slice(0, 800)).catch((e) => log('qqPush 异常:', e?.message));
+    try { appendEvent(wsKey, { t: 'notify.fail-batch', count: cur.items.length }); } catch {}
+  }, win * 1000);
+  if (b.timer.unref) b.timer.unref();
+}
+
 /** 判定后的收尾：worker 总结（P2）→ 账本终结 → QQ（P3）→ 收件箱。 */
 async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() - runSec * 1000) {
   let summary = '';
@@ -1088,7 +1120,9 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   try { pushInbox({ node: node.id, verdict: j.verdict, summary }); } catch {}
   if (!node.quiet && !node.__suppressFinishPush && notifyKind(CFG) !== 'off') {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
-    qqPush(wsKey, `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || [j.via, j.detail].filter(Boolean).join(' · ') || j.error || ''}`.slice(0, 600)).catch((e) => log('qqPush 异常:', e?.message));
+    const text = `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || [j.via, j.detail].filter(Boolean).join(' · ') || j.error || ''}`.slice(0, 600);
+    if (ok) qqPush(wsKey, text).catch((e) => log('qqPush 异常:', e?.message));
+    else batchFailPush(wsKey, icon, text);   // 失败进聚合窗口（2026-09-17）
   }
   try { writeProgress(wsKey); } catch (e) { log('writeProgress 失败:', e?.message); }
   // 产物图直推（2026-09-09）：成功节点把运行窗口内新产出的 png/jpg（≤push_images 张，默认 2）发 owner QQ
@@ -1656,9 +1690,11 @@ async function sendConvergePrompt(wsKey, wsPath, info, sid, { manual = false } =
  * 两阶段收尾（2026-09-16 终版，用户定稿："子对话总结，通知主对话——而不是主对话总结"）：
  *   阶段1：轻量收尾会话干总结的活（读 quest_status → 写 line-summary-日期.md）——小上下文，便宜
  *   阶段2：总结写完后，主对话只收一条**短通知**（要点 + 文件指针），不做任何工具调用——大上下文只花一次重发
- * 防炸：阶段1 超时（默认 4 分钟）不阻塞——超时也发通知（仅文件指针，无要点）。
+ * 防炸：阶段1 超时（默认 15 分钟）不阻塞——超时也发通知（仅文件指针，无要点）。
+ * waitAsync=true（手动收尾用）：HTTP 只等"派发"（建会话+发提示词，秒级），等总结+通知主对话转后台——
+ * 否则 /api/summarize 会挂起最长 15 分钟，浏览器/QQ/测试全断（2026-09-16 踩过）。
  */
-async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false } = {}) {
+async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false, waitAsync = false } = {}) {
   const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
   const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
   const stamp = new Date().toISOString().slice(0, 10);
@@ -1670,7 +1706,9 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false } = {}
   log(`converge ${wsKey}: 收尾会话 ${String(workerSid).slice(8, 16)} 开始总结`);
   await sendConvergePrompt(wsKey, wsPath, info, workerSid, { manual });
 
-  // ── 等总结写完（轮询文件 mtime，超时 4 分钟）──
+  // 阶段1.5+2：等总结写完 → 通知主对话。抽成 finish() 是为了让 waitAsync 路径能把它放后台。
+  const finish = async () => {
+  // ── 等总结写完（轮询文件 mtime，默认 15 分钟；超时不截断，照样通知）──
   const summaryFile = path.join(hostPathFor(wsPath) || wsPath || '', `line-summary-${stamp}.md`);
   const before = fs.existsSync(summaryFile) ? fs.statSync(summaryFile).mtimeMs : 0;
   const t0 = Date.now();
@@ -1720,6 +1758,20 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false } = {}
   });
   log(`converge ${wsKey}: 已通知主对话 ${String(mainSid).slice(8, 16)}（总结${wrote ? '✓' : '超时'}）`);
   return { workerSid, wrote, mainNotified: true, mainSid };
+  };
+
+  if (waitAsync) {
+    // 手动收尾：回执先走，done/error 事件后台补写（QQ 超时警告知常）。
+    finish().then((result) => {
+      appendEvent(wsKey, { t: 'notify.converge', manual, sessionId: result.workerSid, mainSid: result.mainSid || undefined, mainNotified: result.mainNotified, wrote: result.wrote || undefined, counts: info.counts, phase: 'done' });
+      log(`notify.converge ${wsKey}${manual ? '(手动)' : ''}: worker=${String(result.workerSid).slice(8, 16)} wrote=${result.wrote}`);
+    }).catch((e) => {
+      appendEvent(wsKey, { t: 'notify.converge', manual, error: String(e?.message || e).slice(0, 160), phase: 'error' });
+      log('notify.converge 后台阶段失败:', e?.message);
+    });
+    return { workerSid, wrote: null, mainNotified: null, async: true };
+  }
+  return finish();
 }
 
 async function maybeNotifyConverge(wsKey, st, info, { immediate = false } = {}) {
@@ -1735,7 +1787,7 @@ async function maybeNotifyConverge(wsKey, st, info, { immediate = false } = {}) 
     if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒
   }
   const wsPath = (() => { try { return parsePlan(st.plan).meta?.workspace || ''; } catch { return ''; } })();
-  // 事件立即写入（不等两阶段走完——阶段 2 含最长 4 分钟等总结文件，等它事件永远迟到）
+  // 事件立即写入（不等两阶段走完——阶段 2 含最长 15 分钟等总结文件，等它事件永远迟到）
   appendEvent(wsKey, { t: 'notify.converge', counts: info.counts, phase: 'started' });
   runConvergeAndNotify(wsKey, wsPath, info).then((result) => {
     appendEvent(wsKey, { t: 'notify.converge', sessionId: result.workerSid, mainSid: result.mainSid || undefined, mainNotified: result.mainNotified, wrote: result.wrote || undefined, counts: info.counts, phase: 'done' });
@@ -2429,6 +2481,21 @@ const server = http.createServer(async (req, res) => {
       list.sort((a, b) => b.running - a.running || Number(a.junk) - Number(b.junk) || b.nodes - a.nodes || a.wsKey.localeCompare(b.wsKey));
       return json(200, { workspaces: list });
     }
+    if (req.method === 'GET' && u.pathname === '/api/lit') {
+      // 文献检索（2026-09-17）：arxiv/crossref/openalex 三源一次调用——替代调研子代理几十轮 web_search/fetch 手爬。
+      // 不入账本（只读外部 API，与任务线无关）；限 limit≤25、abstract≤700 字符，返回体天然紧凑。
+      try {
+        const { litSearch } = await import('./lib/lit.mjs');
+        const items = await litSearch({
+          query: u.searchParams.get('q') || '',
+          source: u.searchParams.get('source') || 'arxiv',
+          limit: u.searchParams.get('limit') || 10,
+        });
+        return json(200, { ok: true, source: u.searchParams.get('source') || 'arxiv', count: items.length, items });
+      } catch (e) {
+        return json(200, { ok: false, error: String(e?.message || e).slice(0, 200) });
+      }
+    }
     if (req.method === 'GET' && u.pathname === '/api/files') {
       // mode=list 列目录（绝对路径，Windows 或 \\wsl$ UNC 均可）；mode=read 读文本（>512KB 截尾）；
       // mode=img 返回 base64 dataURL（图片预览，≤10MB）。token 认证的 owner 本机服务，路径不设白名单。
@@ -2730,17 +2797,19 @@ const server = http.createServer(async (req, res) => {
     // 给目标会话（缺省=本工作区最新的会话，通常是你正在用的那条；没有则新开）排一条全局总结指令。
     if (req.method === 'POST' && u.pathname === '/api/summarize') {
       const b = await readBody(req);
+      if (!ws) return json(400, { ok: false, error: '缺少 ws 参数（工作区路径）' });   // 空 ws 会退化成无主收敛（2026-09-16 踩过：账本写进 quests 根目录）
       const state = buildState(wsKey);
       const info = lineActivity(state);
       const wsPath = (() => { try { return parsePlan(state.plan || '').meta?.workspace || ws; } catch { return ws; } })();
       try {
         // 两阶段（与自动收尾同架构）：轻量会话干总结 → 主对话收通知。事件立即写，后续异步。
+        // waitAsync：回执只等"派发"（建会话+发提示词），等总结（最长 15 分钟）转后台——
+        // 同步等会把 HTTP 挂 15 分钟，浏览器/QQ/测试全断（2026-09-16 踩过）。
         appendEvent(wsKey, { t: 'notify.converge', manual: true, counts: info.counts, phase: 'started' });
-        const result = await runConvergeAndNotify(wsKey, wsPath, info, { manual: true });
-        appendEvent(wsKey, { t: 'notify.converge', manual: true, sessionId: result.workerSid, mainSid: result.mainSid || undefined, mainNotified: result.mainNotified, counts: info.counts, phase: 'done' });
+        const result = await runConvergeAndNotify(wsKey, wsPath, info, { manual: true, waitAsync: true });
         return json(200, {
-          ok: true, sessionId: result.workerSid, mainSessionId: result.mainSid || null,
-          note: `收尾会话 ${String(result.workerSid).slice(0, 16)}… 已完成总结${result.mainNotified ? `并通知了主对话 ${String(result.mainSid).slice(8, 16)}…` : '（未指定主对话）'}`,
+          ok: true, sessionId: result.workerSid,
+          note: `收尾会话 ${String(result.workerSid).slice(0, 16)}… 已唤醒并派发总结（两阶段）；总结写完后自动通知主对话，本回执不等待。`,
         });
       } catch (e) {
         appendEvent(wsKey, { t: 'notify.converge', manual: true, error: String(e?.message || e).slice(0, 160) });

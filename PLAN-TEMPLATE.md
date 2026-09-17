@@ -1,6 +1,6 @@
 # quest_plan 模板与写法指南（AI 写任务线前先读本文件）
 
-> 位置固定：`__HOME__\dsh-plugins\quest\PLAN-TEMPLATE.md`
+> 位置固定：`C:\Users\Solanine\dsh-plugins\quest\PLAN-TEMPLATE.md`
 > `quest_plan` 工具的 markdown 参数按本模板写。写作原则：**handoff 是 worker 总结质量的上限**——
 > worker 只能看到 handoff + 日志尾部，看不到你们的研究语境，所以要在这里替它把语境补齐。
 
@@ -207,3 +207,4 @@ mtime → 确认正常：什么都不做，让它继续跑；确认没跑完：`
 5. `success:` 声明的产物**必须是你真的会写出来的文件**——声明了却不存在，判定器会如实记
    `success-claim-failed`（不算硬失败、不冻结下游，但那条线在控制台上会一直是红/黄）。
    想让某条结论被机械核对，宁可声明"关键词 + 真实产物"两条（例：`产出 v13_u3_data.npz 且日志尾含 "verdict: PASS"`）。
+

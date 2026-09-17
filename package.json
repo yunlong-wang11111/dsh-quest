@@ -1,66 +1,14 @@
 {
   "name": "dsh-quest-service",
-  "version": "0.6.0",
+  "version": "0.1.0",
+  "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.mjs",
-    "mcp": "node mcp-server.mjs",
-    "pack:check": "npm pack --dry-run",
-    "test": "node tests/run-all.mjs"
+    "start": "node server.mjs"
   },
-  "description": "Agent-agnostic research pipeline orchestrator: plan → dispatch → judge → auto-fix → notify, with WSL/Windows execution lanes, HTTP dashboard and MCP tool surface",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "fzstd": "^0.1.1",
-    "zod": "^3.23.0"
-  },
-  "bin": {
-    "dsh-quest": "./server.mjs"
-  },
-  "files": [
-    "server.mjs",
-    "success.mjs",
-    "backends.mjs",
-    "resume.mjs",
-    "notify.mjs",
-    "session-export.mjs",
-    "mcp-server.mjs",
-    "dashboard.html",
-    "dashboard-v2.html",
-    "dsh-plugin/",
-    "lib/",
-    "guard/",
-    "tests/",
-    "PLAN-TEMPLATE.md",
-    "README.md",
-    "LICENSE",
-    "start-quest.bat",
-    "quest-autostart.vbs"
-  ],
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/yunlong-wang11111/dsh-quest.git"
-  },
-  "homepage": "https://github.com/yunlong-wang11111/dsh-quest#readme",
-  "bugs": {
-    "url": "https://github.com/yunlong-wang11111/dsh-quest/issues"
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "keywords": [
-    "dsh",
-    "deepseek-harness",
-    "dsh-plugin",
-    "pipeline",
-    "orchestrator",
-    "research",
-    "mlops",
-    "ml",
-    "experiment",
-    "mcp",
-    "wsl",
-    "job-scheduler"
-  ]
+    "zod": "^4.6.2"
+  }
 }

@@ -1,3 +1,0 @@
-name: 修复 Worker
-description: quest 任务线的自动修复会话：对失败节点做机械性最小修复（带备份），FIX_OK/FIX_GIVEUP 收尾后归档。
-order: 21

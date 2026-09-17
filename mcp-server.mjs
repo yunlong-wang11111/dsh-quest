@@ -49,7 +49,7 @@ async function q(method, pathname, body, timeoutMs = 60000) {
 const ok = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] });
 const fail = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }], isError: true });
 
-const server = new McpServer({ name: 'quest', version: '0.6.0' });
+const server = new McpServer({ name: 'quest', version: '0.6.1' });
 
 server.tool(
   'quest_plan',
@@ -91,6 +91,24 @@ server.tool(
       command: a.command, cwd: a.cwd, title: a.title, reason: a.reason,
       expectMinutes: a.expect_minutes, handoff: a.handoff, success: a.success, autoFix: a.auto_fix, shell: a.shell,
     });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_lit',
+  [
+    '文献检索：一次调用拿 10-25 篇的 标题/作者/年份/venue/摘要（≤700字/篇）——替代 web_search+web_fetch 手爬（一个调研子代理曾爬 376 次，¥1.4）。',
+    '三源：arxiv（预印本）；crossref（SCI 主力：Elsevier/Springer/Wiley/IEEE/MDPI 等 DOI 元数据）；openalex（全覆盖，带被引数）。',
+    '找创新点打法：同一检索词 2-3 源各搜一次 → 圈定候选 → 只对最关键 1-2 篇再 fetch 全文。只读外部 API，不入账本。',
+  ].join(' '),
+  {
+    query: z.string().describe('检索词（英文效果最好）'),
+    source: z.enum(['arxiv', 'crossref', 'openalex']).optional().describe('缺省 arxiv'),
+    limit: z.number().optional().describe('1-25，缺省 10'),
+  },
+  async (a) => {
+    const r = await q('GET', `/api/lit?q=${encodeURIComponent(a.query)}&source=${a.source || 'arxiv'}&limit=${a.limit || 10}`);
     return r.error ? fail(r) : ok(r);
   },
 );

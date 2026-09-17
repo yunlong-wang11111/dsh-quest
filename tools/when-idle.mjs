@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // tools/when-idle.mjs —— 只读诊断：这个工作区现在到底"在干活"还是"真完了"？
 //
-//   node tools/when-idle.mjs "__HOME__/Desktop/V8/code_kl"
+//   node tools/when-idle.mjs "C:/Users/Solanine/Desktop/V8/code_kl"
 //   node tools/when-idle.mjs            # 不带参数 = 扫最近有活动的所有工作区
 //
 // 为什么独立成脚本：服务端的同一份逻辑（lineActivity/evaluateQuiet）要重启才生效，

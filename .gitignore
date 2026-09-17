@@ -1,8 +1,8 @@
+# 运行时产物与本地敏感文件
 node_modules/
 *.log
-.dsh/
-quest-config.json
 .token
-
-# npm pack 产物（本地校验用，不进仓库）
-*.tgz
+quest-config.json
+converge-state.json
+*.bak*
+quest-autostart.vbs.startup-backup
