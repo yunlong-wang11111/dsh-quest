@@ -1048,11 +1048,16 @@ async function reviveStaleEscalations(wsKey) {
   try { raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n'); } catch { return; }
   const escalated = [];   // {node, sessionId, at}
   const revived = new Set();
+  let revivedTotal = 0;
   for (const l of raw) {
     let ev; try { ev = JSON.parse(l); } catch { continue; }
     if (ev.t === 'notify.escalate' && ev.node && !ev.error) escalated.push({ node: String(ev.node), sessionId: String(ev.sessionId || ''), at: tsOf(ev.at) });
-    if (ev.t === 'notify.escalate-revived' && ev.origKey) revived.add(String(ev.origKey));
+    if (ev.t === 'notify.escalate-revived' && ev.origKey) { revived.add(String(ev.origKey)); revivedTotal++; }
   }
+  // 2026-09-18 止血：本工作区累计复活已达 5 条就收手——首轮上线时"每轮 3 条 × 连续巡检"
+  // 对着昨天积压的 escalate 一口气打了 10+ 条进主对话收件箱，制造了新的通知风暴。
+  // 复活是兜底不是催命：5 条足够把"有死信"这件事通知到，剩下的靠收敛总结与状态文件。
+  if (revivedTotal >= 5) return;
   const now = Date.now();
   const stale = escalated.filter((x) => x.at && now - x.at > H * 3600e3 && !revived.has(`${x.node}@${x.at}`));
   if (!stale.length) return;
