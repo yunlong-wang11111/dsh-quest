@@ -27,9 +27,10 @@ try {
   s.check('③ 正常路径 → 派发成功', r.json.ok === true && !!r.json.nodeId, `nodeId=${r.json.nodeId}`);
 
   // ④ 脚本语法错：py_compile 预检当场拦下（需本机有 python，否则记跳过）
+  // 2026-09-18 加 5s 超时：本机 D:\python\python.exe 高负载下会 0xc0000142 挂死（无超时会拖死整个套件）
   const py = process.env.QUEST_TEST_PYTHON || (() => {
     for (const c of ['python', 'python3', 'py', 'py -3']) {
-      try { require('node:child_process').execSync(`${c} -c "pass"`, { stdio: 'ignore' }); return c; } catch {}
+      try { require('node:child_process').execSync(`${c} -c "pass"`, { stdio: 'ignore', timeout: 5000 }); return c; } catch {}
     }
     return null;
   })();

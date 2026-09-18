@@ -16,7 +16,7 @@ await new Promise((r) => hook.listen(HOOK, '127.0.0.1', r));
 
 // ── 幕一：聚合开（窗口 2 秒）──
 const sb = await startSandbox({
-  name: 'fail-batch', port: 3131, wsDirs: ['ws'],
+  name: 'fail-batch', port: 3161, wsDirs: ['ws'],
   extraConfig: { notify: { kind: 'webhook', url: `http://127.0.0.1:${HOOK}/h1`, failureBatchSec: 2 }, runGate: { enabled: false }, workersEnabled: false },
 });
 const WS = sb.ws.ws;
@@ -50,7 +50,7 @@ try {
 
 // ── 幕二：显式 0 关闭聚合（原逐条行为）──
 const sb2 = await startSandbox({
-  name: 'fail-batch-off', port: 3132, wsDirs: ['ws'],
+  name: 'fail-batch-off', port: 3162, wsDirs: ['ws'],
   extraConfig: { notify: { kind: 'webhook', url: `http://127.0.0.1:${HOOK}/h2`, failureBatchSec: 0 }, runGate: { enabled: false }, workersEnabled: false },
 });
 const WS2 = sb2.ws.ws;

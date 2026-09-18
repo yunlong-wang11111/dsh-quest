@@ -174,6 +174,28 @@ function apply(ctx, config = {}) {
   }));
 
   ctx.tools.register(defineTool({
+    name: 'quest_notify',
+    description: [
+      '点名用户（QQ 推送）——**由你决定何时打扰人**：只在需要人拍板、确认方向、或汇报重要结果时用。',
+      '收尾汇报会自动通知用户（不用你发）；中途节点的成败/警告用户已选择静音（nodeEvents:false）——',
+      '所以"需要人"的判断在你手里：能自己查证/重派的别发，真需要决策的一条说清楚（要什么、选项、你的建议）。',
+      '60 秒冷却。留痕 notify.user-ping。',
+    ].join(' '),
+    parameters: {
+      message: { type: 'string', description: '给用户的话（≤800 字）：要什么决策/确认什么/结果一句话' },
+      ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.ok ? '🔔 已通知用户' : `⚠️ 未发出：${v.error || '未知原因'}` }],
+    },
+    execute: async (args, exec) => questCall(cfg(), `/api/notify?ws=${encodeURIComponent(wsOf(args, exec))}`, {
+      method: 'POST',
+      body: JSON.stringify({ message: String(args.message || '') }),
+    }, 15000),
+  }));
+
+  ctx.tools.register(defineTool({
     name: 'quest_lit',
     description: [
       '文献检索：一次调用拿 10-25 篇的 标题/作者/年份/venue/摘要（≤700字/篇）——替代 web_search+web_fetch 手爬（那是调研子代理贵的原因：一个子代理曾爬 376 次）。',

@@ -96,6 +96,22 @@ server.tool(
 );
 
 server.tool(
+  'quest_notify',
+  [
+    '点名用户（QQ）：由你决定何时打扰人——只在需要人拍板/确认/汇报重要结果时用。',
+    '收尾汇报自动通知；中途节点成败用户已静音（nodeEvents:false）。60 秒冷却。',
+  ].join(' '),
+  {
+    message: z.string().describe('给用户的话（≤800 字）：要什么决策/确认什么/结果一句话'),
+    ws: z.string().optional().describe('工作区绝对路径（缺省=当前会话 cwd）'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/notify?ws=${encodeURIComponent(a.ws || a.cwd || '')}`, { message: a.message });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
   'quest_lit',
   [
     '文献检索：一次调用拿 10-25 篇的 标题/作者/年份/venue/摘要（≤700字/篇）——替代 web_search+web_fetch 手爬（一个调研子代理曾爬 376 次，¥1.4）。',

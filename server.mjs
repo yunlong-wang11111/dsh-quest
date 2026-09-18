@@ -793,7 +793,7 @@ function dispatchJob(wsKey, node, body = {}) {
     const pf = await preflight(node);
     if (pf) {
       appendEvent(wsKey, { t: 'node.preflight-failed', node: node.id, error: pf.error });
-      if (!node.quiet) qqPush(wsKey, `[❌ 预检失败] ${node.id}\n${pf.error.slice(0, 300)}`).catch(() => {});
+      if (!node.quiet) nodeEventPush(wsKey, `[❌ 预检失败] ${node.id}\n${pf.error.slice(0, 300)}`).catch(() => {});
       pushInbox({ node: node.id, verdict: 'preflight-failed' });
       resolve({ ok: false, kind: 'preflight-failed', error: pf.error });
       return;
@@ -809,7 +809,7 @@ function dispatchJob(wsKey, node, body = {}) {
           if (!CK_PAT.test(readTail(scriptPath, 262144))) {
             appendEvent(wsKey, { t: 'checkpoint.warn', node: node.id, why: '脚本未见存档模式' });
             pushInbox({ node: node.id, verdict: 'no-checkpoint', detail: '脚本无存档模式：请按约定补断点（启动读 QUEST_RESUME_FROM、固定路径 torch.save），或确认无需断点' });
-            if (!node.quiet) qqPush(wsKey, `[⚠️ 无断点提醒] ${node.id} 预计 ${node.expectMinutes} 分钟，但脚本没扫到 torch.save/checkpoint 模式——中途崩了要从零跑。确认无碍请在节点加 no_checkpoint: true`).catch(() => {});
+            if (!node.quiet) nodeEventPush(wsKey, `[⚠️ 无断点提醒] ${node.id} 预计 ${node.expectMinutes} 分钟，但脚本没扫到 torch.save/checkpoint 模式——中途崩了要从零跑。确认无碍请在节点加 no_checkpoint: true`).catch(() => {});
           }
         } catch {}
       }
@@ -820,7 +820,7 @@ function dispatchJob(wsKey, node, body = {}) {
       if (bypass) {
         appendEvent(wsKey, { t: 'node.lane-bypass', node: node.id, why: bypass.slice(0, 200) });
         pushInbox({ node: node.id, verdict: 'lane-bypass', detail: bypass });
-        if (!node.quiet) qqPush(wsKey, `[⚠️ 车道绕行] ${node.id}` + String.fromCharCode(10) + bypass).catch(() => {});
+        if (!node.quiet) nodeEventPush(wsKey, `[⚠️ 车道绕行] ${node.id}` + String.fromCharCode(10) + bypass).catch(() => {});
       }
     } catch (e) { log('车道检测失败:', e?.message); }
     const jobId = `j-${++jobSeq}-${Date.now().toString(36)}`;
@@ -915,7 +915,7 @@ function dispatchJob(wsKey, node, body = {}) {
           job.ckWarned = true;
           appendEvent(wsKey, { t: 'checkpoint.stale', node: node.id });
           pushInbox({ node: node.id, verdict: 'stale-checkpoint', detail: '运行期间无新存档文件：检查存档路径是否写错或条件未触发' });
-          if (!node.quiet) qqPush(wsKey, `[⚠️ 存档可疑] ${node.id} 已跑 ${Math.round((Date.now() - startedAt) / 60000)} 分钟，运行期间没有任何新 checkpoint 文件——存档可能写错路径或没触发`).catch(() => {});
+          if (!node.quiet) nodeEventPush(wsKey, `[⚠️ 存档可疑] ${node.id} 已跑 ${Math.round((Date.now() - startedAt) / 60000)} 分钟，运行期间没有任何新 checkpoint 文件——存档可能写错路径或没触发`).catch(() => {});
         }
       }
       try {
@@ -957,12 +957,12 @@ function setupWatch(wsKey, node, job, logFile, pid) {
         rule.hits = 0;
         if (rule.action === 'kill') {
           appendEvent(wsKey, { t: 'watch.kill', node: node.id, rule: rule.if });
-          if (!node.quiet) qqPush(wsKey, `[👁 watch 击杀] ${node.id}\n规则「${rule.if}」连续 ${rule.confirm} 次命中，已终止任务`).catch(() => {});
+          if (!node.quiet) nodeEventPush(wsKey, `[👁 watch 击杀] ${node.id}\n规则「${rule.if}」连续 ${rule.confirm} 次命中，已终止任务`).catch(() => {});
           job.killedByWatch = rule.if;
           try { execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => {}); } catch {}
         } else {
           appendEvent(wsKey, { t: 'watch.warn', node: node.id, rule: rule.if });
-          if (!node.quiet) qqPush(wsKey, `[⚠️ watch 警告] ${node.id}\n规则「${rule.if}」命中（只警告不杀；要杀请在 plan 里配 action=kill 或人工 /q停）`).catch(() => {});
+          if (!node.quiet) nodeEventPush(wsKey, `[⚠️ watch 警告] ${node.id}\n规则「${rule.if}」命中（只警告不杀；要杀请在 plan 里配 action=kill 或人工 /q停）`).catch(() => {});
         }
       }
     }
@@ -1153,6 +1153,14 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
 }
 const runSecText = (j) => (j.runSec != null ? ` · 跑了 ${Math.round(j.runSec)}s` : '');
 
+/** Tier-0 节点级 QQ 推送的总闸（2026-09-18 用户定稿："只有收尾需要我决策时才通知"）。
+ * notify.nodeEvents: false → 中途的成败/警告/修复类推送全部静音（收尾汇报与人工终止确认不受影响），
+ * 需要人时由主对话用 quest_notify 工具点名——通知时点从'每个节点'收敛到'AI 判断需要人'。 */
+function nodeEventPush(wsKey, text) {
+  if (CFG.notify?.nodeEvents === false) return;
+  qqPush(wsKey, text).catch(() => {});
+}
+
 // ── 失败风暴聚合（2026-09-17 用户定稿："同一波失败只发一条汇总"）──────────────
 // Tier-0 逐节点 QQ 推送在风暴日会打爆桥的 8/分钟、60/小时限额（当日实测 60/60 顶满 + 429 丢信）。
 // 失败类（suspect/failed/timeout…一切非 ok）进缓冲，窗口 notify.failureBatchSec（默认 45s，显式 0=关）内合并成一条；
@@ -1161,7 +1169,7 @@ const FAIL_BATCH = new Map();   // wsKey -> { items: [{icon, text}], timer }
 function batchFailPush(wsKey, icon, text) {
   const winRaw = Number(CFG.notify?.failureBatchSec);
   const win = Number.isFinite(winRaw) && winRaw >= 0 ? winRaw : 45;
-  if (win === 0) { qqPush(wsKey, text).catch((e) => log('qqPush 异常:', e?.message)); return; }
+  if (win === 0) { nodeEventPush(wsKey, text); return; }
   let b = FAIL_BATCH.get(wsKey);
   if (!b) { b = { items: [], timer: null }; FAIL_BATCH.set(wsKey, b); }
   b.items.push({ icon, text });
@@ -1171,7 +1179,7 @@ function batchFailPush(wsKey, icon, text) {
     FAIL_BATCH.delete(wsKey);
     if (!cur || !cur.items.length) return;
     if (cur.items.length === 1) {
-      qqPush(wsKey, cur.items[0].text).catch((e) => log('qqPush 异常:', e?.message));
+      nodeEventPush(wsKey, cur.items[0].text);
       return;
     }
     const lines = cur.items.slice(0, 10).map((it, i) => `${i + 1}. ${it.text.split('\n')[0].slice(0, 130)}`);
@@ -1197,7 +1205,7 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   if (!node.quiet && !node.__suppressFinishPush && notifyKind(CFG) !== 'off') {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
     const text = `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || [j.via, j.detail].filter(Boolean).join(' · ') || j.error || ''}`.slice(0, 600);
-    if (ok) qqPush(wsKey, text).catch((e) => log('qqPush 异常:', e?.message));
+    if (ok) nodeEventPush(wsKey, text);
     else batchFailPush(wsKey, icon, text);   // 失败进聚合窗口（2026-09-17）
   }
   try { writeProgress(wsKey); } catch (e) { log('writeProgress 失败:', e?.message); }
@@ -1443,7 +1451,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
   const attempt = (st.fixCount ?? 0) + 1;
   if (attempt > (node.fixBudget ?? 2)) {
     appendEvent(wsKey, { t: 'fix.stopped', node: node.id, reason: `预算耗尽（${node.fixBudget ?? 2} 次）` });
-    qqPush(wsKey, `[🛑 自动修复停手] ${node.id}：${node.fixBudget ?? 2} 次尝试后仍失败，等人工。
+    nodeEventPush(wsKey, `[🛑 自动修复停手] ${node.id}：${node.fixBudget ?? 2} 次尝试后仍失败，等人工。
 最近一次修复：${String(st.lastFix || '').slice(0, 200)}`).catch(() => {});
     return;
   }
@@ -1509,7 +1517,7 @@ ${logTail}
     const okFix = /FIX_OK/i.test(reply.slice(-200));
     appendEvent(wsKey, { t: 'fix.reported', node: node.id, changes: reply.slice(0, 600), diff: diff || '(无文件改动)' });
     if (!node.quiet && notifyKind(CFG) !== 'off') {
-      qqPush(wsKey, `[🔧 自动修复 ${giveup ? '放弃' : okFix ? '完成' : '未知'}] ${node.id} 第${attempt}次
+      nodeEventPush(wsKey, `[🔧 自动修复 ${giveup ? '放弃' : okFix ? '完成' : '未知'}] ${node.id} 第${attempt}次
 ${reply.slice(0, 250)}${diff ? `
 ── 实际改动 ──
 ${diff}` : ''}`.slice(0, 900)).catch(() => {});
@@ -1832,7 +1840,7 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false, waitA
     content: [{ type: 'text', text: [
       `【全线收敛·总结已完成${manual ? '·手动' : ''}】任务线全部结束（${info.nodes.length} 节点：${Object.entries(info.counts).map(([k, v]) => v + ' ' + k).join(' / ')}）。`,
       wrote ? `全局总结已由收尾会话写入 line-summary-${stamp}.md。要点：\n${headline}` : `收尾会话可能超时，总结文件在 line-summary-${stamp}.md（自己去读）。`,
-      '**接下来自动推进**：读 research-state.md 的待办清单——有下一项就直接写新 plan 派发（不用等用户）；全部完成或遇到需拍板的事项才向用户复述并等待。',
+      '**接下来自动推进**：① 先把本轮做了什么追加进 research-state.md 的「任务总览」区（时间倒序、一行一条：`日期时刻 · 做了什么 · 结果/数字`，旧的往下排）——用户不在场时全靠它知道你干了什么。② 读待办清单——有下一项就直接写新 plan 派发（不用等用户）；全部完成或遇到需拍板的事项才用 quest_notify 点名用户（中间过程不用通知）。',
     ].join('\n') }],
   });
   log(`converge ${wsKey}: 已通知主对话 ${String(mainSid).slice(8, 16)}（总结${wrote ? '✓' : '超时'}）`);
@@ -2562,6 +2570,28 @@ const server = http.createServer(async (req, res) => {
       } catch {}
       list.sort((a, b) => b.running - a.running || Number(a.junk) - Number(b.junk) || b.nodes - a.nodes || a.wsKey.localeCompare(b.wsKey));
       return json(200, { workspaces: list });
+    }
+    if (req.method === 'POST' && u.pathname === '/api/notify') {
+      // AI 点名用户（2026-09-18 用户定稿："中间不用通知我；需要我的时候再通知"）。
+      // Tier-0 已可静音（notify.nodeEvents:false），收尾自动响；这把"何时找人"的开关交给主对话自己。
+      // 60 秒冷却防手滑连发；留痕 notify.user-ping。
+      const b = await readBody(req);
+      const msg = String(b.message || '').trim().slice(0, 800);
+      if (!msg) return json(400, { ok: false, error: '缺少 message' });
+      const cdMs = Math.max(5, Number(CFG.notify?.userPingCooldownSec) || 60) * 1000;
+      let lastPing = 0;
+      try {
+        const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+        for (let i = raw.length - 1; i >= 0; i--) { let ev; try { ev = JSON.parse(raw[i]); } catch { continue; } if (ev.t === 'notify.user-ping') { lastPing = tsOf(ev.at); break; } }
+      } catch {}
+      if (lastPing && Date.now() - lastPing < cdMs) return json(200, { ok: false, error: `冷却中（${Math.round((cdMs - (Date.now() - lastPing)) / 1000)}s 后可再发）` });
+      appendEvent(wsKey, { t: 'notify.user-ping' });
+      try {
+        if (notifyKind(CFG) === 'off') return json(200, { ok: false, error: '通知出口为 off（配 notify.kind）' });
+        await qqPush(wsKey, `[🔔 AI 点名·需要你] ${msg}`);
+        log(`notify.user-ping ${wsKey}: ${msg.slice(0, 60)}`);
+        return json(200, { ok: true });
+      } catch (e) { return json(200, { ok: false, error: String(e?.message || e).slice(0, 120) }); }
     }
     if (req.method === 'GET' && u.pathname === '/api/lit') {
       // 文献检索（2026-09-17）：arxiv/crossref/openalex 三源一次调用——替代调研子代理几十轮 web_search/fetch 手爬。
