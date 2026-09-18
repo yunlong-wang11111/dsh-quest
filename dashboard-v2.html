@@ -88,6 +88,7 @@
 <header>
   <h1>quest 控制台 <small id="ver"></small></h1>
   <span class="pill" id="live">● 实时</span>
+  <span class="pill" id="convAuto" title="自动收尾开关（本工作区独立）：线收敛时自动做全局总结并通知主对话。点击=开关" style="cursor:pointer" onclick="doConverge()">收尾 ?</span>
   <span class="mut">工作区</span>
   <select id="ws" style="max-width:380px" title="切换工作区（控制台按工作区看节点；地址里带 ?ws= 会固定住）"></select>
   <span class="mut" id="wsmeta"></span>
@@ -349,6 +350,13 @@ async function loadTasks() {
   const d = await api('/api/status?ws=' + encodeURIComponent(curWs));
   $('#ver').textContent = d.questVersion || '';
   $('#wsmeta').textContent = d.plan?.workspace || '';
+  // 自动收尾状态灯（2026-09-18）：和"实时"并排、一眼可见；点击即开关（与按钮同路）。
+  const cv = $('#convAuto');
+  if (cv) {
+    const on = d.convergeAuto !== false;
+    cv.textContent = on ? '● 收尾开' : '○ 收尾关';
+    cv.style.color = on ? 'var(--ok)' : 'var(--bad)';
+  }
   nodesCache = d.plan?.nodes || [];
   lastStatus = d;
   await loadPlans();          // 先拿到"计划"下拉的选项，再画图（切工作区也走这条路）

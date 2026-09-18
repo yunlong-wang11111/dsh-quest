@@ -1946,6 +1946,11 @@ function sweepQuietDirs() {
       // 死信复活放在静默判定的 mtime 门槛之前：死信按定义就是"账本已 6h+ 没动静"的工作区
       // （最后一条事件往往就是那条没人读的 escalate），不能被下面的 cutoff 跳过。
       reviveStaleEscalations(d).catch((e) => log('escalate-revive 异常:', e?.message));
+      // 定时重开也挪到巡检（2026-09-18 修复：此前挂在 maybeNotifyConverge 里——自动收尾关着
+      // 且线安静时收敛检查不会跑，12:00 的重开永远轮不到检查。用户实测上午关掉、中午没开回来）。
+      try {
+        if (checkReopenConverge(d, CFG.notify?.converge)) log(`converge ${d}: 巡检定时重开自动收尾`);
+      } catch {}
       if (fs.statSync(f).mtimeMs < cutoff) continue;
       evaluateQuiet(d);
     } catch { /* 单个工作区出错不影响其它 */ }
@@ -2390,7 +2395,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.6.0',
+        unread, questVersion: '0.6.0', convergeAuto: convergeAutoOn(wsKey),
       });
     }
     // 历史计划列表（2026-09-14）：控制台用下拉栏调出以前那些短流程 plan。
