@@ -222,7 +222,10 @@ function buildState(wsKey) {
         state.lineEvents.push(e);
         // quest 自己的记账事件（line.quiet/line.concluded）不算"工作区活动"——否则静默通知
         // 一推、活动时钟立刻被自己刷新，状态又变回"不静默"（实测踩到过）。
-        if (e.at && !['line.quiet', 'line.concluded', 'notify.converge'].includes(e.t)) state.lastLineEventAt = e.at;
+        // 2026-09-18：排除清单改前缀匹配——notify.*（converge/worker/fail-batch/escalate-revived）
+        // 与 fix.session 全是记账类事件，不该算"工作区还有活动"（notify.converge.worker 曾把
+        // lastLineEventAt 永远顶新，静默判定死活不触发，quiet-signal/dsh-session-activity 双测抓出）。
+        if (e.at && !/^(line\.quiet|line\.concluded|notify\.|fix\.)/.test(String(e.t))) state.lastLineEventAt = e.at;
         if (e.t === 'plan.created' || e.t === 'plan.reloaded') {
           for (const n2 of Object.values(state.nodes)) n2.fixCount = 0; // 新 plan = 新预算
         }
@@ -1019,6 +1022,74 @@ function handleNodeExit(wsKey, node, ctx) {
  * 防轰炸：逐工作区冷却（默认 10 分钟，config notify.escalate.cooldownMin）；消息只带指针不带日志。
  * queue 语义：目标忙则排队，不打断当前回合。默认开（notify.escalate.enabled=false 可关）。
  */
+/** 本工作区 quest 自建过的会话（收尾 worker 等）——失败上报的"最新会话"回退绝不能命中它们：
+ *  临时会话干完这轮就永不再醒，投进去的上报=死信（2026-09-18 复盘 b551f7b4：9/16 21:56 的
+ *  失败上报在收尾 worker 收件箱里躺了 36 小时，直到人工归档才清掉）。 */
+function questSpawnedSids(wsKey) {
+  const out = new Set();
+  try {
+    const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+    for (const l of raw) {
+      let ev; try { ev = JSON.parse(l); } catch { continue; }
+      if (ev.sessionId && (String(ev.t).startsWith('notify.converge') || String(ev.t).startsWith('fix.'))) out.add(String(ev.sessionId));
+    }
+  } catch {}
+  return out;
+}
+
+/** 死信复活：失败上报投给的会话若一直没醒（默认 6 小时）且节点至今仍失败——把要点转投主对话，
+ *  不让信息烂在临时会话收件箱里（b551f7b4 事故的机制性兜底）。每条 escalate 只复活一次。
+ *  notify.escalate.reviveHours 可调（0=关）。挂在静默巡检上，跟 sweepSeconds 同频。 */
+async function reviveStaleEscalations(wsKey) {
+  const hr = Number(CFG.notify?.escalate?.reviveHours);
+  const H = Number.isFinite(hr) && hr >= 0 ? hr : 6;
+  if (!(H > 0)) return;
+  let raw;
+  try { raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n'); } catch { return; }
+  const escalated = [];   // {node, sessionId, at}
+  const revived = new Set();
+  for (const l of raw) {
+    let ev; try { ev = JSON.parse(l); } catch { continue; }
+    if (ev.t === 'notify.escalate' && ev.node && !ev.error) escalated.push({ node: String(ev.node), sessionId: String(ev.sessionId || ''), at: tsOf(ev.at) });
+    if (ev.t === 'notify.escalate-revived' && ev.origKey) revived.add(String(ev.origKey));
+  }
+  const now = Date.now();
+  const stale = escalated.filter((x) => x.at && now - x.at > H * 3600e3 && !revived.has(`${x.node}@${x.at}`));
+  if (!stale.length) return;
+  const state = buildState(wsKey);
+  const stillBad = stale.filter((x) => ['failed', 'timeout'].includes(state.nodes[x.node]?.status ?? ''));
+  if (!stillBad.length) return;   // 节点后来好了/被重派过——旧上报不复活
+  // 目标：主对话定向 > 最新非 quest 自建会话；都没有就只落事件不投递
+  let target = loadConvergeState()[wsKey]?.mainSessionId || '';
+  if (!target) {
+    try {
+      const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+      const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+      const lr = await api.sessions.list({});
+      let wsPath = ''; try { wsPath = parsePlan(state.plan || '').meta?.workspace || ''; } catch {}
+      let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
+      const spawned = questSpawnedSids(wsKey);
+      const mine = (lr.result.value?.items ?? []).filter((x) => { try { return key && wsKeyOf(String(x.cwd ?? '')) === key && !spawned.has(String(x.sessionId)); } catch { return false; } });
+      target = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0] ?? { sessionId: '' }).sessionId) || '';
+    } catch {}
+  }
+  for (const x of stillBad.slice(0, 3)) {   // 一轮最多复活 3 条，防风暴补炸
+    const key = `${x.node}@${x.at}`;
+    if (target) {
+      try {
+        const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+        const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+        await api.sessions.prompt({
+          sessionId: target, mode: 'queue',
+          content: [{ type: 'text', text: `🔁【失败上报·死信复活】节点 ${x.node} 的失败上报投给会话 ${x.sessionId.slice(8, 16)}… 后 ${Math.round((now - x.at) / 3600e3)} 小时未被读取（该会话可能已不会再醒）。节点当前仍是失败态——若已处理请忽略，否则定位修复后 quest_dispatch 重派。` }],
+        });
+      } catch (e) { log('escalate-revive 投递失败:', e?.message); }
+    }
+    appendEvent(wsKey, { t: 'notify.escalate-revived', node: x.node, origKey: key, fromSession: x.sessionId, toSession: target || '(无目标，仅留痕)' });
+    log(`escalate-revived ${wsKey}: ${x.node} → ${target ? target.slice(8, 16) : '留痕'}`);
+  }
+}
+
 async function maybeNotifyFailure(wsKey, node, j, summary) {
   const ne = CFG.notify?.escalate;
   if (ne && ne.enabled === false) return;
@@ -1057,7 +1128,12 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
     } catch {}
     let sid = by;
     if (!sid || !mine.some((x) => String(x.sessionId) === sid)) {
-      sid = String(mine.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), mine[0]).sessionId);
+      // 2026-09-18 堵洞：回退"最新会话"时排除 quest 自建会话（收尾 worker 等）——
+      // 它们是最新会话的概率极高（收敛后紧接着就是失败判定），且干完永不再醒 = 死信。
+      const spawned = questSpawnedSids(wsKey);
+      const cand = mine.filter((x) => !spawned.has(String(x.sessionId)));
+      if (!cand.length) { log(`notify.escalate ${wsKey}: ${node.id} 本工作区只剩 quest 自建会话，放弃上报（防死信；QQ/收敛汇报兜底）`); return; }
+      sid = String(cand.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), cand[0]).sessionId);
     }
     await api.sessions.prompt({
       sessionId: sid, mode: 'queue',
@@ -1381,6 +1457,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
     if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 120));
     sessionId = created.result.value.sessionId;
     activeWorkers.add(sessionId);
+    try { appendEvent(wsKey, { t: 'fix.session', node: node.id, sessionId }); } catch {}   // 登记为 quest 自建（防死信定向）
     const collector = createTurnCollector();
     let done; const turnP = new Promise((r) => { done = r; });
     workerCollectors.set(sessionId, { collector, resolve: done });
@@ -1703,6 +1780,8 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false, waitA
   const sr = await api.sessions.create({ cwd: wsPath || undefined });
   if (!sr.result.ok) throw new Error('create 收尾会话失败: ' + JSON.stringify(sr.result.error ?? {}).slice(0, 100));
   const workerSid = sr.result.value.sessionId;
+  // 创建即登记（不等总结完成）：失败上报的"最新会话"回退与死信复活都要能认出 quest 自建会话
+  appendEvent(wsKey, { t: 'notify.converge.worker', sessionId: workerSid, manual: manual || undefined });
   log(`converge ${wsKey}: 收尾会话 ${String(workerSid).slice(8, 16)} 开始总结`);
   await sendConvergePrompt(wsKey, wsPath, info, workerSid, { manual });
 
@@ -1851,6 +1930,9 @@ function sweepQuietDirs() {
   for (const d of dirs) {
     try {
       const f = path.join(HOMEOverride, d, 'ledger.jsonl');
+      // 死信复活放在静默判定的 mtime 门槛之前：死信按定义就是"账本已 6h+ 没动静"的工作区
+      // （最后一条事件往往就是那条没人读的 escalate），不能被下面的 cutoff 跳过。
+      reviveStaleEscalations(d).catch((e) => log('escalate-revive 异常:', e?.message));
       if (fs.statSync(f).mtimeMs < cutoff) continue;
       evaluateQuiet(d);
     } catch { /* 单个工作区出错不影响其它 */ }
