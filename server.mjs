@@ -1031,7 +1031,11 @@ function questSpawnedSids(wsKey) {
     const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
     for (const l of raw) {
       let ev; try { ev = JSON.parse(l); } catch { continue; }
-      if (ev.sessionId && (String(ev.t).startsWith('notify.converge') || String(ev.t).startsWith('fix.'))) out.add(String(ev.sessionId));
+      // 只认 worker/fixer 的出生证明。不能放宽到 notify.converge* 通配——旧版（≤0.6.0）的
+      // notify.converge 事件把 sessionId 记成**被通知的主对话**（2026-09-16 的 566db392 就这么
+      // 被拉黑的），通配收集会把主对话永久标成自建会话：定向层拒收它、兜底层跳过它，
+      // 上报永远散弹进子会话（2026-09-19 复盘：4 次上报 4 个子会话）。
+      if (ev.sessionId && (ev.t === 'notify.converge.worker' || String(ev.t).startsWith('fix.'))) out.add(String(ev.sessionId));
     }
   } catch {}
   return out;
@@ -1098,18 +1102,29 @@ async function reviveStaleEscalations(wsKey) {
 async function maybeNotifyFailure(wsKey, node, j, summary) {
   const ne = CFG.notify?.escalate;
   if (ne && ne.enabled === false) return;
-  const cooldownMs = Math.max(1, Number(ne?.cooldownMin) || 10) * 60000;
+  // 0=关（与 failureBatchSec/reviveHours 约定一致；原先 Number(0)||10 会把 0 悄悄变 10 分钟）
+  const cdm = Number(ne?.cooldownMin);
+  const cooldownMs = (Number.isFinite(cdm) && cdm >= 0 ? cdm : 10) * 60000;
   // 冷却判据直接读账本原文：notify.escalate 带着 node 字段，buildState 会把它归进节点事件
   // （lineEvents 查不到——测试②正是抓出这个），扫原文最稳。
   let lastEscAt = 0;
+  // 派发者先查（要在冷却判断之前）：点名回执不设冷却——主对话"派活→等结果→接下一步"的接力
+  // 全靠失败回执驱动，冷却把它吞了就是断链（2026-09-19 实测：02:43/02:44 两条派发者自己的
+  // 失败被 10 分钟冷却压掉，兜底的收敛汇报又被 pending 幽灵节点卡死，主对话睡到早上啥都不知道）。
+  // 冷却只防"兜底启发式"的轰炸，不防点名回执。
+  let by = '';
   try {
     const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
     for (let i = raw.length - 1; i >= 0; i--) {
       let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
       if (ev.t === 'notify.escalate') { lastEscAt = tsOf(ev.at); break; }
     }
+    for (let i = raw.length - 1; i >= 0; i--) {
+      let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+      if (ev.node === node.id && (ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.dispatchedBy) { by = String(ev.dispatchedBy); break; }
+    }
   } catch {}
-  if (lastEscAt && Date.now() - lastEscAt < cooldownMs) return;   // 冷却内：这批失败靠 QQ/收敛汇报兜底
+  if (!by && lastEscAt && Date.now() - lastEscAt < cooldownMs) return;   // 冷却内（仅兜底路径）：这批失败靠 QQ/收敛汇报兜底
   const st = buildState(wsKey);
   const wsPath = (() => { try { return parsePlan(st.plan || '').meta?.workspace || ''; } catch { return ''; } })();
   try {
@@ -1123,22 +1138,24 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
     if (!mine.length) return;
     // 定向优先级（2026-09-16 防双重修改）：①账本里记录的派发者会话（点名回它——派发者若是子对话，
     // 也只回它，绝不扩散到主对话）；②没有记录（旧节点/插件未升级）才退回"最新会话"启发式。
-    let by = '';
-    try {
-      const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
-      for (let i = raw.length - 1; i >= 0; i--) {
-        let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
-        if (ev.node === node.id && (ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.dispatchedBy) { by = String(ev.dispatchedBy); break; }
-      }
-    } catch {}
+    // （by 已在冷却判断前扫出——见上。）
     let sid = by;
     if (!sid || !mine.some((x) => String(x.sessionId) === sid)) {
-      // 2026-09-18 堵洞：回退"最新会话"时排除 quest 自建会话（收尾 worker 等）——
-      // 它们是最新会话的概率极高（收敛后紧接着就是失败判定），且干完永不再醒 = 死信。
+      // 定向优先级（2026-09-18 补主对话层）：派发者 > 主对话（converge 指定/翻页接班）> 最新非自建。
+      // 洞（当日实测）：主对话把活儿派给子会话后，"最新会话"几乎永远是某个子会话——
+      // 一天 6 次失败上报散进 6 个不同子会话，主对话一次都收不到。收敛/死信复活早有主对话
+      // 定向层，唯独这条链没有；对齐之。
       const spawned = questSpawnedSids(wsKey);
-      const cand = mine.filter((x) => !spawned.has(String(x.sessionId)));
-      if (!cand.length) { log(`notify.escalate ${wsKey}: ${node.id} 本工作区只剩 quest 自建会话，放弃上报（防死信；QQ/收敛汇报兜底）`); return; }
-      sid = String(cand.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), cand[0]).sessionId);
+      const mainSid = loadConvergeState()[wsKey]?.mainSessionId || '';
+      if (mainSid && !spawned.has(mainSid) && mine.some((x) => String(x.sessionId) === mainSid)) {
+        sid = mainSid;
+      } else {
+        // 2026-09-18 堵洞：回退"最新会话"时排除 quest 自建会话（收尾 worker 等）——
+        // 它们是最新会话的概率极高（收敛后紧接着就是失败判定），且干完永不再醒 = 死信。
+        const cand = mine.filter((x) => !spawned.has(String(x.sessionId)));
+        if (!cand.length) { log(`notify.escalate ${wsKey}: ${node.id} 本工作区只剩 quest 自建会话，放弃上报（防死信；QQ/收敛汇报兜底）`); return; }
+        sid = String(cand.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), cand[0]).sessionId);
+      }
     }
     await api.sessions.prompt({
       sessionId: sid, mode: 'queue',
@@ -1157,6 +1174,33 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
   }
 }
 const runSecText = (j) => (j.runSec != null ? ` · 跑了 ${Math.round(j.runSec)}s` : '');
+
+/** 成功回执（2026-09-19 署名回执制）：节点完成 → 一行短讯队列给署名派发者。
+ *  无署名（自动链/旧节点/未升级插件）不回执——那类由收尾汇总兜底。 */
+async function maybeNotifyReceipt(wsKey, nodeId, runSec, summary) {
+  let by = '';
+  try {
+    const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+    for (let i = raw.length - 1; i >= 0; i--) {
+      let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+      if (ev.node === nodeId && (ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.dispatchedBy) { by = String(ev.dispatchedBy); break; }
+    }
+  } catch {}
+  if (!by) return;
+  try {
+    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+    const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    await api.sessions.prompt({
+      sessionId: by, mode: 'queue',
+      content: [{ type: 'text', text: `✅【回执】节点 ${nodeId} 完成（${runSec != null ? Math.max(1, Math.round(runSec / 60)) + ' 分钟' : '时长未知'}）。${String(summary || '').split('\n')[0].slice(0, 150)}\n接下一步；产物/日志 quest_log，全景 quest_status。` }],
+    });
+    appendEvent(wsKey, { t: 'notify.receipt', node: nodeId, sessionId: by });
+    log(`notify.receipt ${wsKey}: ${nodeId} → ${String(by).slice(8, 16)}`);
+  } catch (e) {
+    appendEvent(wsKey, { t: 'notify.receipt', node: nodeId, error: String(e?.message || e).slice(0, 120) });
+    log('notify.receipt 失败:', e?.message);
+  }
+}
 
 /** Tier-0 节点级 QQ 推送的总闸（2026-09-18 用户定稿："只有收尾需要我决策时才通知"）。
  * notify.nodeEvents: false → 中途的成败/警告/修复类推送全部静音（收尾汇报与人工终止确认不受影响），
@@ -1206,6 +1250,10 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   // 第 2 级·失败上报（2026-09-16 用户定稿）：失败要报告给派发它的主对话——否则派发者永远蒙在鼓里。
   // 指针式短讯（不带日志）+ 冷却防轰炸；目标=本工作区最新会话（queue 语义，忙则等）。auto_fix 已接手的跳过（修复者自己知道）。
   if (!ok && !node.quiet && !node.autoFix) maybeNotifyFailure(wsKey, node, j, summary).catch((e) => log('失败上报异常:', e?.message));
+  // 成功回执（2026-09-19 用户定稿"署名回执制"）：谁派的活，**成败都回它**——接力（派活→等结果→
+  // 接下一步）靠回执驱动，只有成功回执才闭环。仅署名派发才回（自动链节点不带署名，不轰炸；
+  // 线级汇总仍归收尾）。notify.receipt=false 可关。
+  if (ok && !node.quiet && CFG.notify?.receipt !== false) maybeNotifyReceipt(wsKey, node.id, runSec, summary).catch((e) => log('成功回执异常:', e?.message));
   try { pushInbox({ node: node.id, verdict: j.verdict, summary }); } catch {}
   if (!node.quiet && !node.__suppressFinishPush && notifyKind(CFG) !== 'off') {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
@@ -1813,7 +1861,7 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false, waitA
   }
   if (!wrote) {
     log(`converge ${wsKey}: 总结文件在 ${Math.round(timeoutMs / 60000)} 分钟内未更新（超时，仍将通知主对话）`);
-    if (notifyKind(CFG) !== 'off') {
+    if (notifyKind(CFG) !== 'off' && CFG.notify?.converge?.qq !== false) {
       qqPush(wsKey, `[⚠️ 收尾超时] 收尾会话 ${String(workerSid).slice(8, 16)}… 在 ${Math.round(timeoutMs / 60000)} 分钟内没有写出 line-summary-${stamp}.md（可能卡住或上下文太重）。总结仍会以文件指针形式通知主对话。`.slice(0, 400)).catch(() => {});
     }
   }
@@ -1883,7 +1931,8 @@ async function maybeNotifyConverge(wsKey, st, info, { immediate = false } = {}) 
   appendEvent(wsKey, { t: 'notify.converge', counts: info.counts, phase: 'started' });
   runConvergeAndNotify(wsKey, wsPath, info).then((result) => {
     appendEvent(wsKey, { t: 'notify.converge', sessionId: result.workerSid, mainSid: result.mainSid || undefined, mainNotified: result.mainNotified, wrote: result.wrote || undefined, counts: info.counts, phase: 'done' });
-    if (notifyKind(CFG) !== 'off') {
+    // QQ 收尾汇报可关（2026-09-19：阶段汇总改由主对话统一发声，quest 不再直接打扰用户）
+    if (notifyKind(CFG) !== 'off' && CFG.notify?.converge?.qq !== false) {
       qqPush(wsKey, `[🏁 收尾汇报] 任务线收敛（${info.nodes.length} 节点）。${result.wrote ? '总结已写入 line-summary-*.md' : '总结文件超时'}${result.mainNotified ? '，已通知主对话' : ''}。`.slice(0, 300)).catch(() => {});
     }
     log(`notify.converge ${wsKey}: worker=${String(result.workerSid).slice(8, 16)} main=${result.mainNotified ? String(result.mainSid).slice(8, 16) : '未通知'} wrote=${result.wrote}`);
@@ -2395,7 +2444,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.6.0', convergeAuto: convergeAutoOn(wsKey),
+        unread, questVersion: '0.6.6', convergeAuto: convergeAutoOn(wsKey),
       });
     }
     // 历史计划列表（2026-09-14）：控制台用下拉栏调出以前那些短流程 plan。
@@ -2583,11 +2632,17 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && u.pathname === '/api/notify') {
       // AI 点名用户（2026-09-18 用户定稿："中间不用通知我；需要我的时候再通知"）。
-      // Tier-0 已可静音（notify.nodeEvents:false），收尾自动响；这把"何时找人"的开关交给主对话自己。
-      // 60 秒冷却防手滑连发；留痕 notify.user-ping。
+      // 2026-09-19 收权：QQ 点名**仅主对话可用**——阶段汇总与决策请求由主对话统一发声，
+      // 子对话把结果报给主对话（署名回执制），不再各自打扰用户。
       const b = await readBody(req);
       const msg = String(b.message || '').trim().slice(0, 800);
       if (!msg) return json(400, { ok: false, error: '缺少 message' });
+      const caller = String(b.sessionId || '').trim();
+      const mainSid = loadConvergeState()[wsKey]?.mainSessionId || '';
+      if (mainSid) {
+        if (!caller) return json(200, { ok: false, error: `QQ 点名仅主对话可用（本工作区登记的主对话是 ${mainSid.slice(8, 16)}…）。子对话请把结果回执给主对话，由它汇总点名。` });
+        if (caller !== mainSid) return json(200, { ok: false, error: `QQ 点名仅主对话可用——你是 ${caller.slice(8, 16)}…，不是本工作区登记的主对话。先把结果回执给主对话（它会阶段汇总并点名用户）。` });
+      }   // 未登记主对话的工作区放行（fail-open，翻页/指定后自动收紧）
       const cdMs = Math.max(5, Number(CFG.notify?.userPingCooldownSec) || 60) * 1000;
       let lastPing = 0;
       try {

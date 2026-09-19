@@ -1,10 +1,14 @@
 // dsh-quest — quest 任务线的 DSH 侧薄插件（4 工具，HTTP → 本机 quest 服务）
 // 设计：QUEST_DESIGN.md §4。所有请求 4 秒超时（8788 无超时挂死的前车之鉴），
 // token 与 quest 服务共享 ~/.dsh/quests/.token。
-import { readFileSync } from 'node:fs';
+import { readFileSync, appendFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { defineTool } from '@deepseek-ai/dsh-tools';
+
+// 模板路径按仓库实际位置推导（2026-09-19：原来是硬编码 C:\Users\... ——开源给别人就指空气了）
+const PLAN_TEMPLATE_PATH = fileURLToPath(new URL('../PLAN-TEMPLATE.md', import.meta.url));
 
 const name = 'dsh-quest';
 const inject = ['tools'];
@@ -55,10 +59,33 @@ function wsOf(args, exec) {
 
 // 派发者身份（2026-09-16）：让 quest 知道是谁派的——失败上报才能点名回派发者，
 // 而不是猜"最新会话"（派发者若是子对话，猜最新可能落到主对话 ⇒ 双重修改）。
+// 2026-09-19：字段假设多次失配（生产里 dispatchedBy 全部"未记录"）——改为深扫描
+// session-<uuid> 形状（对结构漂移鲁棒）；找不到时把 exec 结构 dump 到调试文件（一次性取证）。
 function sessOf(exec) {
-  const s = exec?.agent?.session;
-  const id = s?.sessionId || s?.id || s?.header?.sessionId || s?.header?.id || '';
-  return String(id || '');
+  const RE = /^session-[0-9a-f-]{30,}$/;
+  const seen = new Set();
+  const scan = (o, d) => {
+    if (!o || typeof o !== 'object' || d > 6 || seen.has(o)) return '';
+    seen.add(o);
+    for (const v of Object.values(o)) {
+      if (typeof v === 'string' && RE.test(v)) return v;
+      if (v && typeof v === 'object') { const r = scan(v, d + 1); if (r) return r; }
+    }
+    return '';
+  };
+  let id = '';
+  try { id = scan(exec, 0) || ''; } catch {}
+  // 取证（有 bug 才看）：每次调用记一行——找到 id 就记 id；没找到就附带 exec 骨架，下次照着修。
+  try {
+    const dbg = join(homedir(), '.dsh', 'quests', 'plugin-exec-dump.json');
+    let size = 0; try { size = statSync(dbg).size; } catch {}
+    if (size < 200e3) {
+      const skeleton = (o, d = 0) => (!o || typeof o !== 'object' || d > 4) ? typeof o
+        : Object.fromEntries(Object.entries(o).slice(0, 30).map(([k, v]) => [k, typeof v === 'object' && v ? skeleton(v, d + 1) : (typeof v === 'string' && v.length > 80 ? v.slice(0, 80) + '…' : v)]));
+      appendFileSync(dbg, JSON.stringify({ at: new Date().toISOString(), found: id || null, exec: id ? undefined : skeleton(exec) }).slice(0, 12000) + '\n');
+    }
+  } catch {}
+  return id;
 }
 
 function apply(ctx, config = {}) {
@@ -68,7 +95,7 @@ function apply(ctx, config = {}) {
     name: 'quest_plan',
     description: [
       '写入/替换当前工作区的任务线计划（quest 系统的源头定义，markdown 格式）。',
-      '⚠️ 写之前必须先用 read 工具读模板：C:\\Users\\Solanine\\dsh-plugins\\quest\\PLAN-TEMPLATE.md',
+      `⚠️ 写之前必须先用 read 工具读模板：${PLAN_TEMPLATE_PATH}`,
       '（含五段科研流水标准骨架、handoff 写作指南与红线——handoff 质量决定 worker 总结质量）。',
       '要点速览：节点用 "---node: <id>---" 分节；command 必填（解释器绝对路径）；',
       'expect_minutes 写真实值（超时护栏=2倍）；after 声明依赖（上游成功自动派发、失败冻结下游；',
@@ -176,9 +203,9 @@ function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'quest_notify',
     description: [
-      '点名用户（QQ 推送）——**由你决定何时打扰人**：只在需要人拍板、确认方向、或汇报重要结果时用。',
-      '收尾汇报会自动通知用户（不用你发）；中途节点的成败/警告用户已选择静音（nodeEvents:false）——',
-      '所以"需要人"的判断在你手里：能自己查证/重派的别发，真需要决策的一条说清楚（要什么、选项、你的建议）。',
+      '点名用户（QQ 推送）——**仅主对话可用**（服务端按登记的主对话校验调用者身份）。',
+      '定位（2026-09-19 定稿）：阶段任务完成时给用户发汇总、需要人拍板/确认方向时点名。',
+      '子对话没有此权限：把结果回执给主对话（署名回执制自动送达），由主对话统一汇总发声。',
       '60 秒冷却。留痕 notify.user-ping。',
     ].join(' '),
     parameters: {
@@ -191,7 +218,7 @@ function apply(ctx, config = {}) {
     },
     execute: async (args, exec) => questCall(cfg(), `/api/notify?ws=${encodeURIComponent(wsOf(args, exec))}`, {
       method: 'POST',
-      body: JSON.stringify({ message: String(args.message || '') }),
+      body: JSON.stringify({ message: String(args.message || ''), ...(sessOf(exec) ? { sessionId: sessOf(exec) } : {}) }),
     }, 15000),
   }));
 
@@ -220,10 +247,10 @@ function apply(ctx, config = {}) {
     description: [
       '浏览/读取任意路径的文件（Windows 绝对路径或 \\\\wsl$\\Ubuntu\\... UNC 路径，即 WSL 内部文件）。',
       'mode=list 列目录（名称/大小/时间）；mode=read 读文本（大文件自动截尾）。',
-      '典型用途：查 WSL 里的实验产物（\\\\wsl$\\Ubuntu\\home\\solanine\\...）、看 checkpoint 目录、翻日志文件。',
+      '典型用途：查 WSL 里的实验产物（\\\\wsl$\\Ubuntu\\home\\user\\...）、看 checkpoint 目录、翻日志文件。',
     ].join(' '),
     parameters: {
-      path: { type: 'string', description: '绝对路径，如 \\\\wsl$\\Ubuntu\\home\\solanine\\exp 或 C:\\Users\\Solanine\\Desktop\\V8' },
+      path: { type: 'string', description: '绝对路径，如 \\\\wsl$\\Ubuntu\\home\\user\\exp 或 C:\\Users\\you\\Project' },
       mode: { type: 'string', description: 'list（列目录，缺省）或 read（读文件内容）' },
     },
     output: {

@@ -70,14 +70,12 @@ Claude Code、Codex、ZCode 这类 agent 都自带后台执行（`run_in_backgro
 要求：Node.js ≥ 20。**DSH 不是必需的**——quest 可独立运行（纯机械模式），DSH 只用于可选的任务总结与自动修复；Windows 与 Linux 都能跑（WSL 执行车道为 Windows 专属）。
 
 ```bash
-# 1. 启动服务（一行；数据目录 ~/.dsh/quests/ 与令牌自动生成）
-npx dsh-quest-service
-
-#    不想用 npx？从源码起也一样：
-#    git clone https://github.com/yunlong-wang11111/dsh-quest.git && cd dsh-quest && node server.mjs
+# 1. 启动服务（数据目录 ~/.dsh/quests/ 与令牌自动生成）
+git clone https://github.com/yunlong-wang11111/dsh-quest.git && cd dsh-quest
+node server.mjs
 
 #    服务起来后：仪表盘 http://127.0.0.1:3110/dashboard
-#              MCP 服务器 npx dsh-quest-service mcp（接 Claude Code / Codex / ZCode）
+#              MCP 服务器 node mcp-server.mjs（本仓库内；接 Claude Code / Codex / ZCode 等 MCP 宿主）
 
 # 2. 编辑 ~/.dsh/quests/quest-config.json（通知出口等；默认关闭，配法见下文「通知出口」），重启服务生效
 
@@ -260,6 +258,15 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 | `off` | — | — | **纯机械模式**：判定、指标提取、超时、重试、通知照常，只是没有 AI 写的总结 |
 
 实测（机械模式）：`python mech_test.py` → `completed | ok | finish-keyword`，loss 指标 `1.5 → 1.05` 自动提取——**全程零模型调用**。
+
+## v0.6.4–0.6.6 新增（2026-09-18/19）
+
+- **失败上报的定向链补全（生产事故复盘）**：主对话把活派给子会话后，"最新会话"兜底几乎永远命中子会话——一天 6 次失败上报散进 6 个不同子会话，主对话一次收不到。修复分三层：①`questSpawnedSids` 只认 `notify.converge.worker`/`fix.*` 的出生证明（旧版 ≤0.6.0 的 `notify.converge` 事件把 sessionId 记成**主对话**，通配收集会把主对话永久拉黑——9/16 起就在发生）；②上报定向链对齐收敛/死信复活：**派发者 → 主对话（converge 登记/翻页接班）→ 最新非自建**；③毒丸回归测试进套件
+- **署名回执制（v0.6.6 核心）**：派任务署名（插件层 `sessOf` 深扫描 `session-<uuid>`，对 DSH exec 结构漂移鲁棒；找不到时自动 dump exec 骨架取证）+ **成败都回执**——署名派发的节点完成后发一行 `✅【回执】` 给派发者，"派活→等结果→接下一步"的接力不再断链（自动链节点无署名不回执，不轰炸）；**点名回执不设冷却**（冷却只防兜底轰炸；实测事故：派发者自己的失败被 10 分钟冷却吞掉、兜底收敛又被 pending 幽灵节点卡死，主对话断链睡到天亮）
+- **QQ 通知权收归主对话**：`quest_notify` 服务端鉴权，非登记主对话调用直接被拒（提示回执给主对话）；quest 自动 QQ 可全关（`converge.qq:false`、`failureBatchSec:0`、`escalate.cooldownMin:0`）——阶段汇总与决策点名由主对话统一发声
+- **`escalate.cooldownMin: 0` 语义修正**：原先 `Number(0)||10` 把 0 悄悄变 10 分钟（与 failureBatchSec/reviveHours 的"0=关"约定相悖）
+- **测试**：escalate-deadletter 扩到 12 用例（毒丸防拉黑/冷却绕过/成功回执/QQ 收权三连）；notify-gate 6/6；另踩坑记录：Windows 跨进程 append 不保序，测试里外部账本注入必须留时间窗（慢节点+派发后补署名）
+- **可移植性**：插件里硬编码的个人路径清零（PLAN-TEMPLATE 从仓库位置推导，示例路径泛化）
 
 ## v0.6.1 新增（2026-09-17）
 
