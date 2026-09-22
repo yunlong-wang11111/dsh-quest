@@ -3,7 +3,7 @@
 //
 // 用途（2026-09-15）：MCP 层做好后的"自测门"——不依赖 DSH/ZCode 注册，
 // 任何脚本/人/agent 一行就能验证 quest 的 MCP 是不是好的：
-//   node tools/mcp-call.mjs quest_status '{"ws":"C:/Users/Solanine/Desktop/V8/code_kl"}'
+//   node tools/mcp-call.mjs quest_status '{"ws":"__HOME__/Desktop/V8/code_kl"}'
 //   node tools/mcp-call.mjs quest_log '{"node":"quick-xxx","ws":"C:/...","tail":2000}'
 //   node tools/mcp-call.mjs quest_status '{}'          # 缺省=最近活跃工作区（brief）
 // 参数是 JSON 字符串（可空 {}）。退出码：0 成功 / 1 工具报错 / 2 用法错。

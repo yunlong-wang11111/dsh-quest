@@ -7,8 +7,8 @@
 // 全终结的线不需要收：冻结是空操作（它已经没有扳机可卸）。
 //
 // 用法：
-//   node tools/close-line.mjs "C:/Users/Solanine/Desktop/V8/code_kl"           # 只看（dry-run）
-//   node tools/close-line.mjs "C:/Users/Solanine/Desktop/V8/code_kl" --apply   # 真收线
+//   node tools/close-line.mjs "__HOME__/Desktop/V8/code_kl"           # 只看（dry-run）
+//   node tools/close-line.mjs "__HOME__/Desktop/V8/code_kl" --apply   # 真收线
 //   node tools/close-line.mjs <ws> --apply --reason "V13 门槛线已出结论，收线"
 //
 // 可逆：重派某个节点 = 解冻该节点；/api/resume 它的上游 = 解冻它整条下游。
