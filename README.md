@@ -59,7 +59,7 @@ Claude Code、Codex、ZCode 这类 agent 都自带后台执行（`run_in_backgro
 - **预检**：派发前 `py_compile` 拦截语法错误（编译器报错原文直推 QQ）
 - **worker 总结**：任务结束 → 独立一次性会话读[交接上下文+日志尾]写 ≤10 行总结 → 归档。主对话零增长。**后端可插拔（v0.5）**：DSH 会话 / OpenAI 兼容 API / headless CLI / 关闭（纯机械模式）
 - **auto_fix 自动修复**（可选，节点级开关）：失败 → fixer 做**机械性最小修复**（显存调 batch / NaN 调 lr / 路径环境；**绝不碰实验逻辑**）→ `.bak` 备份 → 语法验证 → 自动重派。预算烧尽或判断需人工（FIX_GIVEUP）则停手告警。修复后服务端做**客观逐行 diff** 上报 QQ（不信任自述）。后端同样可插拔
-- **跨 agent（MCP）**：8 个工具以标准 MCP 暴露，Claude Code / Codex / ZCode / Cursor 等可直接调用；quest 本体零模型依赖——执行、判定、指标、超时、重试、通知全程不需要 AI
+- **跨 agent（MCP）**：12 个工具以标准 MCP 暴露，Claude Code / Codex / ZCode / Cursor 等可直接调用；quest 本体零模型依赖——执行、判定、指标、超时、重试、通知全程不需要 AI
 - **中断恢复（v0.5）**：机器重启后开机自动检测被腰斩的任务——仅在**确实重启过**（系统开机时刻判定，OOM/自崩不算）且**有断点存档**且节点声明 `resume_on_boot` 时，推一条提示；回 `/q续跑` 从断点接着跑。检测自动、重派要人点头（重复跑会双写产物）
 - **QQ 推送**：经 bridge console 直发（纯 HTTP，不经过任何对话）；任务线收尾自动推总览；推送带重试+落盘队列，失败不静默丢失
 - **外部进程接入**：手动启动的 python 进程（≥5 分钟）退出后由检测端转交同一管线
@@ -202,7 +202,7 @@ node server.mjs        # 启动 quest 服务（3110）
 node mcp-server.mjs    # MCP 服务器（stdio，由 agent 拉起，无需手动运行）
 ```
 
-暴露 8 个工具：`quest_plan` `quest_dispatch` `quest_run` `quest_status` `quest_log` `quest_probe` `quest_files` `quest_cancel`。
+暴露 12 个工具：`quest_plan` `quest_dispatch` `quest_run` `quest_spawn` `quest_status` `quest_log` `quest_probe` `quest_files` `quest_cancel` `quest_flip` `quest_notify` `quest_lit`。
 
 **接入方式**（把路径换成你的实际路径）：
 
@@ -258,6 +258,12 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 | `off` | — | — | **纯机械模式**：判定、指标提取、超时、重试、通知照常，只是没有 AI 写的总结 |
 
 实测（机械模式）：`python mech_test.py` → `completed | ok | finish-keyword`，loss 指标 `1.5 → 1.05` 自动提取——**全程零模型调用**。
+
+## v0.7.0 新增（2026-09-22）
+
+- **`quest_spawn` 派真子对话（L3，用户内测定稿）**：给 AI "派子对话"的动词——建同工作区独立 DSH 会话 + 种子提示（身份/运行纪律/简报契约）。handoff 复用 plan 节点写法（"一套写作技能、两种执行形态：节点里跑脚本、子对话里跑判断/写码"）。**可见性**（用户硬约束①）：spawned 进 `/api/status` 的 spawned 区、progress.md「派出的子对话」、控制台卡片；**有界返回**（硬约束②）：子对话干完调 quest_notify 交结构化简报（做了什么/产物路径/读数/阻塞/建议）定向回派发者，`spawn.reported` 记终态，超期 sweep 标 overdue + 催派发者一次。子对话不能再派子对话（一层为限）；spawned 会话计入 quest 自建名单（不进兜底上报目标）
+- **分工文档（L1）**：PLAN-TEMPLATE 新增「谁干什么：分工决策树 + 责任表」（含"一个阶段=一个节点，不是一个会话"）与「suspect 的 30 秒分诊」（四个 via 原因码对照 + 快判口诀；澄清**没有**独立的"脚本自检 FAIL"路径——它表现为 success-claim-failed）；补 expect_minutes 估法规则（单件实测×件数）；定义"本次运行窗口"（job 启动前 2 秒起，实时判定无上界）；补 quick 可见性说明、409 默认动作、非 torch 断点语义；模板补全 timeout_seconds/when/watch_rules/resume_on_boot 四个字段并修复 shell: 行格式断裂
+- **plan 写入时预检（用户提议）**：command 里的 .py 存在性 + py_compile，**警告不拦**（派发预检照旧硬拦）——"plan 三个脚本都不存在，建好了却派不了"这类问题提前到写入时暴露
 
 ## v0.6.4–0.6.6 新增（2026-09-18/19）
 

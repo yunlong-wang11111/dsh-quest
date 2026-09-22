@@ -39,7 +39,7 @@ const sb = await startSandbox({
   extraConfig: {
     dshBaseUrl: `http://127.0.0.1:${DSH}`, dshToken: 'stub-token',
     runGate: { enabled: false }, workersEnabled: false,
-    notify: { kind: 'off', escalate: { enabled: true, cooldownMin: 0.3, reviveHours: 0.002 } },   // 冷却18s；revive ≈ 7 秒
+    notify: { kind: 'off', userPingCooldownSec: 1, escalate: { enabled: true, cooldownMin: 0.3, reviveHours: 0.002 } },   // 冷却18s；revive ≈ 7 秒
     sweepSeconds: 2,
   },
 });
@@ -132,13 +132,27 @@ try {
   s.check('⑨ 成功回执送达署名派发者', rc.length >= 1 && rc.every((p) => p.sid === 'sess-subagent'),
     `dispatch.ok=${disp?.ok} 条数=${rc.length} 目标=${[...new Set(rc.map((p) => p.sid))].join(',')}`);
 
-  // ── 幕六：QQ 点名仅主对话（2026-09-19 收权）── sb.api 返回 {status,json}，断言用 .json
-  const rj1 = (await sb.api('POST', `/api/notify?ws=${encodeURIComponent(WS)}`, { message: '子对话想点名' })).json;
-  s.check('⑩ 子对话（无身份）点名被拒', rj1.ok === false && /仅主对话/.test(rj1.error || ''), String(rj1.error || '').slice(0, 60));
-  const rj2 = (await sb.api('POST', `/api/notify?ws=${encodeURIComponent(WS)}`, { message: '冒充者点名', sessionId: 'session-imposter-0000000000000000000000' })).json;
-  s.check('⑪ 非登记会话点名被拒', rj2.ok === false && /仅主对话/.test(rj2.error || ''), String(rj2.error || '').slice(0, 60));
-  const ok3 = (await sb.api('POST', `/api/notify?ws=${encodeURIComponent(WS)}`, { message: '主对话点名', sessionId: 'sess-main' })).json;
-  s.check('⑫ 主对话过身份关（沙箱 kind=off，走到出口检查即算通过）', ok3.ok === false && /通知出口/.test(ok3.error || ''), String(ok3.error || '').slice(0, 60));
+  // ── 幕六：QQ 点名权限语义（2026-09-20 二次修订：任一会话可发 + 工作区冷却）──
+  // 沙箱 kind=off → 走到出口检查即算"过了权限关"（错误是'通知出口为 off'）。
+  const rj1 = (await sb.api('POST', `/api/notify?ws=${encodeURIComponent(WS)}`, { message: '任一会话想点名' })).json;
+  s.check('⑩ 无身份（旧插件）放行到出口检查', rj1.ok === false && /通知出口/.test(rj1.error || ''), String(rj1.error || '').slice(0, 60));
+  const rj2 = (await sb.api('POST', `/api/notify?ws=${encodeURIComponent(WS)}`, { message: '非主对话会话点名', sessionId: 'session-imposter-0000000000000000000000' })).json;
+  s.check('⑪ 子对话被拒且引导回主对话', rj2.ok === false && /你是子对话/.test(rj2.error || '') && /主对话/.test(rj2.error || ''), String(rj2.error || '').slice(0, 70));
+  const rj3 = (await sb.api('POST', `/api/notify?ws=${encodeURIComponent(WS)}`, { message: '紧接着第二条', sessionId: 'sess-main' })).json;
+  s.check('⑫ 工作区冷却挡连发', rj3.ok === false && /冷却中/.test(rj3.error || ''), String(rj3.error || '').slice(0, 70));
+
+  // ── 幕七：无署名 quick 成功 → 兜底回执给主对话（2026-09-20 补洞：失败有兜底、成功静默的不对称）──
+  // 布景：登记主对话 sess-main（幕三已设）；用 /api/run（= quest_run 路径，写 quick.dispatched）
+  // **不带 dispatchedBy**（QQ 桥 /q派发、旧插件未升级时的真实路径）。
+  const before7 = prompts.length;
+  const run7 = (await sb.api('POST', `/api/run?ws=${encodeURIComponent(WS)}`, {
+    command: 'cmd /c ping -n 3 127.0.0.1 & exit 0', cwd: WS, title: 'win7-unsigned',
+    expectMinutes: 1, success: '无',
+  }, 20000)).json;
+  await waitFor(async () => prompts.slice(before7).some((p) => p.text.includes('【回执】')), 40000);
+  const rc7 = prompts.slice(before7).filter((p) => p.text.includes('【回执】'));
+  s.check('⑬ 无署名 quick 成功 → 兜底回执给主对话', rc7.length >= 1 && rc7.every((p) => p.sid === 'sess-main'),
+    `run.ok=${run7?.ok} 条数=${rc7.length} 目标=${[...new Set(rc7.map((p) => p.sid))].join(',')}`);
 } finally {
   sb.stop();
   await new Promise((r) => stub.close(r));

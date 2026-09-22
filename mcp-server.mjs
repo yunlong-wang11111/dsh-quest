@@ -49,7 +49,7 @@ async function q(method, pathname, body, timeoutMs = 60000) {
 const ok = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] });
 const fail = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }], isError: true });
 
-const server = new McpServer({ name: 'quest', version: '0.6.6' });
+const server = new McpServer({ name: 'quest', version: '0.6.7' });
 
 server.tool(
   'quest_plan',
@@ -243,6 +243,31 @@ server.tool(
       created: r.created, handoff: r.handoff || null, errors: r.errors || [],
       note: '新会话已注入恢复提示（读交接→quest_status→向用户复述确认）。归档不删除：全文在 archive/flip-*.md。',
     });
+  },
+);
+
+server.tool(
+  'quest_spawn',
+  [
+    '派一个真子对话（同工作区新建独立 DSH 会话，注入交接后独立推进）——需要连续多轮独立推进的大阶段用（整块调研/独立模块开发）；',
+    '跑命令用 quest_run/plan 节点（执行者是进程）；一次性检索用你的会话内子代理；主线写码自己干。',
+    'handoff 写法同 plan 节点（角色/验证什么/指标与健康范围/产物在哪/坑）；子对话干完调 quest_notify 交结构化简报，简报自动回派发者。',
+    '注意：MCP 通道拿不到你的会话身份（署名），需在返回错误提示指引下带 dispatchedBy 重试，或改用 DSH 原生 quest_spawn 工具。',
+  ].join(' '),
+  {
+    title: z.string().describe('子对话用途短名'),
+    handoff: z.string().describe('交接上下文（写法同 plan 节点 handoff）'),
+    deadline_minutes: z.number().optional().describe('约定时限（分钟，默认 240）'),
+    ws: z.string().optional().describe('工作区绝对路径（一般=你的 cwd）'),
+    dispatchedBy: z.string().optional().describe('派发者 sessionId（DSH 原生插件自动带；MCP 需显式传）'),
+  },
+  async ({ title, handoff, deadline_minutes, ws, dispatchedBy }) => {
+    const r = await q('POST', `/api/spawn?ws=${encodeURIComponent(ws || '')}`, {
+      title, handoff,
+      ...(deadline_minutes ? { deadlineMinutes: deadline_minutes } : {}),
+      ...(dispatchedBy ? { dispatchedBy } : {}),
+    }, 60000);
+    return r.error ? fail(r) : ok(r);
   },
 );
 

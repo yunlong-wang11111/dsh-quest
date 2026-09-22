@@ -171,6 +171,7 @@ function apply(ctx, config = {}) {
         reason: String(args.reason || ''),
         handoff: String(args.handoff || ''), success: String(args.success || ''), autoFix: args.auto_fix === 'true' || args.auto_fix === true,
         shell: args.shell === 'wsl' ? 'wsl' : 'windows',
+        ...(sessOf(exec) ? { dispatchedBy: sessOf(exec) } : {}),   // 2026-09-20 补：署名漏传——深扫描一直正常（exec-dump 228/228 找到），但这处 body 从没带上
       }),
     }, 25000),
   }));
@@ -203,10 +204,15 @@ function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'quest_notify',
     description: [
-      '点名用户（QQ 推送）——**仅主对话可用**（服务端按登记的主对话校验调用者身份）。',
-      '定位（2026-09-19 定稿）：阶段任务完成时给用户发汇总、需要人拍板/确认方向时点名。',
-      '子对话没有此权限：把结果回执给主对话（署名回执制自动送达），由主对话统一汇总发声。',
-      '60 秒冷却。留痕 notify.user-ping。',
+      '点名用户（QQ 推送）——**仅本工作区的主对话可调**（服务端按登记主对话校验身份）。',
+      '**如果你是子对话**：不要调本工具。规矩是——把你的结果/总结交回主对话（用 DSH 的 send_message 发给它，或写进工作区文件并在收尾消息里说明），**由主对话筛选后统一通知用户**。你的任务结果本来就会通过署名回执自动送回你的派发者，绝大部分情况你不需要再额外汇报。',
+      '**如果你是主对话**：只在"阶段任务完成需要汇总"或"需要用户拍板/确认方向"时调。判断值不值得打扰用户是你的职责（不要逐节点汇报）。',
+      '**消息格式硬要求（2026-09-20 用户实测反馈：决策点埋在中间等于没发）**：',
+      '第一行必须一句话说清"需要用户决定什么"+你的建议，例如：',
+      '"❓需要你决定：X 换轨到 Y 吗？我的建议：先跑 A 对照（1 小时）再定。"',
+      '背景、数据、证据、备选方案全部放后面（用户手机上首屏只看到开头）。',
+      '若纯汇报无决策事项，首行写"📋 汇报：<一句话结论>"，需要用户知道的关键数字放紧随的 2-3 行内。',
+      '工作区级冷却（默认 10 分钟一条）；被挡时不要重试，攒到下一次汇总一起发。',
     ].join(' '),
     parameters: {
       message: { type: 'string', description: '给用户的话（≤800 字）：要什么决策/确认什么/结果一句话' },
@@ -321,10 +327,76 @@ function apply(ctx, config = {}) {
   }));
 
   ctx.tools.register(defineTool({
+    name: 'quest_takeover',
+    description: [
+      '接管本工作区的**主对话**身份（"职位注册"，2026-09-21 用户提出：主对话只有一个，换人时应显式交接）。',
+      '**只在用户明确要求时调用**（例如他对你说"你当主对话"、"接管一下"、"以后你来汇报"）——子对话不要自作主张抢位。',
+      '接管后的变化：收尾通知/失败上报/回执的定向目标变成你；你有 quest_notify 权限（能点名用户）；老主对话自动退位（无需额外操作）。',
+      '想确认当前谁在位：quest_status 返回的 role（你的身份）与 mainSessionId（在位者）。',
+    ].join(' '),
+    parameters: {
+      ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd，一般不用传）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, mainSessionId: { type: 'string' }, note: { type: 'string' }, error: { type: 'string' }, pending: { type: 'boolean' }, gateId: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.ok
+        ? `✅ 已接管主对话：后续收尾/上报/回执都指向你（${String(v.mainSessionId || '').slice(8, 16)}…）。${v.note || ''}`
+        : (v.pending
+          ? `⏳ 接管请求已发出，等用户确认：已有主对话在位于 ${String(v.error || '').slice(0, 120)}…\n（用户 QQ 回复 /q确认 ${v.gateId || ''} 后你才接管；期间请保持子对话职责，不要用 quest_notify 打扰用户。）`
+          : `接管失败：${v.error || '未知原因'}`) }],
+    },
+    execute: async (args, exec) => {
+      const sid = sessOf(exec);
+      if (!sid) return { ok: false, error: '拿不到本会话身份（插件未能从执行上下文提取 sessionId）——换用 /q 命令或让用户手动指定' };
+      const r = await questCall(cfg(), `/api/converge?ws=${encodeURIComponent(wsOf(args, exec))}`, {
+        method: 'POST', body: JSON.stringify({ action: 'main', sessionId: sid }),
+      }, 15000);
+      return { ok: !!r.ok, pending: r.pending === true, gateId: r.id || '', mainSessionId: r.mainSessionId || sid, note: r.note || '', error: r.error };
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'quest_spawn',
+    description: [
+      '派一个**真子对话**（同工作区新建独立 DSH 会话，注入交接提示后独立推进）——"派子对话"从这里变成动作。',
+      '什么时候用（分工决策树）：**跑命令**→quest_run/plan 节点（执行者是进程，不是会话）；**当前研究主线的写码/迭代**→主对话自己干；',
+      '**一次性并行检索/分析**→会话内 subagent；**需要连续多轮独立推进的大阶段**（整块调研、独立模块开发、长程验证）→本工具。',
+      'handoff 复用 plan 节点那套写法（角色/这次验证什么/指标与健康范围/产物在哪/已知的坑）——一套写作技能、两种执行形态。',
+      '子对话会收到：身份+你的交接+运行纪律（超1分钟 quest_run/秒级 probe/不能再派子对话）+**简报契约**。',
+      '可见性：它出现在 quest_status 的 spawned 区、progress.md「派出的子对话」、控制台——用户和你都看得见。',
+      '有界返回：干完（或干不下去）它调 quest_notify 交结构化简报（做了什么/产物路径/读数/阻塞/建议），简报自动回到你这里；',
+      '超 deadline_minutes（默认 240）未交简报会标超期并催你一次。',
+      '**简报到了你的收件箱就是它的终态**——接力判断（要不要重派/追加/收线）由你做。',
+    ].join(' '),
+    parameters: {
+      title: { type: 'string', description: '子对话用途短名（如"曲率方案文献调研"）——画布/简报里都显示它' },
+      handoff: { type: 'string', description: '交接上下文（写法同 plan 节点的 handoff）：这个阶段在整个研究里的角色、具体验证什么、关键指标与健康范围、产物放哪、已知的坑。它看不到你的对话，语境全靠这份交接' },
+      deadline_minutes: { type: 'string', description: '约定时限（分钟，默认 240）：超时未交简报标超期+催派发者' },
+      ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd，一般不用传）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, spawnId: { type: 'string' }, sessionId: { type: 'string' }, deadlineMinutes: { type: 'number' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 子对话未创建：${v.error}` : `✅ 子对话「${v.spawnId}」已上任（会话 ${String(v.sessionId || '').slice(8, 16)}…，时限 ${v.deadlineMinutes} 分钟）。\n它独立推进；简报完成时自动回到你这里。中途看它：quest_status 的 spawned 区 / progress.md。` }],
+    },
+    execute: async (args, exec) => {
+      const sid = sessOf(exec);
+      if (!sid) return { ok: false, error: '拿不到本会话身份（插件未能从执行上下文提取 sessionId）——quest_spawn 必须署名派发' };
+      return questCall(cfg(), `/api/spawn?ws=${encodeURIComponent(wsOf(args, exec))}`, {
+        method: 'POST', body: JSON.stringify({
+          title: String(args.title || ''), handoff: String(args.handoff || ''),
+          ...(args.deadline_minutes ? { deadlineMinutes: Number(args.deadline_minutes) || 240 } : {}),
+          dispatchedBy: sid,
+        }),
+      }, 60000);
+    },
+  }));
+
+  ctx.tools.register(defineTool({
     name: 'quest_status',
     description: [
       '查询当前工作区任务线的全部节点状态（pending/running/completed/failed/timeout + 判定依据 + worker 总结）。',
       '返回开头的 unread 是自上次查看以来的完成事件摘要。用户问"实验跑完了吗/怎么样了"时用这个。',
+      '**返回的 role 字段告诉你自己的身份**（main=本工作区主对话 / subagent=子对话）——不确定"我该向谁汇报、能不能点名用户"时看它，不用凭感觉。主对话职责=汇总筛选后决定是否打扰用户；子对话职责=把结果交给主对话。',
       '返回的 line 字段回答"是不是真都完成了"：quiet=true 表示没有在跑节点、账本安静了 idleMinutes 分钟、且工作区也没有新文件改动；workspace.recent>0 说明有人正在改代码（可能马上又派任务）。dsh.running>0 表示本工作区的 DSH 会话正在跑（AI 在思考/写代码）。这是收敛推断不是完成保证，回答用户时把依据一起说。',
     ].join(' '),
     parameters: {
@@ -335,6 +407,7 @@ function apply(ctx, config = {}) {
         type: 'object', additionalProperties: true,
         properties: {
           questVersion: { type: 'string' },
+          role: { type: 'string', description: 'main=你是主对话；subagent=你是子对话；unknown=身份未传' },
           plan: { type: 'object', additionalProperties: true, properties: { workspace: { type: 'string' }, nodes: { type: 'array', items: { type: 'object', additionalProperties: true, properties: {
             id: { type: 'string' }, status: { type: 'string' }, verdict: { type: 'string' }, via: { type: 'string' },
             // 注意：exitCode / file / metrics 可能为 null（例如重启后认领的节点拿不到退出码）。
@@ -352,10 +425,11 @@ function apply(ctx, config = {}) {
         if (!nodes.length) return [{ type: 'text', text: '当前工作区没有任务线计划。先用 quest_plan 写一个。' }];
         const unread = (v.unread || []).map((u) => `${u.node}:${u.verdict}`).join('、');
         const lines = nodes.map((n) => `- ${n.id}: ${n.status}${n.verdict ? `（${n.verdict}${n.via ? '/' + n.via : ''}）` : ''}${n.runSeconds != null ? ` 运行${n.runSeconds}s` : ''}${n.summary ? `\n  总结：${String(n.summary).slice(0, 300)}` : ''}`);
-        return [{ type: 'text', text: `${unread ? `📣 自上次查看：${unread}\n` : ''}任务线 ${nodes.length} 个节点：\n${lines.join('\n')}` }];
+        const roleTag = v.role === 'main' ? '【身份：主对话】' : v.role === 'subagent' ? '【身份：子对话】' : '';
+        return [{ type: 'text', text: `${roleTag ? roleTag + '\n' : ''}${unread ? `📣 自上次查看：${unread}\n` : ''}任务线 ${nodes.length} 个节点：\n${lines.join('\n')}` }];
       },
     },
-    execute: async (args, exec) => questCall(cfg(), `/api/status?ws=${encodeURIComponent(wsOf(args, exec))}`),
+    execute: async (args, exec) => questCall(cfg(), `/api/status?ws=${encodeURIComponent(wsOf(args, exec))}${sessOf(exec) ? `&sessionId=${encodeURIComponent(sessOf(exec))}` : ''}`),
   }));
 
   ctx.tools.register(defineTool({
