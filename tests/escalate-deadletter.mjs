@@ -120,7 +120,7 @@ try {
   // ── 幕五：成功回执（2026-09-19 署名回执制）：署名派发的节点**成功**也要一行回执给派发者 ──
   // 同样的时序纪律：慢成功节点（ping ~2s）+ 派发后补署名。
   const plan2 = `workspace: ${WS}\nfreeze_on: hard-fail-only\n` +
-    `---node: win---\ncommand: cmd /c ping -n 3 127.0.0.1 & exit 0\ncwd: ${WS}\nexpect_minutes: 1\n\n`;
+    `---node: win---\ncommand: cmd /c ping -n 3 127.0.0.1 >nul & echo done! & exit 0\ncwd: ${WS}\nexpect_minutes: 1\n\n`;
   await sb.api('POST', `/api/plan?ws=${encodeURIComponent(WS)}`, { markdown: plan2, force: true });
   await sleep(500);
   const before5 = prompts.length;
@@ -146,7 +146,7 @@ try {
   // **不带 dispatchedBy**（QQ 桥 /q派发、旧插件未升级时的真实路径）。
   const before7 = prompts.length;
   const run7 = (await sb.api('POST', `/api/run?ws=${encodeURIComponent(WS)}`, {
-    command: 'cmd /c ping -n 3 127.0.0.1 & exit 0', cwd: WS, title: 'win7-unsigned',
+    command: 'cmd /c ping -n 3 127.0.0.1 >nul & echo done! & exit 0', cwd: WS, title: 'win7-unsigned',
     expectMinutes: 1, success: '无',
   }, 20000)).json;
   await waitFor(async () => prompts.slice(before7).some((p) => p.text.includes('【回执】')), 40000);

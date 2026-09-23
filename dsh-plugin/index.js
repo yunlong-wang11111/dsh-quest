@@ -1,7 +1,7 @@
 // dsh-quest — quest 任务线的 DSH 侧薄插件（4 工具，HTTP → 本机 quest 服务）
 // 设计：QUEST_DESIGN.md §4。所有请求 4 秒超时（8788 无超时挂死的前车之鉴），
 // token 与 quest 服务共享 ~/.dsh/quests/.token。
-import { readFileSync, appendFileSync, statSync } from 'node:fs';
+import { readFileSync, appendFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -274,7 +274,8 @@ function apply(ctx, config = {}) {
       '用户说"停掉/别跑了/这个卡死了"时使用。务必带上原因（会进账本和 QQ 通知）。',
     ].join(' '),
     parameters: {
-      node: { type: 'string', description: '节点 id' },
+      node: { type: 'string', description: '节点 id（与 tag 二选一）' },
+      tag: { type: 'string', description: '批量收线（2026-09-23）：节点 id 包含此片段的全部处理——在跑的杀树、pending/frozen/ready 的落 cancelled 终态；已终态的不动。适合清理一批被取代的 quick-* 节点' },
       reason: { type: 'string', description: '终止原因（一句话，入账本+QQ）' },
       ws: { type: 'string', description: '工作区绝对路径（缺省=最近活跃工作区）' },
     },
@@ -283,8 +284,11 @@ function apply(ctx, config = {}) {
       render: (_a, v) => [{ type: 'text', text: v.error ? `终止失败：${v.error}` : `已终止：${v.note || '杀树指令已发'}` }],
     },
     execute: async (args, exec) => questCall(cfg(), `/api/cancel?ws=${encodeURIComponent(wsOf(args, exec))}`, {
-      method: 'POST', body: JSON.stringify({ node: String(args.node || ''), reason: String(args.reason || '人工终止') }),
-    }, 8000),
+      method: 'POST', body: JSON.stringify({
+        ...(args.tag ? { tag: String(args.tag) } : { node: String(args.node || '') }),
+        reason: String(args.reason || (args.tag ? `tag 批量收线 ${args.tag}` : '人工终止')),
+      }),
+    }, 30000),
   }));
 
   ctx.tools.register(defineTool({
@@ -392,15 +396,43 @@ function apply(ctx, config = {}) {
   }));
 
   ctx.tools.register(defineTool({
+    name: 'quest_tell',
+    description: [
+      '向 quest_spawn 派出的子对话发引导消息（补充指令/修正方向/追加要求）。',
+      '为什么需要它：DSH 的 send_message 有父子会话限制（对 spawn 子对话报 "belongs to another parent session"），',
+      '而服务端投递没有这个限制——引导消息经 quest 中转，queue 语义（它忙则排队，绝不打断）。',
+      'spawnId 可传全称或片段（唯一前缀即可）；它交完简报后状态变 reported，此时投递会提示已收工。',
+      '注意：这是"引导"不是"打断"——要中止用 quest_cancel（对它的任务）或直接不再理会。',
+    ].join(' '),
+    parameters: {
+      spawnId: { type: 'string', description: '目标子对话的 spawnId（quest_status 的 spawned 区可查；片段即可）' },
+      message: { type: 'string', description: '引导消息（它会以【派发者引导】前缀收到）' },
+      ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd，一般不用传）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, spawnId: { type: 'string' }, title: { type: 'string' }, note: { type: 'string' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.error ? `⚠️ 未投递：${v.error}` : `✅ 已投递给「${v.title || v.spawnId}」${v.note ? ' — ' + v.note : ''}` }],
+    },
+    execute: async (args, exec) => questCall(cfg(), `/api/tell?ws=${encodeURIComponent(wsOf(args, exec))}`, {
+      method: 'POST', body: JSON.stringify({ spawnId: String(args.spawnId || ''), message: String(args.message || '') }),
+    }, 20000),
+  }));
+
+  ctx.tools.register(defineTool({
     name: 'quest_status',
     description: [
       '查询当前工作区任务线的全部节点状态（pending/running/completed/failed/timeout + 判定依据 + worker 总结）。',
       '返回开头的 unread 是自上次查看以来的完成事件摘要。用户问"实验跑完了吗/怎么样了"时用这个。',
+      '**输出硬上限 ~8KB**（2026-09-23，kl P5：此前全量渲染 670 节点能到 300+KB，撑爆上下文）：',
+      '概览（含 asOf 快照时刻与 ok/suspect/crash/infra 四类计数）+ 异常/在跑节点 + 最近完成的节点明细；',
+      '被截掉的全量明细自动落盘到工作区 `quest-status-full.txt`，需要翻旧账就 read 它。',
       '**返回的 role 字段告诉你自己的身份**（main=本工作区主对话 / subagent=子对话）——不确定"我该向谁汇报、能不能点名用户"时看它，不用凭感觉。主对话职责=汇总筛选后决定是否打扰用户；子对话职责=把结果交给主对话。',
       '返回的 line 字段回答"是不是真都完成了"：quiet=true 表示没有在跑节点、账本安静了 idleMinutes 分钟、且工作区也没有新文件改动；workspace.recent>0 说明有人正在改代码（可能马上又派任务）。dsh.running>0 表示本工作区的 DSH 会话正在跑（AI 在思考/写代码）。这是收敛推断不是完成保证，回答用户时把依据一起说。',
+      'spawned 区=quest_spawn 派出的子对话（谁在替你干活、简报交了没）。',
     ].join(' '),
     parameters: {
       ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd，一般不用传）' },
+      verbose: { type: 'boolean', description: 'true=跳过截断，全量渲染（大工作区慎用，会很长）' },
     },
     output: {
       schema: {
@@ -416,17 +448,46 @@ function apply(ctx, config = {}) {
             detail: { type: 'string' },
           } } } } },
           unread: { type: 'array', items: { type: 'object', additionalProperties: true, properties: { node: { type: 'string' }, verdict: { type: 'string' }, summary: { type: 'string' }, ts: { type: 'number' } } } },
+          asOf: { type: 'string', description: '快照时刻（ISO）——判断新鲜度用' },
+          line: { type: 'object', additionalProperties: true, description: '收敛状态（quiet/idleMinutes/verdictBuckets 四类计数等）' },
+          spawned: { type: 'array', items: { type: 'object', additionalProperties: true, description: 'quest_spawn 派出的子对话（spawnId/title/status）' } },
           error: { type: 'string' },
         },
       },
-      render: (_a, v) => {
+      render: (args, v) => {
         if (v.error) return [{ type: 'text', text: `查询失败：${v.error}` }];
         const nodes = v.plan?.nodes || [];
         if (!nodes.length) return [{ type: 'text', text: '当前工作区没有任务线计划。先用 quest_plan 写一个。' }];
-        const unread = (v.unread || []).map((u) => `${u.node}:${u.verdict}`).join('、');
-        const lines = nodes.map((n) => `- ${n.id}: ${n.status}${n.verdict ? `（${n.verdict}${n.via ? '/' + n.via : ''}）` : ''}${n.runSeconds != null ? ` 运行${n.runSeconds}s` : ''}${n.summary ? `\n  总结：${String(n.summary).slice(0, 300)}` : ''}`);
+        const asOf = v.asOf ? `（快照 ${v.asOf.slice(11, 19)}Z）` : '';
+        const vb = v.line?.verdictBuckets;
+        const head = vb ? `四类计数：✅ok ${vb.ok}｜⚠️suspect(记账) ${vb.suspect}｜❌crash(脚本) ${vb.crash}｜🛠infra(超时/终止) ${vb.infra}` : '';
+        const line = (n) => `- ${n.id}: ${n.status}${n.verdict ? `（${n.verdict}${n.via ? '/' + n.via : ''}）` : ''}${n.runSeconds != null ? ` 运行${n.runSeconds}s` : ''}${n.summary ? `\n  总结：${String(n.summary).slice(0, 300)}` : ''}`;
         const roleTag = v.role === 'main' ? '【身份：主对话】' : v.role === 'subagent' ? '【身份：子对话】' : '';
-        return [{ type: 'text', text: `${roleTag ? roleTag + '\n' : ''}${unread ? `📣 自上次查看：${unread}\n` : ''}任务线 ${nodes.length} 个节点：\n${lines.join('\n')}` }];
+        const unread = (v.unread || []).map((u) => `${u.node}:${u.verdict}`).join('、');
+        // 全量落盘（供翻旧账）：写进工作区固定文件名，渲染里只给指针
+        try {
+          const cwd = String(args?.ws || v.plan?.workspace || '');
+          if (cwd) writeFileSync(join(cwd, 'quest-status-full.txt'),
+            [`# quest_status 全量（落盘于 ${new Date().toLocaleString('zh-CN')}，共 ${nodes.length} 节点）`, ...nodes.map(line)].join('\n'), 'utf8');
+        } catch {}
+        if (args?.verbose === true) {
+          return [{ type: 'text', text: `${roleTag ? roleTag + '\n' : ''}${unread ? `📣 自上次查看：${unread}\n` : ''}任务线 ${nodes.length} 个节点：\n${nodes.map(line).join('\n')}` }];
+        }
+        // 2026-09-23 硬上限 ~8KB：概览 + 异常/在跑全给 + 最近完成 12 条，其余去落盘文件
+        const BAD = ['running', 'failed', 'timeout'];
+        const hot = nodes.filter((n) => BAD.includes(n.status));
+        const done = nodes.filter((n) => n.status === 'completed');
+        const recentDone = done.slice(-12).reverse();
+        const parts = [
+          `${roleTag ? roleTag + '\n' : ''}${unread ? `📣 自上次查看：${unread}\n` : ''}任务线 ${nodes.length} 节点${asOf}${head ? '\n' + head : ''}`,
+          ...(hot.length ? ['', `▸ 需关注（在跑/异常，全量 ${hot.length}）：`, ...hot.slice(0, 25).map(line)] : []),
+          ...(recentDone.length ? ['', `▸ 最近完成（最新 ${recentDone.length}/${done.length}）：`, ...recentDone.map(line)] : []),
+          ...(v.spawned?.length ? ['', `▸ 子对话：${v.spawned.map((s) => `${s.title}(${s.status})`).join('、')}`] : []),
+          ...(hot.length > 25 || done.length > 12 ? [`…（其余 ${hot.length > 25 ? hot.length - 25 + ' 条异常/' : ''}${done.length - 12} 条完成已省略，全量在 <工作区>/quest-status-full.txt）`] : []),
+        ];
+        let text = parts.join('\n');
+        if (text.length > 8192) text = text.slice(0, 7900) + `\n…（渲染超 8KB 截断；全量在 <工作区>/quest-status-full.txt）`;
+        return [{ type: 'text', text }];
       },
     },
     execute: async (args, exec) => questCall(cfg(), `/api/status?ws=${encodeURIComponent(wsOf(args, exec))}${sessOf(exec) ? `&sessionId=${encodeURIComponent(sessOf(exec))}` : ''}`),

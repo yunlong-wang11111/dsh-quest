@@ -1401,7 +1401,17 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   orchestrate(wsKey).catch(() => {});
   // WA 触发器：失败 + 节点声明 auto_fix + 预算未烧完 → 修复会话（最小修复+备份+重派）
   if (!ok && node.autoFix) {
-    runFixer(wsKey, node, j, summary).catch((e) => log('fixer 异常:', e?.message));
+    // 2026-09-23（三件"静默失败"复盘）：auto_fix 接手会跳过即时失败上报（防修复中重复打扰），
+    // 但派发者至少要知道"已被接手"——否则像今早那样：失败被吸收、修复又当场崩，
+    // 两头无消息，派发者以为任务凭空消失。给署名派发者发一行接手回执（不设冷却，同点名回执制）。
+    maybeNotifyReceipt(wsKey, node.id, 0, `🛠【已接手自动修复】节点 ${node.id} 判定 ${j.verdict}（${j.via}）。修复中：改好自动重派并回执；放弃或超时会再通知你。`).catch(() => {});
+    runFixer(wsKey, node, j, summary).catch(async (e) => {
+      // 2026-09-23 保险：fixer 自身崩溃（曾因 api2 未定义全灭 36 次且零结案）不能再次静音失败——
+      // 落账 + 把被吸收的那条失败上报补发给派发者，让人永远比沉默先知道。
+      log('fixer 异常:', e?.message);
+      try { appendEvent(wsKey, { t: 'fix.error', node: node.id, error: String(e?.message || e).slice(0, 300) }); } catch {}
+      await maybeNotifyFailure(wsKey, node, { ...j, via: `${j.via}（修复器异常：${String(e?.message || e).slice(0, 80)}）` }, summary).catch(() => {});
+    });
   }
 }
 
@@ -1647,7 +1657,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
   const { createTurnCollector } = await import('./lib/dsh-client-v2.mjs');
   let sessionId = null;
   try {
-    const created = await api2.sessions.create({ cwd: node.cwd || os.homedir(), agentPreset: CFG.fixerPreset || 'quest-fixer' });
+    const created = await api.sessions.create({ cwd: node.cwd || os.homedir(), agentPreset: CFG.fixerPreset || 'quest-fixer' });
     if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 120));
     sessionId = created.result.value.sessionId;
     activeWorkers.add(sessionId);
@@ -1663,7 +1673,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
     })();
     const script = String(node.command || '').match(/\b([\w.\-]+\.py)\b/)?.[1] || '';
 
-    await api2.sessions.prompt({
+    await api.sessions.prompt({
       sessionId, mode: 'queue',
       content: [{ type: 'text', text: `【自动修复任务】节点 ${node.id} 第 ${attempt}/${node.fixBudget ?? 2} 次尝试失败，请你做最小修复。
 
@@ -1729,7 +1739,7 @@ ${diff}` : ''}`.slice(0, 900)).catch(() => {});
     if (sessionId) {
       activeWorkers.delete(sessionId);
       workerCollectors.delete(sessionId);
-      try { await api2.workspace.archiveSession({ sessionId }); } catch {}
+      try { await api.workspace.archiveSession({ sessionId }); } catch {}
     }
   }
 }
@@ -1928,9 +1938,29 @@ function convergeAutoOn(wsKey) {
   const st = loadConvergeState()[wsKey] || {};
   return st.auto !== false;   // 缺省=开（buff 默认生效；只有显式 off 才关）
 }
+/** 工作区路径解析（2026-09-23，"收尾会话落在 qq-bridge"事故的根修）：
+ *  quest 建的每个会话都必须有**明确的 cwd**——此前自动收尾在 plan 头缺 workspace 时兜底成 ''，
+ *  sessions.create({cwd: undefined}) 落到 DSH 进程默认 cwd（当时是 qq-bridge）⇒ 收尾会话写
+ *  line-summary 到真正的工作区 = "工作区之外" ⇒ 沙箱要人工审批，汇报卡死等人点。
+ *  解析链：plan 头 workspace → 账本里最近一次派发的 cwd → 调用方兜底；仍为空返回 ''（调用方必须处理）。 */
+function resolveWsPath(wsKey, fallback = '') {
+  try {
+    const w = parsePlan(buildState(wsKey).plan || '').meta?.workspace;
+    if (w && String(w).trim()) return String(w).trim();
+  } catch {}
+  try {
+    const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+    for (let i = raw.length - 1; i >= 0; i--) {
+      let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+      const c = ev.cwd || ev.workspace;
+      if ((ev.t === 'quick.dispatched' || ev.t === 'node.dispatched' || ev.t === 'spawn.created') && c && String(c).trim()) return String(c).trim();
+    }
+  } catch {}
+  return String(fallback || '').trim();
+}
+
 /** 每日定时重开：过了任一 reopenTime 且今天还没重开过 → 开（2 小时内巡检到都算，防错过）。 */
-function checkReopenConverge(wsKey, nc) {
-  const times = Array.isArray(nc?.reopenTimes) ? nc.reopenTimes : [];
+function checkReopenConverge(wsKey, nc) {  const times = Array.isArray(nc?.reopenTimes) ? nc.reopenTimes : [];
   if (!times.length) return false;
   const now = new Date();
   const cur = now.getHours() * 60 + now.getMinutes();
@@ -2076,7 +2106,8 @@ async function maybeNotifyConverge(wsKey, st, info, { immediate = false } = {}) 
     const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
     if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒
   }
-  const wsPath = (() => { try { return parsePlan(st.plan).meta?.workspace || ''; } catch { return ''; } })();
+  const wsPath = resolveWsPath(wsKey);   // 2026-09-23：不再兜底 ''（会把收尾会话建进 DSH 默认 cwd）
+  if (!wsPath) { log(`converge ${wsKey}: 解析不到工作区路径，跳过本轮收尾（plan 头缺 workspace 且账本无派发记录）`); return { skipped: 'no-workspace-path' }; }
   // 事件立即写入（不等两阶段走完——阶段 2 含最长 15 分钟等总结文件，等它事件永远迟到）
   appendEvent(wsKey, { t: 'notify.converge', counts: info.counts, phase: 'started' });
   runConvergeAndNotify(wsKey, wsPath, info).then((result) => {
@@ -2696,15 +2727,28 @@ const server = http.createServer(async (req, res) => {
       }));
       // workspace 优先取 plan.md 里声明的绝对路径（权威），入参只做缺省——/q翻页 等下游要拿真路径去匹配 DSH 会话
       const act = lineActivity(state);
+      // 2026-09-23（kl P3）：failed 大数不再一锅端——拆四类让人一眼分清"实验真崩"与"记账 suspect"。
+      //   ok=正常完成 | suspect=判据未命中/产物存疑（记账层） | crash=startup-failed/crashed（脚本层）
+      //   infra=timeout/cancelled（执行环境/人工层）。failed 原字段保留兼容旧消费方。
+      const verdictBuckets = { ok: 0, suspect: 0, crash: 0, infra: 0 };
+      for (const n of nodes) {
+        if (n.status === 'completed') verdictBuckets.ok++;
+        else if (n.status === 'failed') {
+          if (n.verdict === 'suspect') verdictBuckets.suspect++;
+          else if (['startup-failed', 'crashed', 'preflight-failed'].includes(n.verdict)) verdictBuckets.crash++;
+          else verdictBuckets.infra++;   // timeout / cancelled / 未知
+        } else if (n.status === 'timeout' || n.status === 'cancelled') verdictBuckets.infra++;
+      }
       return json(200, {
+        asOf: new Date().toISOString(),   // 2026-09-23（kl P2）：快照时刻——汇总与实况赛跑时,消费方能自判新鲜度
         plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes, closedAt: state.closedAt || null, closedReason: state.closedReason || '' },
         line: {
-          active: act.active.length, nodes: act.nodes.length, counts: act.counts,
+          active: act.active.length, nodes: act.nodes.length, counts: act.counts, verdictBuckets,
           idleMinutes: act.idleMinutes, quietMinutes: act.quietMinutes,
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.7.0', convergeAuto: convergeAutoOn(wsKey), spawned,
+        unread, questVersion: '0.7.1', convergeAuto: convergeAutoOn(wsKey), spawned,
         // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
         // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
         role: (() => {
@@ -2941,6 +2985,31 @@ const server = http.createServer(async (req, res) => {
     // 节点里跑脚本、子对话里跑判断/写码"）。可见性（用户硬约束①）：spawned 进
     // /api/status 的 spawned 区与 progress.md；有界返回（硬约束②）：干完必须
     // 交结构化简报（经 quest_notify 的简报通道回派发者），超期 sweep 催报。
+    // ── quest_tell：向 spawn 出的子对话发消息（2026-09-23，kl P4）──────────────
+    // 背景DSH 的 send_message 有父子会话限制（"belongs to another parent session"），
+    // 派发者对 spawn 子对话"能停不能引导"。服务端没有这个限制（sessions.prompt 对任意会话可投），
+    // 所以引导消息走 quest 中转：找到 spawn 登记 → queue 模式投递 → 账本留痕。
+    if (req.method === 'POST' && u.pathname === '/api/tell') {
+      const b = await readBody(req);
+      const target = String(b.spawnId || b.sessionId || '').trim();
+      const text = String(b.message || '').trim().slice(0, 4000);
+      if (!target || !text) return json(400, { ok: false, error: '缺少 spawnId（或 sessionId）/message' });
+      const spawns = buildSpawns(wsKey);
+      const sp = spawns.find((s) => s.spawnId === target || s.sessionId === target || s.spawnId.startsWith(target) || target.startsWith(s.spawnId));
+      if (!sp) return json(200, { ok: false, error: `没找到子对话「${target.slice(0, 40)}」——quest_status 的 spawned 区可查 spawnId。` });
+      const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+      const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+      try {
+        await api.sessions.prompt({
+          sessionId: sp.sessionId, mode: 'queue',
+          content: [{ type: 'text', text: `【派发者引导】${text}` }],
+        });
+        appendEvent(wsKey, { t: 'spawn.told', spawnId: sp.spawnId, sessionId: sp.sessionId, len: text.length });
+        return json(200, { ok: true, spawnId: sp.spawnId, title: sp.title, note: sp.status === 'running' ? '已投递（queue：它忙则排队）' : `注意：该子对话状态是 ${sp.status}（可能已交简报收工）` });
+      } catch (e) {
+        return json(200, { ok: false, error: `投递失败：${String(e?.message || e).slice(0, 140)}` });
+      }
+    }
     if (req.method === 'POST' && u.pathname === '/api/spawn') {
       const b = await readBody(req);
       const title = String(b.title || '').trim().slice(0, 60);
@@ -2949,7 +3018,9 @@ const server = http.createServer(async (req, res) => {
       if (!title || !handoff) return json(400, { ok: false, error: '缺少 title/handoff（handoff 复用 plan 节点写法：角色/验证什么/指标与健康范围/产物在哪/已知的坑）' });
       if (!by) return json(400, { ok: false, error: '缺少派发者身份（dispatchedBy）——插件层会自动带上；直连 HTTP 需手动传' });
       const state = buildState(wsKey);
-      let wsPath = ''; try { wsPath = parsePlan(state.plan || '').meta?.workspace || ws; } catch { wsPath = ws; }
+      // 2026-09-23：spawn 的 cwd 必须解析成功——建在错误 cwd 的子对话写工作区文件会撞沙箱审批
+      const wsPath = resolveWsPath(wsKey, ws);
+      if (!wsPath) return json(400, { ok: false, error: '解析不到工作区路径（plan 头缺 workspace、账本无派发记录、也未传 ws）——子对话必须建在明确的工作区里' });
       const deadlineMin = Math.min(1440, Math.max(5, Number(b.deadlineMinutes) || 240));
       const spawnId = `spawn-${title.replace(/[^\w一-龥-]/g, '_').slice(0, 40)}-${Date.now().toString(36)}`;
       const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
@@ -3035,12 +3106,15 @@ const server = http.createServer(async (req, res) => {
         return json(200, { ok: false, error: `你是子对话（${caller.slice(8, 16)}…），不是本工作区的主对话（${mainSid.slice(8, 16)}…）。规矩：子对话把结果/总结交回主对话（用 DSH 的 send_message 发给它，或写进工作区文件并在你的收尾消息里说明），由主对话筛选后统一通知用户。` });
       }
       const cdMs = Math.max(5, Number(CFG.notify?.userPingCooldownSec) || 600) * 1000;   // 默认 10 分钟/工作区
+      // 2026-09-23（kl P8）：更正/撤回类消息绕过冷却——冷却挡住"16× 作废"那类更正 10 分钟，
+      // 晚到的撤回比不发更糟。首行 retract:/更正/撤回 即视为更正通道（滥用由主对话自律约束）。
+      const isRetract = /^\s*(retract:|更正[:：]|撤回[:：]|作废[:：])/i.test(rawMsg);
       let lastPing = 0;
       try {
         const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
         for (let i = raw.length - 1; i >= 0; i--) { let ev; try { ev = JSON.parse(raw[i]); } catch { continue; } if (ev.t === 'notify.user-ping') { lastPing = tsOf(ev.at); break; } }
       } catch {}
-      if (lastPing && Date.now() - lastPing < cdMs) return json(200, { ok: false, error: `冷却中（${Math.round((cdMs - (Date.now() - lastPing)) / 1000)}s 后可再发）——每工作区默认 10 分钟一条。` });
+      if (!isRetract && lastPing && Date.now() - lastPing < cdMs) return json(200, { ok: false, error: `冷却中（${Math.round((cdMs - (Date.now() - lastPing)) / 1000)}s 后可再发）——每工作区默认 10 分钟一条；更正/撤回类消息首行写"更正："可立即发。` });
       appendEvent(wsKey, { t: 'notify.user-ping', from: caller || undefined });
       try {
         if (notifyKind(CFG) === 'off') return json(200, { ok: false, error: '通知出口为 off（配 notify.kind）' });
@@ -3231,7 +3305,9 @@ const server = http.createServer(async (req, res) => {
       } catch (e) { results.errors.push(`list: ${e.message}`); }
       // 3) 开新会话（cwd 用 Windows 原生形态——/mnt/c 形态在 Windows 侧是无效路径）
       try {
-        const created = await api.sessions.create({ cwd: hostPathFor(String(b.ws ?? '')) || b.ws, agentPreset: b.preset || undefined });
+        // 2026-09-23：flip 新会话的 cwd 也走统一解析链（b.ws 缺失时不再静默落 DSH 默认 cwd）
+        const flipCwd = hostPathFor(String(b.ws ?? '')) || b.ws || resolveWsPath(wsKey);
+        const created = await api.sessions.create({ cwd: flipCwd || undefined, agentPreset: b.preset || undefined });
         if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 150));
         results.created = created.result.value.sessionId;
         if (!results.created) throw new Error('create 返回 ok 但没有 sessionId');
@@ -3405,7 +3481,7 @@ const server = http.createServer(async (req, res) => {
       if (!ws) return json(400, { ok: false, error: '缺少 ws 参数（工作区路径）' });   // 空 ws 会退化成无主收敛（2026-09-16 踩过：账本写进 quests 根目录）
       const state = buildState(wsKey);
       const info = lineActivity(state);
-      const wsPath = (() => { try { return parsePlan(state.plan || '').meta?.workspace || ws; } catch { return ws; } })();
+      const wsPath = resolveWsPath(wsKey, ws);   // 2026-09-23：统一解析链（plan 头→账本→入参），防 cwd 落 DSH 默认
       try {
         // 两阶段（与自动收尾同架构）：轻量会话干总结 → 主对话收通知。事件立即写，后续异步。
         // waitAsync：回执只等"派发"（建会话+发提示词），等总结（最长 15 分钟）转后台——
@@ -3424,6 +3500,31 @@ const server = http.createServer(async (req, res) => {
     // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
     if (req.method === 'POST' && u.pathname === '/api/cancel') {
       const body = await readBody(req);
+      // 2026-09-23（kl P7）：tag 批量收线——节点 id 前缀/片段匹配（大小写不敏感），
+      // 在跑的逐个走正常杀树；非终态（pending/frozen/ready）的直接落 cancelled 终态。
+      // 典型场景：一批被取代的 quick-xxx_*_* 分散节点，不用一个个挑。
+      if (body.tag) {
+        const tag = String(body.tag).toLowerCase();
+        const st = buildState(wsKey);
+        const matched = Object.values(st.nodes || {}).filter((n) => String(n.id ?? '').toLowerCase().includes(tag));
+        const running = matched.filter((n) => n.status === 'running');
+        const idle = matched.filter((n) => ['pending', 'frozen', 'ready'].includes(n.status));
+        const results = [];
+        for (const n of idle) {
+          appendEvent(wsKey, { t: 'node.cancelled', node: n.id, reason: `tag 批量收线(${body.tag})` });
+          results.push(`${n.id}: cancelled`);
+        }
+        for (const n of running) {
+          const job = activeJobs.get(`${wsKey}|${n.id}`);
+          if (job) {
+            job.cancelledByHuman = `tag 批量收线: ${String(body.reason || body.tag).slice(0, 120)}`;
+            killJobTree(job, job.child.pid);
+            results.push(`${n.id}: 已发杀树`);
+          } else { results.push(`${n.id}: 在跑但不在活动表（等对账）`); }
+        }
+        writeProgress(wsKey);
+        return json(200, { ok: true, tag: body.tag, matched: matched.length, detail: results.slice(0, 30), note: `匹配 ${matched.length}（杀在跑 ${running.length}，收 idle ${idle.length}）；不匹配的已终态节点不动。` });
+      }
       {
         // 先解析 id：短后缀/片段唯一就当成它；解析不到直接 404，不写账本（防幽灵节点）
         const st0 = buildState(wsKey);
@@ -3548,6 +3649,24 @@ const server = http.createServer(async (req, res) => {
       }
       const command = String(b.command);
       const cwd = String(b.cwd);
+      // 2026-09-23（kl P6）：探针没有 shell——顶层（引号外）的 |、&、;、换行 后面的段落会被静默丢弃
+      // （实测：python -c 后跟一段 PowerShell，第二段无声蒸发）。直接拒绝并说明。
+      // 引号感知：-c "import time; time.sleep(600)" 里的分号是 Python 语法，必须放行——
+      // 只拦引号**外**的元字符（粗粒度引号追踪，够这个白名单场景用）。
+      const topMeta = (() => {
+        let q = null;
+        for (let i = 0; i < command.length; i++) {
+          const c = command[i];
+          if (q) { if (c === q) q = null; else if (c === '\\') i++; continue; }
+          if (c === '"' || c === "'") { q = c; continue; }
+          if (c === '|' || c === '&' || c === ';' || c === '\n' || c === '\r') return c;
+        }
+        return null;
+      })();
+      if (topMeta) {
+        const pretty = { '|': '|', '&': '&', ';': ';', '\n': '换行', '\r': '换行' }[topMeta];
+        return json(200, { ok: false, error: `探针不支持 shell 语法（顶层检测到 ${pretty}，其后的命令会被静默丢弃）——拆成多次探针，或把逻辑写进 -c 的引号内代码里；真正的管道/串联命令用 quest_run。` });
+      }
       const cls = classifyRunCommand(command, cwd);
       const allowC = cls.why === '解释器 -c 内联代码不可静态审查'; // 探针放行 -c（quest_run 依然要过门）
       if (cls.level !== 'ok' && !allowC) {

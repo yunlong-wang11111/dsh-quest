@@ -211,14 +211,16 @@ server.tool(
 
 server.tool(
   'quest_cancel',
-  '人工终止一个正在运行的节点（杀整棵进程树；不触发自动修复）。',
+  '人工终止一个正在运行的节点（杀整棵进程树；不触发自动修复）。tag 参数可批量收线（id 含片段的：在跑杀树、pending/frozen 落 cancelled）。',
   {
-    node: z.string().describe('节点 id'),
+    node: z.string().optional().describe('节点 id（与 tag 二选一）'),
+    tag: z.string().optional().describe('批量收线：节点 id 包含此片段的全部处理'),
     reason: z.string().optional().describe('终止原因（入账本+通知）'),
     ws: z.string().optional().describe('工作区绝对路径'),
   },
-  async ({ node, reason, ws }) => {
-    const r = await q('POST', `/api/cancel?ws=${encodeURIComponent(ws || '')}`, { node, reason: reason || '人工终止' });
+  async ({ node, tag, reason, ws }) => {
+    const r = await q('POST', `/api/cancel?ws=${encodeURIComponent(ws || '')}`,
+      tag ? { tag, reason: reason || `tag 批量收线 ${tag}` } : { node: node || '', reason: reason || '人工终止' }, 30000);
     return r.error ? fail(r) : ok(r);
   },
 );
@@ -267,6 +269,23 @@ server.tool(
       ...(deadline_minutes ? { deadlineMinutes: deadline_minutes } : {}),
       ...(dispatchedBy ? { dispatchedBy } : {}),
     }, 60000);
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_tell',
+  [
+    '向 quest_spawn 派出的子对话发引导消息（补充指令/修正方向）——绕开 DSH send_message 的父子会话限制。',
+    'spawnId 传全称或唯一片段；queue 语义（它忙则排队）。',
+  ].join(' '),
+  {
+    spawnId: z.string().describe('目标子对话 spawnId（quest_status 的 spawned 区可查；片段即可）'),
+    message: z.string().describe('引导消息'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async ({ spawnId, message, ws }) => {
+    const r = await q('POST', `/api/tell?ws=${encodeURIComponent(ws || '')}`, { spawnId, message }, 20000);
     return r.error ? fail(r) : ok(r);
   },
 );

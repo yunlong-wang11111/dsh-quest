@@ -259,6 +259,16 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 
 实测（机械模式）：`python mech_test.py` → `completed | ok | finish-keyword`，loss 指标 `1.5 → 1.05` 自动提取——**全程零模型调用**。
 
+## v0.7.1 新增（2026-09-23，内测 P2–P8 批次）
+
+- **`quest_tell`（P4）**：向 spawn 出的子对话发引导消息——绕开 DSH send_message 的父子会话限制（"能停不能引导"的对称性修复）；queue 语义，spawnId 支持片段
+- **status 渲染硬上限 ~8KB（P5）**：原生插件此前全量渲染大工作区可达 300+KB；现在概览（asOf 快照时刻 + 四类计数）+ 异常/在跑 + 最近完成 12 条，全量明细落盘 `<工作区>/quest-status-full.txt`，`verbose:true` 可跳过截断
+- **四类计数（P3）**：`line.verdictBuckets` = ok / suspect(记账) / crash(脚本) / infra(超时·终止)——"failed 38%"不再一锅端；`asOf`（P2）快照时刻随 status 返回
+- **探针拒顶层 shell 元字符（P6）**：引号**外**的 |、&、;、换行 直接拒绝（此前第二段命令被静默丢弃）；引号内（-c 的 Python 分号）放行——引号感知扫描
+- **tag 批量收线（P7）**：`quest_cancel {tag}`——节点 id 含片段的在跑杀树、pending/frozen/ready 落 cancelled
+- **更正类绕过冷却（P8）**：首行 `retract:`/`更正：`/`撤回：`/`作废：` 的 notify 不受 10 分钟冷却限制
+- **WMI 探测诚实化（python-manager 配套）**：`python_resources` 在 WMI 被拒/损坏时显式报"探测不可信"并给替代验证路径，不再静默返 0（当日 AI 据此误判三件活全死）；退出检测同样跳过不可信快照
+
 ## v0.7.0 新增（2026-09-22）
 
 - **`quest_spawn` 派真子对话（L3，用户内测定稿）**：给 AI "派子对话"的动词——建同工作区独立 DSH 会话 + 种子提示（身份/运行纪律/简报契约）。handoff 复用 plan 节点写法（"一套写作技能、两种执行形态：节点里跑脚本、子对话里跑判断/写码"）。**可见性**（用户硬约束①）：spawned 进 `/api/status` 的 spawned 区、progress.md「派出的子对话」、控制台卡片；**有界返回**（硬约束②）：子对话干完调 quest_notify 交结构化简报（做了什么/产物路径/读数/阻塞/建议）定向回派发者，`spawn.reported` 记终态，超期 sweep 标 overdue + 催派发者一次。子对话不能再派子对话（一层为限）；spawned 会话计入 quest 自建名单（不进兜底上报目标）
