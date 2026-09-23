@@ -996,7 +996,9 @@ function handleNodeExit(wsKey, node, ctx) {
   if (job.cancelledByHuman) {
     appendEvent(wsKey, { t: 'node.cancelled', node: node.id, reason: job.cancelledByHuman });
     pushInbox({ node: node.id, verdict: 'cancelled' });
-    if (!node.quiet && notifyKind(CFG) !== 'off') qqPush(wsKey, `[🛑 人工终止] ${node.id} · 已跑 ${formatDur(runSec)}\n原因：${job.cancelledByHuman}\n（不触发自动修复）`.slice(0, 400)).catch(() => {});
+    // 2026-09-23（用户定稿通道分工）：私聊只保留 静默收敛 + AI 点名；人工终止确认不再发 QQ——
+    // AI 批量收线(tag)会一次几十条轰炸；/q停 的回执走命令通道、账本留痕已足够审计。
+    // if (!node.quiet && notifyKind(CFG) !== 'off') qqPush(wsKey, `[🛑 人工终止] ...`)
     orchestrate(wsKey).catch(() => {});
     return;
   }
@@ -2763,7 +2765,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.7.2', convergeAuto: convergeAutoOn(wsKey), spawned,
+        unread, questVersion: '0.7.3', convergeAuto: convergeAutoOn(wsKey), spawned,
         // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
         // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
         role: (() => {
