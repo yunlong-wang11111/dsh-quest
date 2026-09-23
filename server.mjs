@@ -1336,10 +1336,11 @@ async function maybeNotifyReceipt(wsKey, nodeId, runSec, summary) {
  * notify.nodeEvents: false → 中途的成败/警告/修复类推送全部静音（收尾汇报与人工终止确认不受影响），
  * 需要人时由主对话用 quest_notify 工具点名——通知时点从'每个节点'收敛到'AI 判断需要人'。 */
 function nodeEventPush(wsKey, text) {
-  if (CFG.notify?.nodeEvents === false) return;
-  // 2026-09-22 修（沙箱测试抓出）：qqPush 在 notify.kind=off 时返回 undefined（早退不返回 Promise），
-  // 直接 .catch 会在 dispatchJob 的 async executor 里同步抛 TypeError——resolve 永远不执行，
-  // /api/run 挂死到 fetch 头超时（测试实测 300s）。包一层 Promise.resolve 兑底两种返回形状。
+  // 2026-09-23 根修（kl 反馈"同一个 catch 崩溃影响 5 节点"）：两处早退都必须返回 Promise——
+  // ① nodeEvents:false（生产 9/19 起就是它）：裸 return undefined ⇒ 7 个调用点的 .catch 同步抛
+  //    TypeError；fixer 在 fix.reported 之后崩（吞掉重派/结案），dispatchJob 预检失败路径更会让
+  //    /api/run 挂死到超时。② kind=off 时 qqPush 返回 undefined（2026-09-22 只修了这半）。
+  if (CFG.notify?.nodeEvents === false) return Promise.resolve();
   return Promise.resolve(qqPush(wsKey, text)).catch(() => {});
 }
 
@@ -1406,11 +1407,25 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
     // 两头无消息，派发者以为任务凭空消失。给署名派发者发一行接手回执（不设冷却，同点名回执制）。
     maybeNotifyReceipt(wsKey, node.id, 0, `🛠【已接手自动修复】节点 ${node.id} 判定 ${j.verdict}（${j.via}）。修复中：改好自动重派并回执；放弃或超时会再通知你。`).catch(() => {});
     runFixer(wsKey, node, j, summary).catch(async (e) => {
-      // 2026-09-23 保险：fixer 自身崩溃（曾因 api2 未定义全灭 36 次且零结案）不能再次静音失败——
-      // 落账 + 把被吸收的那条失败上报补发给派发者，让人永远比沉默先知道。
+      // 2026-09-23 保险：fixer 自身崩溃不能再次静音失败——落账 + 把被吸收的那条失败上报补发给派发者。
+      // 同日降级（kl 建议"fixer 异常不改判定"）：若本次修复已成功落账 fix.reported（崩在收尾通知层，
+      // 5 节点事故的实形——修复本身结论有效），则只记 fix.error，**不再把节点当失败重发上报**。
       log('fixer 异常:', e?.message);
-      try { appendEvent(wsKey, { t: 'fix.error', node: node.id, error: String(e?.message || e).slice(0, 300) }); } catch {}
-      await maybeNotifyFailure(wsKey, node, { ...j, via: `${j.via}（修复器异常：${String(e?.message || e).slice(0, 80)}）` }, summary).catch(() => {});
+      let repairConcluded = false;
+      try {
+        const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+        let lastAttempt = -1;
+        for (let i = 0; i < raw.length; i++) {
+          let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+          if (ev.node !== node.id) continue;
+          if (ev.t === 'fix.attempt') lastAttempt = i;
+          if (ev.t === 'fix.reported' && i > lastAttempt) { repairConcluded = true; break; }
+        }
+      } catch {}
+      try { appendEvent(wsKey, { t: 'fix.error', node: node.id, error: String(e?.message || e).slice(0, 300), ...(repairConcluded ? { note: '修复已落账，崩溃仅影响收尾通知，不重发失败上报' } : {}) }); } catch {}
+      if (!repairConcluded) {
+        await maybeNotifyFailure(wsKey, node, { ...j, via: `${j.via}（修复器异常：${String(e?.message || e).slice(0, 80)}）` }, summary).catch(() => {});
+      }
     });
   }
 }
@@ -2748,7 +2763,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.7.1', convergeAuto: convergeAutoOn(wsKey), spawned,
+        unread, questVersion: '0.7.2', convergeAuto: convergeAutoOn(wsKey), spawned,
         // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
         // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
         role: (() => {
