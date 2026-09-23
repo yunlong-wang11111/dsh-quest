@@ -1856,7 +1856,9 @@ function dshActivity(wsDir) {
   };
 }
 const WS_SKIP_DIRS = new Set(['.git', 'node_modules', 'archive', '__pycache__', 'logs', 'out', 'runs']);
-const WS_SKIP_FILES = new Set(['progress.md', 'research-state.md', 'plan.md']);
+// 2026-09-23 补：line-summary*.md 是收敛会话每轮写的、quest-status-full.txt 是 status 渲染落盘的——
+// 都算"活动"就会自激（收敛→写文件→工作区活跃→再收敛）。
+const WS_SKIP_FILES = new Set(['progress.md', 'research-state.md', 'plan.md', 'quest-status-full.txt']);
 
 /**
  * 工作区活跃度：最近有没有文件被改动（回答"子对话是不是在改代码"）。
@@ -1877,7 +1879,7 @@ function workspaceActivity(wsDir, minutes) {
         if (depth > 0 && !WS_SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) walk(path.join(dir, e.name), depth - 1);
         continue;
       }
-      if (!e.isFile() || WS_SKIP_FILES.has(e.name)) continue;
+      if (!e.isFile() || WS_SKIP_FILES.has(e.name) || /^line-summary.*\.md$/i.test(e.name) || /^line-summary.*\.bak/i.test(e.name)) continue;
       try { found.push({ name: e.name, mtimeMs: fs.statSync(path.join(dir, e.name)).mtimeMs }); } catch {}
     }
   };
@@ -2146,8 +2148,13 @@ function evaluateQuiet(wsKey) {
     if (!st.plan) return null;
     if (!parsePlan(st.plan).nodes.length && !Object.keys(st.nodes || {}).length) return null;
     const info = lineActivity(st);
+    // 2026-09-23 根修（收敛通知 28 连发事故）：防重发守卫原来比 lastAct（含一切账本行级事件）vs lastQuiet——
+    // 但收敛机制自己每轮写的 notify.converge 事件永远比上一轮 line.quiet 新 ⇒ "有新动作"永真 ⇒ 每轮巡检
+    // 都再触发收敛（实测 1-3 分钟一轮、135 轮）。守卫必须只看**节点活动**：quest 的记账/通知类行级事件
+    // （notify.*、line.*、probe.*）不代表任务有进展。
     const lastQuiet = tsOf((st.lineEvents ?? []).filter((e) => e.t === 'line.quiet').pop()?.at);
-    if (info.lastAct === 0 || info.lastAct <= lastQuiet) {
+    const lastNodeAct = Math.max(0, ...Object.values(st.nodes || {}).map((n) => tsOf(n.lastEventAt)));
+    if (lastNodeAct === 0 || lastNodeAct <= lastQuiet) {
       return { quiet: false, active: info.active.length, idleMinutes: info.idleMinutes };
     }
     // 注意：任务在跑、或还在静默窗口内、或工作区刚被改过 → 都不算收敛
@@ -2765,7 +2772,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.7.3', convergeAuto: convergeAutoOn(wsKey), spawned,
+        unread, questVersion: '0.7.4', convergeAuto: convergeAutoOn(wsKey), spawned,
         // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
         // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
         role: (() => {
