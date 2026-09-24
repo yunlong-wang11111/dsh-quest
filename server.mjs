@@ -142,6 +142,7 @@ function parsePlan(markdown) {
       case 'auto_fix': cur.autoFix = v.trim() === 'true'; break;
       case 'fix_budget': cur.fixBudget = Number(v) || 2; break;
       case 'max_log_mb': cur.maxLogMB = Number(v) || 0; break; // 0 = 默认 256MB
+      case 'progress_minutes': cur.progressMinutes = Number(v) || 0; break; // 2026-09-24 F1：进度推送周期（分钟，0=关）——服务端定时把日志尾摘要推给派发者，替代 AI 轮询
       case 'push_images': cur.pushImages = Number(v) || 0; break; // 成功后直推 QQ 的图片数上限，0 = 关
       case 'shell': cur.shell = v.trim().toLowerCase() === 'wsl' ? 'wsl' : 'windows'; break;
       case 'resume_on_boot': cur.resumeOnBoot = v.trim() === 'true'; break; // 开机中断后允许一键续跑（默认关）
@@ -382,7 +383,7 @@ function judge(node, exitCode, runSec, logFile, startedAtMs = null, endedAtMs = 
   //    解析不出任何可校验条件（纯白话）时 total=0，自动退回下面的通用路径，零回归。
   const claims = parseSuccessClaims(node.success);
   if (claims.total > 0) {
-    const r = checkClaims(claims, { tail: tailLc, artifacts: artifacts.filter((f) => f.mtimeMs <= endMs), metrics: logFile ? extractMetrics(logFile) : {}, startMs });
+    const r = checkClaims(claims, { tail: tailLc, artifacts: artifacts.filter((f) => f.mtimeMs <= endMs), metrics: logFile ? extractMetrics(logFile) : {}, startMs, cwd: node.cwd || '' });
     if (r.failures.length) {
       return { verdict: 'suspect', via: 'success-claim-failed', detail: r.failures.map((f) => f.why).join('；').slice(0, 300), claims: r };
     }
@@ -919,6 +920,31 @@ function dispatchJob(wsKey, node, body = {}) {
     // 就截断（append 句柄会自动跟到新 EOF）。截断丢的是旧 stdout，账本/指标/总结都不依赖它。
     const capMB = node.maxLogMB > 0 ? node.maxLogMB : 256;
     job.timers.push(setInterval(() => {
+      // F1（2026-09-24）progress_push：每 progressMinutes 把日志尾摘要推给派发者——替代 AI 用
+      // Start-Sleep 盯日志的反模式（实测 kl 轮询 83 次）。只推署名派发；停滞检测：连续两个
+      // 周期日志零增长 → 一次 stalled 警报（日志写错路径/训练卡死/静默循环）。
+      const pushMin = Number(node.progressMinutes) || 0;
+      if (pushMin > 0 && !node.quiet) {
+        job.prog = job.prog || { lastAt: startedAt, lastSize: -1, stalls: 0, stalledWarned: false };
+        if (Date.now() - job.prog.lastAt >= pushMin * 60000) {
+          job.prog.lastAt = Date.now();
+          try {
+            const st = fs.statSync(logFile);
+            const grew = st.size !== job.prog.lastSize;
+            job.prog.lastSize = st.size;
+            job.prog.stalls = grew ? 0 : job.prog.stalls + 1;
+            const runMin = Math.round((Date.now() - startedAt) / 60000);
+            if (job.prog.stalls >= 2 && !job.prog.stalledWarned) {
+              job.prog.stalledWarned = true;
+              appendEvent(wsKey, { t: 'node.progress-stalled', node: node.id, runMinutes: runMin });
+              pushProgressToDispatcher(wsKey, node, `⏸【停滞警报】${node.id} 已跑 ${runMin} 分钟，连续 ${job.prog.stalls} 个周期日志零增长（${pushMin}min/周期）——检查日志路径/是否卡死。终态判定不受影响，这是过程警报。`).catch(() => {});
+            } else {
+              const digest = grew ? lastMeaningfulLine(readTail(logFile, 4096)) : '（本周期日志无新增）';
+              pushProgressToDispatcher(wsKey, node, `📍【进度】${node.id} · 已跑 ${runMin} 分钟 · ${digest}`).catch(() => {});
+            }
+          } catch {}
+        }
+      }
       // 断点第二层（防假）：长任务 20 分钟内无新存档 → 提醒一次（存档路径写错/未生效）
       if (!job.ckWarned && node.expectMinutes >= 20 && !node.noCheckpoint && Date.now() - startedAt > 20 * 60000) {
         const latest = findLatestCheckpoint(node.shell === 'wsl' ? hostPathFor(node.cwd || '') : node.cwd || '');
@@ -1292,6 +1318,29 @@ function roleTail(wsKey, sid) {
     }
     return '\n——角色：子对话（结果交给主对话，别越级）';
   } catch { return ''; }
+}
+
+/** F1（2026-09-24）progress_push 的投递腿：把一行进度摘要按回执同款通道推给派发者。
+ *  只推署名派发的节点（回执制同款边界——自动链节点不推，防轰炸）；投递失败只落账不重试。 */
+async function pushProgressToDispatcher(wsKey, node, text) {
+  let by = '';
+  try {
+    const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+    for (let i = raw.length - 1; i >= 0; i--) { let ev; try { ev = JSON.parse(raw[i]); } catch { continue; } if (ev.node === node.id && (ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.dispatchedBy) { by = String(ev.dispatchedBy); break; } }
+  } catch {}
+  if (!by) return false;
+  try {
+    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+    const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    await api.sessions.prompt({ sessionId: by, mode: 'queue', content: [{ type: 'text', text }] });
+    return true;
+  } catch (e) { log('progress_push 投递失败:', e?.message); return false; }
+}
+
+/** F1：日志尾的"最后一行有意义内容"（≤160 字符），做进度摘要用。 */
+function lastMeaningfulLine(tailText) {
+  const lines = String(tailText || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  return (lines[lines.length - 1] || '').slice(0, 160);
 }
 
 async function maybeNotifyReceipt(wsKey, nodeId, runSec, summary) {
@@ -2489,9 +2538,17 @@ setInterval(() => { try { sweepQuiet(); } catch (e) { log('sweepQuiet 异常:', 
 
 /** 产物图直推：把节点刚产出的 png/jpg 发 owner QQ（bridge /api/send/private-image，base64 image 段）。 */
 async function qqPushImage(wsKey, imagePath, caption) {
-  const r = await sendImage(CFG, imagePath, `${qqTag(wsKey)}${caption}`, { fs, timeoutMs: 20000 });
-  if (!r.ok && r.error !== 'off') log('图片直推失败:', r.error);
-  return r.ok;
+  // F4（2026-09-24）：图片与文字同款 3 次退避重试——此前图片一次性(2026-09-22 kl 发频谱图 502 丢图)。
+  // 不落盘排队(图片文件可能被后续运行覆盖,补发旧路径会推错图),三次失败只留日志。
+  const full = `${qqTag(wsKey)}${caption}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const r = await sendImage(CFG, imagePath, full, { fs, timeoutMs: 20000 });
+    if (r.ok) return true;
+    if (r.error === 'off') return false;
+    if (attempt < 3) { await new Promise((res) => setTimeout(res, attempt * 3000)); continue; }
+    log(`图片直推失败(3 次重试后放弃): ${r.error}`);
+  }
+  return false;
 }
 
 // ── worker 子会话（P2：复用 dsh-client-v2）──────────────────────────────
@@ -2772,7 +2829,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.7.4', convergeAuto: convergeAutoOn(wsKey), spawned,
+        unread, questVersion: '0.8.0', convergeAuto: convergeAutoOn(wsKey), spawned,
         // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
         // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
         role: (() => {
@@ -2834,6 +2891,24 @@ const server = http.createServer(async (req, res) => {
         }
       }
       return json(200, { ok: true, plans });
+    }
+    // ── F3（2026-09-24）配置热加载：改 quest-config.json 后不必等重启窗口 ──────────
+    // 教训：2026-09-23 关收敛链时,配置改了但内存态没换,23:00 定时器照旧翻案,只能干等几小时空窗重启。
+    // 语义边界：notify/converge/worker/fixer/sweep/qu gate 等**运行时读 CFG 的**全部即时生效；
+    // 端口/DSH baseUrl/令牌等**启动期消费的**要重启才换（返回体里会标出来）。防呆：JSON 损坏拒收不动现状。
+    if (req.method === 'POST' && u.pathname === '/api/config/reload') {
+      let fresh;
+      try { fresh = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch (e) {
+        return json(200, { ok: false, error: `配置文件解析失败,已拒收(内存态未动): ${String(e?.message || e).slice(0, 120)}` });
+      }
+      const before = JSON.stringify(CFG);
+      for (const k of Object.keys(CFG)) delete CFG[k];
+      Object.assign(CFG, fresh);
+      const beforeObj = JSON.parse(before);
+      const changed = Object.keys(fresh).filter((k) => JSON.stringify(fresh[k]) !== JSON.stringify(beforeObj[k] ?? null));
+      log('config.reload: 生效键 [' + changed.join(', ') + ']（启动期键 port/dshBaseUrl 等需重启）');
+      appendEvent(lastActiveWs, { t: 'config.reloaded', changed });
+      return json(200, { ok: true, changed, note: '运行时语义已即时生效;port/dshBaseUrl/token 等启动期键需重启' });
     }
     if (req.method === 'POST' && u.pathname === '/api/plan') {
       const body = await readBody(req);
@@ -2910,6 +2985,7 @@ const server = http.createServer(async (req, res) => {
         command: String(b.command), cwd: b.cwd,
         expectMinutes: Number(b.expectMinutes) || 30, quiet: b.quiet === true,
         autoFix: b.autoFix === true, fixBudget: 2,
+        progressMinutes: Number(b.progressMinutes) || 0,   // F1：进度推送（分钟，0=关）
         handoff: String(b.handoff || '快速单发任务').slice(0, 2000),
         success: String(b.success || '').slice(0, 300),
         after: [], when: '', watchRules: [],

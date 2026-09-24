@@ -1,4 +1,9 @@
 // success.mjs —— 把 plan 里 `success:` 的白话判据解析成可机器校验的条件（零 token、纯正则）
+// 2026-09-24 F2：带路径的产物判据（如 abaqus_batch/ml/xxx.json）直接按 cwd 解析 stat——
+// 此前判定器只扫「根 + out/logs/output/results/runs」非递归，子目录声明永远"未找到"
+// （piml 实测 165 条失败里 121 条是这类误报，占 73%）。
+import fs from 'node:fs';
+import path from 'node:path';
 //
 // 背景：PLAN-TEMPLATE 一直要求 AI 写「成功判据」（如 `日志尾含"训练完成"且 5 分钟内有 .pt 产出`），
 // 但 2026-09-13 之前判定器根本不读它 —— 字段只是被解析进 node.success 就没人用，成了装饰品。
@@ -107,6 +112,17 @@ export function checkClaims(claims, ctx) {
   }
 
   for (const a of claims.artifacts) {
+    // F2（2026-09-24）：带路径的声明直接 stat（cwd+相对路径）——不走非递归扫描的 artifacts 列表。
+    if (/[/\\]/.test(a.what) && !a.what.includes('*')) {
+      const p = path.isAbsolute(a.what) ? a.what : path.resolve(String(ctx.cwd || '.'), a.what);
+      try {
+        const st = fs.statSync(p);
+        if (st.isFile() && st.mtimeMs > ctx.startMs) { checked.push({ what: a.what, why: `运行窗口内产出（直接路径）` }); continue; }
+        failures.push({ what: `产物:${a.what}`, why: `找到 ${a.what} 但不是本次运行窗口内产出的（mtime ${new Date(st.mtimeMs).toISOString()}）` }); continue;
+      } catch {
+        failures.push({ what: `产物:${a.what}`, why: `未找到 ${a.what}（按 cwd=${ctx.cwd || '(无)'} 解析后不存在）` }); continue;
+      }
+    }
     const rx = globToRe(a.glob);
     const hit = arts.find((f) => rx.test(String(f.name || '').toLowerCase()) && Number(f.mtimeMs || 0) > ctx.startMs);
     if (hit) checked.push({ what: a.what, why: `运行窗口内有 ${hit.name}` });

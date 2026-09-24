@@ -155,6 +155,7 @@ function apply(ctx, config = {}) {
       handoff: { type: 'string', description: '交接上下文：这个任务做什么、看什么指标、异常特征' },
       success: { type: 'string', description: '成功判据（白话即可，能机器校验的部分会被判定器强制核对）：引号里的关键词必须出现在日志尾；文件名或通配（out.npz / *.pt）必须落在本次运行窗口内有产出；指标阈值如 val_loss < 1e-3 会用日志里提取到的指标核对。声明了却没满足 → 判 suspect（不是失败），交给你判断' },
       auto_fix: { type: 'string', description: '"true" = 失败后自动修复（默认关）' },
+      progress_minutes: { type: 'string', description: '进度推送周期（分钟，缺省关）：服务端定时把日志尾一行摘要推回你的收件箱——**用它替代 Start-Sleep 轮询盯日志**（反模式：锁回合+烧上下文+DSH 重启白等）；连续两周期日志零增长会推停滞警报' },
       shell: { type: 'string', description: '"wsl" = 在 WSL(Ubuntu) 里执行（bash 语法 + Linux 路径的 cwd）；缺省 windows' },
       ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
     },
@@ -170,6 +171,7 @@ function apply(ctx, config = {}) {
         title: String(args.title || args.command || 'quick'), expectMinutes: Number(args.expect_minutes) || 30,
         reason: String(args.reason || ''),
         handoff: String(args.handoff || ''), success: String(args.success || ''), autoFix: args.auto_fix === 'true' || args.auto_fix === true,
+        progressMinutes: Number(args.progress_minutes) || 0,
         shell: args.shell === 'wsl' ? 'wsl' : 'windows',
         ...(sessOf(exec) ? { dispatchedBy: sessOf(exec) } : {}),   // 2026-09-20 补：署名漏传——深扫描一直正常（exec-dump 228/228 找到），但这处 body 从没带上
       }),
