@@ -1,7 +1,7 @@
 # dsh-quest
 
-> 科研实验的任务线调度台 —— 让 AI 只负责"立项与验收"，长任务交给独立后台服务，结果自动推送 IM。
-> An agent-agnostic pipeline orchestrator for research experiments: dispatch long-running tasks to an independent background service, get judged results and AI-written summaries pushed to your phone — while the agent conversation stays clean.
+> **多 agent 协作的科研作业系统**——主对话决策、子对话并行执行、进程层跑任务：后台执行、事件驱动监控、自动派发与流转、机器判定验收、署名回执路由，AI 只负责"立项与验收"。
+> A multi-agent orchestration system for research: a decision-making main agent, parallel sub-conversations, and a process lane for jobs — background execution, event-driven monitoring, auto-dispatch, machine-verified acceptance, and signed receipts — while the model only plans and reviews.
 
 ## 为什么做这个 / Why
 
@@ -11,7 +11,7 @@
 2. **轮询风暴**：插件轮询进程表/会话文件做检测，拖垮宿主（我们在生产环境实测过 63% CPU 被 GC 吃掉的案例）；
 3. **单终端排队**：多个实验挤一个共享终端，互相阻塞。
 
-dsh-quest 用一套**事件驱动**架构解决：进程退出由操作系统事件感知（零轮询），AI 总结由**一次性 worker 会话**完成（用完归档，主对话零增长），失败由**带预算的 fixer 会话**自动修复（改前 .bak 备份 + 客观 diff 上报）。
+dsh-quest 用一套**事件驱动 + 多 agent 分层**架构解决：进程退出由操作系统事件感知（零轮询），总结由**一次性 worker 会话**完成（用完归档，主对话零增长），失败由**带预算的 fixer 会话**自动修复（改前 .bak 备份 + 客观 diff 上报）。**多 agent 协作**是它的核心形态：主对话做决策与验收，`quest_spawn` 派出的子对话独立推进大阶段（简报契约保证有界返回），子代理做一次性检索——三层各司其职，回执与账本把审计权留给你。
 
 ### 为什么不是用 agent 自带的后台就够了 / Why not just the agent's own background jobs
 
@@ -54,16 +54,15 @@ Claude Code、Codex、ZCode 这类 agent 都自带后台执行（`run_in_backgro
 
 ## 功能 / Features
 
-- **五级判定**：`ok`（完成关键词/产物新鲜度）、`crashed`、`startup-failed`、`timeout`、`suspect`——纯代码判定，零 token
-- **DAG 依赖链**：节点声明 `after:` 上游，成功自动流转、失败自动冻结下游；重派上游自动解冻下游
-- **预检**：派发前 `py_compile` 拦截语法错误（编译器报错原文直推 QQ）
-- **worker 总结**：任务结束 → 独立一次性会话读[交接上下文+日志尾]写 ≤10 行总结 → 归档。主对话零增长。**后端可插拔（v0.5）**：DSH 会话 / OpenAI 兼容 API / headless CLI / 关闭（纯机械模式）
-- **auto_fix 自动修复**（可选，节点级开关）：失败 → fixer 做**机械性最小修复**（显存调 batch / NaN 调 lr / 路径环境；**绝不碰实验逻辑**）→ `.bak` 备份 → 语法验证 → 自动重派。预算烧尽或判断需人工（FIX_GIVEUP）则停手告警。修复后服务端做**客观逐行 diff** 上报 QQ（不信任自述）。后端同样可插拔
+- **多 agent 协作三层**：主对话（决策/验收）→ `quest_spawn` 真子对话（独立上下文推进大阶段，简报契约有界返回、超期看护、`quest_tell` 中途引导）→ 子代理（会话内一次性检索）。行为纪律模板见 [AGENTS.example.md](AGENTS.example.md)（决策分级/小组制/冒烟归属，复制进你的 DSH 全局指令即可复现同款作业方式）
+- **后台执行与自动派发**：`quest_run` 快速单发与 plan 节点都是后台进程（独立于任何对话，宿主重启任务照跑、回来自动接管认领）；DAG `after:` 依赖链成功自动流转、失败冻结下游；`when:` 条件门控分支
+- **监控与守护**：五级判定（ok/crashed/startup-failed/timeout/suspect，纯代码零 token）+ `success:` 判据硬核对（含子目录产物直查）+ `watch_rules` 运行中盯梢（NaN/OOM 可配击杀）+ `progress_minutes` 进度推送与停滞警报（替代 AI 轮询）+ 超时护栏 + 日志封顶
+- **auto_fix 自动修复**（节点级开关）：失败 → fixer 做**机械性最小修复**（显存/NaN/路径；**绝不碰实验逻辑**）→ `.bak` 备份 → 语法验证 → 自动重派；预算烧尽或判断需人工则停手告警；修复后服务端做**客观逐行 diff** 上报
+- **回执与通知路由**：署名派发的任务成败都回执派发者（`dispatchedBy`），失败上报定向链（派发者→登记主对话→死信复活）；收敛通知可配置/关闭——"什么时候汇报"的主动权可完全交给 AI
 - **跨 agent（MCP）**：12 个工具以标准 MCP 暴露，Claude Code / Codex / ZCode / Cursor 等可直接调用；quest 本体零模型依赖——执行、判定、指标、超时、重试、通知全程不需要 AI
-- **中断恢复（v0.5）**：机器重启后开机自动检测被腰斩的任务——仅在**确实重启过**（系统开机时刻判定，OOM/自崩不算）且**有断点存档**且节点声明 `resume_on_boot` 时，推一条提示；回 `/q续跑` 从断点接着跑。检测自动、重派要人点头（重复跑会双写产物）
-- **QQ 推送**：经 bridge console 直发（纯 HTTP，不经过任何对话）；任务线收尾自动推总览；推送带重试+落盘队列，失败不静默丢失
-- **外部进程接入**：手动启动的 python 进程（≥5 分钟）退出后由检测端转交同一管线
-- **崩溃韧性**：账本追加式 + 状态可重建；quest 自带守护循环重启脚本
+- **中断恢复**：机器重启后检测被腰斩的任务（系统开机时刻判定），有断点存档且节点声明 `resume_on_boot` 时提示续跑；重派自动注入 `QUEST_RESUME_FROM`
+- **通知出口 provider 无关**：bridge / webhook（Telegram/钉钉/飞书/企微/ntfy 模板见下文），推送带重试+落盘队列（图片同）
+- **崩溃韧性**：账本追加式 + 状态可重建；WSL 车道负载由 systemd 认养（quest 重启免疫）；quest 自带守护循环
 
 ## 快速上手 / Quick Start
 
@@ -85,6 +84,8 @@ node server.mjs
 # 4. 装 preset：presets/quest-worker 与 presets/quest-fixer 复制到 ~/.dsh/.agent-presets/
 
 # 5. 在 DSH 对话里说："用 quest 建任务线跑 xxx，然后派发"
+# 6.（推荐）把 AGENTS.example.md 的条令合并进你的 user-global AGENTS.md——
+#    工具给机制，条令给判断：决策分级、小组制、冒烟归属都在里面
 ```
 
 ## 通知出口（可选，provider 无关） / Notification sink
