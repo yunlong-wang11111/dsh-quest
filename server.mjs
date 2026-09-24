@@ -1262,10 +1262,22 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
     const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
     // 目标：本工作区最新会话（queue；没有则放弃——不值得为一条失败上报新开会话）
     const lr = await api.sessions.list({});
-    if (!lr.result.ok) return;
+    // 2026-09-24 修（piml cmp3 失败通知丢失）：list 失败/空列表原先**静默 return**——无账本痕迹、
+    // 无重试,DSH 一次抖动 = 失败上报永久丢失（主对话不知道任务死了）。现在:①list 失败直接退回
+    // converge-state 登记的主对话（这条路不依赖 list）;②仍投不出去就落带 error 的 notify.escalate
+    // ——reviveStaleEscalations 会按 6h 兜底复活,不再无声。
+    if (!lr.result.ok) {
+      const mainFallback = String(loadConvergeState()[wsKey]?.mainSessionId || '');
+      if (!mainFallback) { appendEvent(wsKey, { t: 'notify.escalate', node: node.id, error: `DSH 列表查询失败且无登记主对话:${String(lr.result.error || '').slice(0, 80)}` }); return; }
+      try {
+        await api.sessions.prompt({ sessionId: mainFallback, mode: 'queue', content: [{ type: 'text', text: `❌【失败上报·降级直投】节点 ${node.id} 判定 ${j.verdict}（${j.via}）。${summary ? '\n' + String(summary).slice(0, 300) : ''}\n（DSH 列表查询失败，按登记主对话直投；定位修复后 quest_dispatch 重派）` + roleTail(wsKey, mainFallback) }] });
+        appendEvent(wsKey, { t: 'notify.escalate', node: node.id, sessionId: mainFallback, via: 'main-fallback-listfail' });
+        return;
+      } catch (e) { appendEvent(wsKey, { t: 'notify.escalate', node: node.id, error: `直投也失败:${String(e?.message || e).slice(0, 80)}` }); return; }
+    }
     let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
     const mine = (lr.result.value?.items ?? []).filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
-    if (!mine.length) return;
+    if (!mine.length) { appendEvent(wsKey, { t: 'notify.escalate', node: node.id, error: '本工作区在 DSH 无可见会话（列表空）' }); return; }
     // 定向优先级（2026-09-16 防双重修改）：①账本里记录的派发者会话（点名回它——派发者若是子对话，
     // 也只回它，绝不扩散到主对话）；②没有记录（旧节点/插件未升级）才退回"最新会话"启发式。
     // （by 已在冷却判断前扫出——见上。）
@@ -2829,7 +2841,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.8.0', convergeAuto: convergeAutoOn(wsKey), spawned,
+        unread, questVersion: '0.8.1', convergeAuto: convergeAutoOn(wsKey), spawned,
         // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
         // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
         role: (() => {
