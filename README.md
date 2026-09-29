@@ -261,6 +261,35 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 
 实测（机械模式）：`python mech_test.py` → `completed | ok | finish-keyword`，loss 指标 `1.5 → 1.05` 自动提取——**全程零模型调用**。
 
+## v0.8.2 新增（2026-09-29，实验登记簿+环境指纹）
+
+- **实验登记簿**：任务终态自动登记实验骨架（命令/车道/判定/耗时）到工作区 `experiments.jsonl`——机器记骨架零纪律；`quest_exp_log` 补记假设/metrics/结论/方向标签，`quest_exp_query` 折叠查询（全文检索+方向过滤）。append-only 事件溯源永不改写：翻页/换会话后查登记簿，不翻聊天记录——实验记忆从会话上下文解耦
+- **环境指纹**：骨架自动带解释器版本（白名单判定，不执行任意首词）+ git HEAD（非 git 工作区记 null）——复现凭证；3 秒超时全容错，采不到不影响收尾
+- 工具 14→16；测试 26 套全过（新增 `tests/exp-registry.mjs` 14 用例）
+
+## v0.8.1 新增（2026-09-24，失败上报防丢）
+
+- DSH 列表查询失败时降级直投登记主对话；投递失败落带 error 的账本事件（revive 兜底可复活），不再静默 return（piml cmp3 通知丢失复盘）
+
+## v0.8.0 新增（2026-09-24，progress_push 批次 F1–F4）
+
+- **progress_push（F1）**：节点声明 `progress_minutes` 即定时收进度摘要 + 停滞检测（≥2 周期 stalled 警报推派发者）——替代 AI 轮询盯日志
+- **判据带路径直查（F2）**：产物判据含路径时按 cwd 解析 stat——子目录声明误报根修（piml 实测 165 条失败里 121 条属此类，73%）
+- **/api/config/reload（F3）**：配置热加载，JSON 防呆拒损——"改配置≠生效"的三层状态（文件/内存/每 ws）闭环
+- **图片推送 3 次退避重试（F4）**
+
+## v0.7.4 新增（2026-09-23，收敛通知自激循环根修）
+
+- 防重发守卫改比**节点活动**（原比全体账本事件 ⇒ notify.converge 自身每轮比上轮"新"，1-3 分钟一轮 135 连发）；workspaceActivity 排除 line-summary*/quest-status-full.txt（quest 自写文件不算工作区活动）
+
+## v0.7.3 新增（2026-09-23，通知通道分工定稿）
+
+- 私聊只留 静默收敛 + AI 点名 + 晨报；人工终止确认不再发 QQ（AI tag 批量收线会轰炸，账本留痕足够审计）
+
+## v0.7.2 新增（2026-09-23，fixer 崩溃面修复）
+
+- nodeEventPush 两处早退都返回 Promise（nodeEvents:false 下 7 个调用点 `.catch` 同步崩——fixer 报告后吞重派/结案、预检失败挂死 /api/run）；fixer 异常不改判定：修复已落账只记 fix.error，不重发失败上报
+
 ## v0.7.1 新增（2026-09-23，内测 P2–P8 批次）
 
 - **`quest_tell`（P4）**：向 spawn 出的子对话发引导消息——绕开 DSH send_message 的父子会话限制（"能停不能引导"的对称性修复）；queue 语义，spawnId 支持片段
