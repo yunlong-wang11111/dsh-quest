@@ -59,6 +59,7 @@ Claude Code、Codex、ZCode 这类 agent 都自带后台执行（`run_in_backgro
 - **监控与守护**：五级判定（ok/crashed/startup-failed/timeout/suspect，纯代码零 token）+ `success:` 判据硬核对（含子目录产物直查）+ `watch_rules` 运行中盯梢（NaN/OOM 可配击杀）+ `progress_minutes` 进度推送与停滞警报（替代 AI 轮询）+ 超时护栏 + 日志封顶
 - **auto_fix 自动修复**（节点级开关）：失败 → fixer 做**机械性最小修复**（显存/NaN/路径；**绝不碰实验逻辑**）→ `.bak` 备份 → 语法验证 → 自动重派；预算烧尽或判断需人工则停手告警；修复后服务端做**客观逐行 diff** 上报
 - **回执与通知路由**：署名派发的任务成败都回执派发者（`dispatchedBy`），失败上报定向链（派发者→登记主对话→死信复活）；收敛通知可配置/关闭——"什么时候汇报"的主动权可完全交给 AI
+- **实验登记簿与环境指纹**（`quest_exp_log` / `quest_exp_query`）：任务终态自动落一条实验骨架——命令、车道、**环境指纹**（解释器版本 + git HEAD，复现凭证）、判定；假设/metrics/结论由 AI 收尾时补记。`experiments.jsonl` append-only 永不改写（事件溯源），翻页/换会话后用 `quest_exp_query` 查"试过什么、结果多少、为什么败"，不靠翻聊天记录——实验记忆从会话上下文里解耦出来
 - **跨 agent（MCP）**：12 个工具以标准 MCP 暴露，Claude Code / Codex / ZCode / Cursor 等可直接调用；quest 本体零模型依赖——执行、判定、指标、超时、重试、通知全程不需要 AI
 - **中断恢复**：机器重启后检测被腰斩的任务（系统开机时刻判定），有断点存档且节点声明 `resume_on_boot` 时提示续跑；重派自动注入 `QUEST_RESUME_FROM`
 - **通知出口 provider 无关**：bridge / webhook（Telegram/钉钉/飞书/企微/ntfy 模板见下文），推送带重试+落盘队列（图片同）

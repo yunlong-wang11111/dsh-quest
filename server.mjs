@@ -305,6 +305,77 @@ let lastActiveWs = ''; // P3：QQ 命令免带 ws 参数用的"最近活跃工�
 const eventWaiters = [];
 const wakeEventWaiters = () => { for (const w of eventWaiters.splice(0)) w(); };
 
+// ── 实验登记簿（#1）+ 环境指纹（#2）（2026-09-29）──────────────────────────────
+// 设计：机器记骨架，agent 补灵魂。节点终态时自动追加一条骨架记录（命令/车道/环境指纹/
+// 判定——机器都知道）；假设/指标/结论只有 agent 知道，由 quest_exp_log 以 note 追加到
+// 同一条 exp 上。文件 append-only 永不改写（事件溯源，与账本同哲学）——翻页后的新会话
+// 用 quest_exp_query 查历史，而不是重读归档。错误的数字也照记（它是数据），
+// 但数值门禁（#3）另行设计，登记簿本身不阻断任何东西。
+function expPathOf(wsKey) { return path.join(dirOf(wsKey), 'experiments.jsonl'); }
+function readExps(wsKey) {
+  try {
+    return fs.readFileSync(expPathOf(wsKey), 'utf8').split('\n').filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+function appendExp(wsKey, entry) {
+  fs.mkdirSync(dirOf(wsKey), { recursive: true });
+  fs.appendFileSync(expPathOf(wsKey), JSON.stringify(entry) + '\n');
+}
+// 环境指纹（#2）：解释器版本（白名单判定，绝不执行任意首词）+ git HEAD（没有则 null）。
+// 全部 3 秒超时、彻底容错——指纹采不到不能影响节点收尾（复现凭证是加分项不是门）。
+async function envFingerprint(command, cwd) {
+  const fp = {};
+  const interp = String(command || '').trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, '') || '';
+  const known = /^(node|python|python3|py|python\.exe|py\.exe)$/i.test(interp)
+    || /[\\/](node|python|python3|py)(\.exe)?$/i.test(interp);
+  if (known) {
+    fp.interpreter = interp;
+    try {
+      const v = await new Promise((resolve) => {
+        execFile(interp, ['--version'], { timeout: 3000, windowsHide: true }, (err, stdout, stderr) => resolve(err ? null : String(stdout || stderr || '').trim()));
+      });
+      if (v) fp.version = v.slice(0, 120);
+    } catch {}
+  }
+  try {
+    const head = await new Promise((resolve) => {
+      execFile('git', ['-C', cwd || '.', 'rev-parse', '--short', 'HEAD'], { timeout: 3000, windowsHide: true }, (err, stdout) => resolve(err ? null : String(stdout || '').trim()));
+    });
+    fp.git = head || null; // 非 git 工作区（如 piml 22G）明确记 null，与"没采到"区分
+  } catch { fp.git = null; }
+  return fp;
+}
+// 终态自动登记骨架（fire-and-forget，全容错，永不抛）
+async function registerExperiment(wsKey, node, j, runSec) {
+  if (!node?.command) return;
+  const exp = `e${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+  const env = await envFingerprint(node.command, node.cwd);
+  const claims = Array.isArray(node.success) ? node.success.filter((c) => typeof c === 'string' && /[/\\]/.test(c)).slice(0, 10) : [];
+  appendExp(wsKey, {
+    kind: 'auto', exp, at: new Date().toISOString(), node: node.id,
+    title: node.title || '', command: node.command, shell: node.shell || 'windows',
+    cwd: node.cwd || '', verdict: j?.verdict || '', runSec: Math.round(runSec || 0),
+    env, artifacts: claims,
+  });
+}
+// 查询视图：把 auto/manual 骨架与其后的 note 按时间顺序折叠成单条实验
+function foldExps(records) {
+  const byExp = new Map();
+  for (const r of records) {
+    if (r.kind === 'auto' || r.kind === 'manual') {
+      byExp.set(r.exp, { exp: r.exp, at: r.at, node: r.node || '', title: r.title || '', command: r.command || '', shell: r.shell || '', cwd: r.cwd || '', verdict: r.verdict || '', runSec: r.runSec ?? null, env: r.env || {}, artifacts: r.artifacts || [], hypothesis: '', config: '', metrics: null, conclusion: '', direction: '', noteCount: 0, lastNoteAt: null });
+    } else if (r.kind === 'note') {
+      const tgt = byExp.get(r.exp);
+      if (!tgt) continue;
+      for (const k of ['hypothesis', 'config', 'conclusion', 'direction']) if (r[k]) tgt[k] = r[k];
+      if (r.metrics && typeof r.metrics === 'object') tgt.metrics = r.metrics;
+      tgt.noteCount += 1; tgt.lastNoteAt = r.at;
+    }
+  }
+  return [...byExp.values()];
+}
+
 // ── 未读收件箱（主会话 quest_status 时消费）────────────────────────────
 const inbox = [];
 const pushInbox = (msg) => { inbox.push({ ts: Date.now(), ...msg }); if (inbox.length > 50) inbox.shift(); };
@@ -1444,6 +1515,9 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   }
   const ok = j.verdict === 'ok';
   try { appendEvent(wsKey, { t: ok ? 'node.completed' : 'node.failed', node: node.id, verdict: j.verdict }); } catch (e) { log('落账本失败:', e?.message); }
+  // 实验登记簿（2026-09-29 #1/#2）：终态自动落一条骨架（含环境指纹），假设/指标/结论
+  // 由 agent 用 quest_exp_log 补记。fire-and-forget + 全容错——登记失败不影响节点收尾。
+  registerExperiment(wsKey, node, j, runSec).catch(() => {});
   // 第 2 级·失败上报（2026-09-16 用户定稿）：失败要报告给派发它的主对话——否则派发者永远蒙在鼓里。
   // 指针式短讯（不带日志）+ 冷却防轰炸；目标=本工作区最新会话（queue 语义，忙则等）。auto_fix 已接手的跳过（修复者自己知道）。
   if (!ok && !node.quiet && !node.autoFix) maybeNotifyFailure(wsKey, node, j, summary).catch((e) => log('失败上报异常:', e?.message));
@@ -2841,7 +2915,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.8.1', convergeAuto: convergeAutoOn(wsKey), spawned,
+        unread, questVersion: '0.8.2', convergeAuto: convergeAutoOn(wsKey), spawned,
         // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
         // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
         role: (() => {
@@ -3121,6 +3195,49 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return json(200, { ok: false, error: `投递失败：${String(e?.message || e).slice(0, 140)}` });
       }
+    }
+    // ── 实验登记簿（2026-09-29 #1/#2）────────────────────────────────────────
+    if (req.method === 'POST' && u.pathname === '/api/exp/log') {
+      const b = await readBody(req);
+      const nodeRef = String(b.node || '').trim();
+      const cut = (v, n) => { const s = String(v ?? '').trim(); return s ? s.slice(0, n) : ''; };
+      const note = {
+        kind: 'note', at: new Date().toISOString(), by: String(b.dispatchedBy || '').trim(),
+        hypothesis: cut(b.hypothesis, 800), config: cut(b.config, 800),
+        conclusion: cut(b.conclusion, 800), direction: cut(b.direction, 80),
+      };
+      if (b.metrics !== undefined) {
+        if (typeof b.metrics !== 'object' || Array.isArray(b.metrics) || b.metrics === null) return json(400, { ok: false, error: 'metrics 必须是对象（如 {"val_loss": 0.123, "acc": 0.91}）' });
+        const flat = {};
+        for (const [k, v] of Object.entries(b.metrics).slice(0, 20)) flat[String(k).slice(0, 40)] = typeof v === 'number' ? v : String(v).slice(0, 80);
+        note.metrics = flat;
+      }
+      if (!note.hypothesis && !note.conclusion && !note.config && !note.metrics) {
+        return json(400, { ok: false, error: '至少要有一条：hypothesis（跑之前想验证什么）/ metrics（数值结果对象）/ conclusion（一句话结论）。只写 config 也算，但尽量补齐假设与结论——没登记的实验翻页后等于白跑。' });
+      }
+      let exp = '';
+      if (nodeRef) {
+        // 挂到该节点最新一条 auto 骨架上（重跑同节点会产生多条骨架，note 挂最近一条）
+        const autos = readExps(wsKey).filter((r) => r.kind === 'auto' && r.node === nodeRef);
+        const latest = autos[autos.length - 1];
+        if (!latest) return json(200, { ok: false, error: `没找到节点 ${nodeRef} 的自动登记（该节点没跑过命令？）——去掉 node 参数可登记一条独立实验。` });
+        exp = latest.exp;
+      } else {
+        exp = `e${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+        appendExp(wsKey, { kind: 'manual', exp, at: note.at, node: '', title: cut(b.title, 80), command: '', shell: '', cwd: '', verdict: '', runSec: null, env: {}, artifacts: [] });
+      }
+      appendExp(wsKey, { ...note, exp });
+      return json(200, { ok: true, exp, attachedToNode: !!nodeRef });
+    }
+    if (req.method === 'GET' && u.pathname === '/api/exp/query') {
+      const q = String(u.searchParams.get('q') || '').toLowerCase().trim();
+      const direction = String(u.searchParams.get('direction') || '').toLowerCase().trim();
+      const limit = Math.min(50, Math.max(1, Number(u.searchParams.get('limit')) || 10));
+      let exps = foldExps(readExps(wsKey));
+      if (direction) exps = exps.filter((e) => (e.direction || '').toLowerCase().includes(direction));
+      if (q) exps = exps.filter((e) => [e.title, e.command, e.hypothesis, e.conclusion, e.direction, e.node, String(e.metrics ? JSON.stringify(e.metrics) : '')].join(' ').toLowerCase().includes(q));
+      exps.sort((a, b2) => String(b2.at).localeCompare(String(a.at)));
+      return json(200, { ok: true, total: exps.length, experiments: exps.slice(0, limit).map((e) => ({ ...e, env: { interpreter: e.env.interpreter || '', version: e.env.version || '', git: e.env.git ?? null } })) });
     }
     if (req.method === 'POST' && u.pathname === '/api/spawn') {
       const b = await readBody(req);

@@ -231,6 +231,77 @@ function apply(ctx, config = {}) {
   }));
 
   ctx.tools.register(defineTool({
+    name: 'quest_exp_log',
+    description: [
+      '实验登记簿·登记：跑完实验（或告一段落）时，把假设/指标/结论补记到 quest 自动生成的实验骨架上。',
+      'quest_run/plan 节点终态时会**自动**记下命令/车道/环境指纹（解释器版本+git HEAD）/判定——机器记骨架；',
+      '**假设（hypothesis：跑之前想验证什么）、数值结果（metrics 对象）、一句话结论（conclusion）只有你知道**，用本工具补上。',
+      'direction 是归类标签（如 "force-recon"/"ablation"），跨实验比较按它查。',
+      '没补记的实验，翻页/换会话后等于白跑——没人知道为什么做、结果说明什么。这是实验收尾的一部分，不是可选项。',
+      '错误的数字也照记（它是数据）；登记本身不影响任何判定。',
+    ].join(' '),
+    parameters: {
+      hypothesis: { type: 'string', description: '跑之前的假设：想验证什么、预期长什么样（≤800 字）' },
+      metrics: { type: 'object', description: '数值结果对象，如 {"val_loss": 0.123, "seed": 42}（值取 number）' },
+      conclusion: { type: 'string', description: '一句话结论：支持/推翻了假设，下一步指向哪（≤800 字）' },
+      config: { type: 'string', description: '关键配置摘要：超参/数据版本/模型变体（≤800 字）' },
+      direction: { type: 'string', description: '方向标签，如 "force-recon"（跨实验比较用）' },
+      node: { type: 'string', description: '挂到哪个 quest 节点的骨架上（不填=登记为独立实验条目）' },
+      title: { type: 'string', description: '独立实验（无节点）时的标题' },
+      ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, exp: { type: 'string' }, attachedToNode: { type: 'boolean' }, error: { type: 'string' } } },
+      render: (_a, v) => [{ type: 'text', text: v.ok ? `📓 已登记 ${v.exp}${v.attachedToNode ? '（已挂到节点骨架）' : ''}` : `⚠️ 未登记：${v.error || '未知原因'}` }],
+    },
+    execute: async (args, exec) => questCall(cfg(), `/api/exp/log?ws=${encodeURIComponent(wsOf(args, exec))}`, {
+      method: 'POST',
+      body: JSON.stringify({
+        hypothesis: args.hypothesis, metrics: args.metrics, conclusion: args.conclusion,
+        config: args.config, direction: args.direction, node: args.node, title: args.title,
+        ...(sessOf(exec) ? { dispatchedBy: sessOf(exec) } : {}),
+      }),
+    }, 8000),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'quest_exp_query',
+    description: [
+      '实验登记簿·查询：翻页后接手、开新方向、或要报数时，**先查这里**再决定——"我们试过什么、结果多少、为什么败"全在登记簿里。',
+      '支持 q 全文匹配（标题/命令/假设/结论/方向/metrics）、direction 精确过滤、limit（缺省 10，上限 50），按时间倒序。',
+      '每条含：假设/配置/metrics/结论/命令/环境指纹（解释器版本、git HEAD）/判定/耗时。跨实验比较（如选基线）以这里为准，不靠翻聊天记录。',
+    ].join(' '),
+    parameters: {
+      q: { type: 'string', description: '全文检索词（匹配标题/命令/假设/结论/metrics）' },
+      direction: { type: 'string', description: '方向标签过滤，如 "force-recon"' },
+      limit: { type: 'number', description: '条数 1-50（缺省 10）' },
+      ws: { type: 'string', description: '工作区绝对路径（缺省=当前会话 cwd）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: { ok: { type: 'boolean' }, total: { type: 'number' }, experiments: { type: 'array', items: { type: 'object', additionalProperties: true } }, error: { type: 'string' } } },
+      render: (_a, v) => {
+        if (!v.ok) return [{ type: 'text', text: `⚠️ 查询失败：${v.error || '未知原因'}` }];
+        const rows = (v.experiments || []).map((e) => [
+          `📓 ${e.exp} · ${e.at?.slice(0, 16)} · [${e.verdict || 'manual'}] ${e.title || e.node || ''}`,
+          e.direction ? `  方向: ${e.direction}` : '',
+          e.hypothesis ? `  假设: ${String(e.hypothesis).slice(0, 120)}` : '',
+          e.metrics ? `  指标: ${JSON.stringify(e.metrics).slice(0, 160)}` : '',
+          e.conclusion ? `  结论: ${String(e.conclusion).slice(0, 120)}` : '',
+          `  环境: ${e.env?.interpreter || '?'} ${e.env?.version || ''} git=${e.env?.git ?? 'null'}`,
+        ].filter(Boolean).join('\n'));
+        return [{ type: 'text', text: `共 ${v.total} 条（显示 ${rows.length}）：\n${rows.join('\n\n') || '（登记簿为空——跑实验收尾记得 quest_exp_log）'}`.slice(0, 8000) }];
+      },
+    },
+    execute: async (args, exec) => {
+      const p = new URLSearchParams({ ws: wsOf(args, exec) });
+      if (args.q) p.set('q', String(args.q));
+      if (args.direction) p.set('direction', String(args.direction));
+      if (args.limit) p.set('limit', String(args.limit));
+      return questCall(cfg(), `/api/exp/query?${p.toString()}`, {}, 8000);
+    },
+  }));
+
+  ctx.tools.register(defineTool({
     name: 'quest_lit',
     description: [
       '文献检索：一次调用拿 10-25 篇的 标题/作者/年份/venue/摘要（≤700字/篇）——替代 web_search+web_fetch 手爬（那是调研子代理贵的原因：一个子代理曾爬 376 次）。',
