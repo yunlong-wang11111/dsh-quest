@@ -1,6 +1,9 @@
 // tests/success-claims.mjs —— 判据解析与校验的单元测试（不启服务，纯函数）
 import { suite } from './lib.mjs';
 import { parseSuccessClaims, checkClaims } from '../success.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const s = suite('success-claims');
 const norm = (c) => ({ k: c.keywords.map((x) => x.what), a: c.artifacts.map((x) => x.glob), c: c.conditions.map((x) => `${x.metric}${x.op}${x.value}`) });
@@ -36,7 +39,26 @@ const norm = (c) => ({ k: c.keywords.map((x) => x.what), a: c.artifacts.map((x) 
 }
 
 // ── 校验 ────────────────────────────────────────────────────────────────
-const ctx = (o = {}) => ({ tail: o.tail || '', artifacts: o.artifacts || [], metrics: o.metrics || {}, startMs: o.startMs ?? 1000 });
+const ctx = (o = {}) => ({ tail: o.tail || '', artifacts: o.artifacts || [], metrics: o.metrics || {}, startMs: o.startMs ?? 1000, cwd: o.cwd });
+
+// ── F2（2026-09-24）：带路径的产物判据直接 stat（cwd+相对路径）——子目录声明不再永远"未找到" ──
+{
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claim-sub-'));
+  fs.mkdirSync(path.join(tmp, 'abaqus_batch/ml'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'abaqus_batch/ml/x.json'), '{}');
+  const old = path.join(tmp, 'abaqus_batch/ml/old.json');
+  fs.writeFileSync(old, '{}');
+  const past = new Date(Date.now() - 3600e3);
+  fs.utimesSync(old, past, past);
+  const hit = checkClaims(parseSuccessClaims('产出 abaqus_batch/ml/x.json'), ctx({ cwd: tmp }));
+  s.check('F2 子目录产物(新鲜) → 通过', hit.ok && /直接路径/.test(hit.checked[0]?.why || ''), JSON.stringify(hit));
+  const stale = checkClaims(parseSuccessClaims('产出 abaqus_batch/ml/old.json'), ctx({ cwd: tmp, startMs: Date.now() - 60000 }));
+  s.check('F2 子目录产物(旧 mtime) → 失败且说明窗口', !stale.ok && /不是本次运行窗口/.test(stale.failures[0]?.why || ''), stale.failures[0]?.why);
+  const miss = checkClaims(parseSuccessClaims('产出 abaqus_batch/ml/none.json'), ctx({ cwd: tmp }));
+  s.check('F2 子目录产物(不存在) → 失败且带解析提示', !miss.ok && /按 cwd=/.test(miss.failures[0]?.why || ''), miss.failures[0]?.why);
+  const noGlob = checkClaims(parseSuccessClaims('产出 abaqus_batch/ml/*.json'), ctx({ cwd: tmp }));
+  s.check('F2 通配路径仍走扫描(不误入直接 stat)', noGlob.failures.length >= 1, JSON.stringify(noGlob));
+}
 {
   const c = parseSuccessClaims('日志尾含"MY_DONE"且产出 out.npz');
   const pass = checkClaims(c, ctx({ tail: 'blah my_done blah', artifacts: [{ name: 'out.npz', mtimeMs: 2000 }] }));

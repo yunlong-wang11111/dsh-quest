@@ -122,6 +122,12 @@
     <div id="runList"></div>
   </div>
 
+  <!-- ②b 派出的子对话（quest_spawn，2026-09-22）：AI 派的真子对话在这里可见（硬约束①） -->
+  <div class="card" id="spawnedCard" style="margin-top:10px;display:none">
+    <div class="trk-hd"><b>派出的子对话</b><span class="mut" id="spawnedCount"></span></div>
+    <div id="spawnedList"></div>
+  </div>
+
   <!-- ③ 计划路线：只画 plan.md 声明的节点（快速单发不在图里，见上方「正在跑」）；
        下拉切换"当下在走的线 / 以前的短流程"（历史只读） -->
   <div class="card" style="margin-top:10px">
@@ -362,6 +368,7 @@ async function loadTasks() {
   await loadPlans();          // 先拿到"计划"下拉的选项，再画图（切工作区也走这条路）
   renderTracker(d);
   renderRunning(d);
+  renderSpawned(d);
   renderRoute(d);
   loadGate();
   $('#nodes').innerHTML = nodesCache.map((n) => {
@@ -461,6 +468,29 @@ function renderRunning(d) {
       <button class="act danger" onclick="act('cancel','${esc(n.id)}')">终止</button>
     </div>`;
   }).join("");
+}
+
+// ── 派出的子对话（quest_spawn）：谁在替谁干活 + 简报/超期状态（可见性硬约束）──
+function renderSpawned(d) {
+  const list = d.spawned || [];
+  const card = $("#spawnedCard");
+  if (!card) return;
+  if (!list.length) { card.style.display = "none"; return; }
+  card.style.display = "";
+  const open = list.filter((s) => s.status === "running" || s.status === "overdue");
+  const done = list.filter((s) => s.status === "reported");
+  if ($("#spawnedCount")) $("#spawnedCount").textContent = open.length ? `${open.length} 个在推进` : "（都已交简报）";
+  const row = (s) => {
+    const icon = s.status === "overdue" ? "⏰" : s.status === "reported" ? "✅" : "▶";
+    const stat = s.status === "overdue" ? "超期未交简报" : s.status === "reported" ? `已交简报${s.reportedAt ? " · " + new Date(s.reportedAt).toLocaleTimeString("zh-CN", { hour12: false }).slice(0, 5) : ""}` : "推进中";
+    const age = s.at ? Math.round((Date.now() - s.at) / 60000) : null;
+    return `<div class="obj run">
+      <span class="oi">${icon}</span>
+      <span class="oid mono" title="${esc(s.spawnId)}">${esc(s.title || s.spawnId)}</span>
+      <span class="ostat">${stat}${age != null ? " · 派出 " + age + " 分钟前" : ""}${s.by ? " · 派发 " + esc(String(s.by).slice(8, 16)) + "…" : ""}</span>
+    </div>`;
+  };
+  $("#spawnedList").innerHTML = open.map(row).join("") + (done.length ? `<div class="mut" style="margin-top:6px">已交简报：${done.slice(0, 5).map((s) => esc(s.title)).join("、")}${done.length > 5 ? " 等" + done.length + " 个" : ""}</div>` : "");
 }
 
 // ── 计划路线（横排 DAG；BTWQuests 式：依赖箭头 + 完成绿勾 + 可派发绿框 + 人工门金星）──
@@ -814,7 +844,7 @@ loadWs().then(async () => { await loadTasks(); fillLogNodes(); pump(); }).catch(
 setInterval(() => {
   if (!lastStatus || !$('#tasks')) return;
   // 路线图/追踪/正在跑现在都在「任务线」这一个页里，卡片直接重画（路线图只画 plan 节点，开销很小）
-  if ($('#tasks').classList.contains('on')) { renderTracker(lastStatus); renderRunning(lastStatus); renderRoute(lastStatus); }
+  if ($('#tasks').classList.contains('on')) { renderTracker(lastStatus); renderRunning(lastStatus); renderSpawned(lastStatus); renderRoute(lastStatus); }
 }, 5000);
 setInterval(() => { if ($('#logs').classList.contains('on') && $('#logAuto').checked) loadLog(); }, 8000);
 </script>

@@ -142,6 +142,7 @@ function parsePlan(markdown) {
       case 'auto_fix': cur.autoFix = v.trim() === 'true'; break;
       case 'fix_budget': cur.fixBudget = Number(v) || 2; break;
       case 'max_log_mb': cur.maxLogMB = Number(v) || 0; break; // 0 = 默认 256MB
+      case 'progress_minutes': cur.progressMinutes = Number(v) || 0; break; // 2026-09-24 F1：进度推送周期（分钟，0=关）——服务端定时把日志尾摘要推给派发者，替代 AI 轮询
       case 'push_images': cur.pushImages = Number(v) || 0; break; // 成功后直推 QQ 的图片数上限，0 = 关
       case 'shell': cur.shell = v.trim().toLowerCase() === 'wsl' ? 'wsl' : 'windows'; break;
       case 'resume_on_boot': cur.resumeOnBoot = v.trim() === 'true'; break; // 开机中断后允许一键续跑（默认关）
@@ -304,6 +305,77 @@ let lastActiveWs = ''; // P3：QQ 命令免带 ws 参数用的"最近活跃工�
 const eventWaiters = [];
 const wakeEventWaiters = () => { for (const w of eventWaiters.splice(0)) w(); };
 
+// ── 实验登记簿（#1）+ 环境指纹（#2）（2026-09-29）──────────────────────────────
+// 设计：机器记骨架，agent 补灵魂。节点终态时自动追加一条骨架记录（命令/车道/环境指纹/
+// 判定——机器都知道）；假设/指标/结论只有 agent 知道，由 quest_exp_log 以 note 追加到
+// 同一条 exp 上。文件 append-only 永不改写（事件溯源，与账本同哲学）——翻页后的新会话
+// 用 quest_exp_query 查历史，而不是重读归档。错误的数字也照记（它是数据），
+// 但数值门禁（#3）另行设计，登记簿本身不阻断任何东西。
+function expPathOf(wsKey) { return path.join(dirOf(wsKey), 'experiments.jsonl'); }
+function readExps(wsKey) {
+  try {
+    return fs.readFileSync(expPathOf(wsKey), 'utf8').split('\n').filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+function appendExp(wsKey, entry) {
+  fs.mkdirSync(dirOf(wsKey), { recursive: true });
+  fs.appendFileSync(expPathOf(wsKey), JSON.stringify(entry) + '\n');
+}
+// 环境指纹（#2）：解释器版本（白名单判定，绝不执行任意首词）+ git HEAD（没有则 null）。
+// 全部 3 秒超时、彻底容错——指纹采不到不能影响节点收尾（复现凭证是加分项不是门）。
+async function envFingerprint(command, cwd) {
+  const fp = {};
+  const interp = String(command || '').trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, '') || '';
+  const known = /^(node|python|python3|py|python\.exe|py\.exe)$/i.test(interp)
+    || /[\\/](node|python|python3|py)(\.exe)?$/i.test(interp);
+  if (known) {
+    fp.interpreter = interp;
+    try {
+      const v = await new Promise((resolve) => {
+        execFile(interp, ['--version'], { timeout: 3000, windowsHide: true }, (err, stdout, stderr) => resolve(err ? null : String(stdout || stderr || '').trim()));
+      });
+      if (v) fp.version = v.slice(0, 120);
+    } catch {}
+  }
+  try {
+    const head = await new Promise((resolve) => {
+      execFile('git', ['-C', cwd || '.', 'rev-parse', '--short', 'HEAD'], { timeout: 3000, windowsHide: true }, (err, stdout) => resolve(err ? null : String(stdout || '').trim()));
+    });
+    fp.git = head || null; // 非 git 工作区（如 piml 22G）明确记 null，与"没采到"区分
+  } catch { fp.git = null; }
+  return fp;
+}
+// 终态自动登记骨架（fire-and-forget，全容错，永不抛）
+async function registerExperiment(wsKey, node, j, runSec) {
+  if (!node?.command) return;
+  const exp = `e${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+  const env = await envFingerprint(node.command, node.cwd);
+  const claims = Array.isArray(node.success) ? node.success.filter((c) => typeof c === 'string' && /[/\\]/.test(c)).slice(0, 10) : [];
+  appendExp(wsKey, {
+    kind: 'auto', exp, at: new Date().toISOString(), node: node.id,
+    title: node.title || '', command: node.command, shell: node.shell || 'windows',
+    cwd: node.cwd || '', verdict: j?.verdict || '', runSec: Math.round(runSec || 0),
+    env, artifacts: claims,
+  });
+}
+// 查询视图：把 auto/manual 骨架与其后的 note 按时间顺序折叠成单条实验
+function foldExps(records) {
+  const byExp = new Map();
+  for (const r of records) {
+    if (r.kind === 'auto' || r.kind === 'manual') {
+      byExp.set(r.exp, { exp: r.exp, at: r.at, node: r.node || '', title: r.title || '', command: r.command || '', shell: r.shell || '', cwd: r.cwd || '', verdict: r.verdict || '', runSec: r.runSec ?? null, env: r.env || {}, artifacts: r.artifacts || [], hypothesis: '', config: '', metrics: null, conclusion: '', direction: '', noteCount: 0, lastNoteAt: null });
+    } else if (r.kind === 'note') {
+      const tgt = byExp.get(r.exp);
+      if (!tgt) continue;
+      for (const k of ['hypothesis', 'config', 'conclusion', 'direction']) if (r[k]) tgt[k] = r[k];
+      if (r.metrics && typeof r.metrics === 'object') tgt.metrics = r.metrics;
+      tgt.noteCount += 1; tgt.lastNoteAt = r.at;
+    }
+  }
+  return [...byExp.values()];
+}
+
 // ── 未读收件箱（主会话 quest_status 时消费）────────────────────────────
 const inbox = [];
 const pushInbox = (msg) => { inbox.push({ ts: Date.now(), ...msg }); if (inbox.length > 50) inbox.shift(); };
@@ -382,7 +454,7 @@ function judge(node, exitCode, runSec, logFile, startedAtMs = null, endedAtMs = 
   //    解析不出任何可校验条件（纯白话）时 total=0，自动退回下面的通用路径，零回归。
   const claims = parseSuccessClaims(node.success);
   if (claims.total > 0) {
-    const r = checkClaims(claims, { tail: tailLc, artifacts: artifacts.filter((f) => f.mtimeMs <= endMs), metrics: logFile ? extractMetrics(logFile) : {}, startMs });
+    const r = checkClaims(claims, { tail: tailLc, artifacts: artifacts.filter((f) => f.mtimeMs <= endMs), metrics: logFile ? extractMetrics(logFile) : {}, startMs, cwd: node.cwd || '' });
     if (r.failures.length) {
       return { verdict: 'suspect', via: 'success-claim-failed', detail: r.failures.map((f) => f.why).join('；').slice(0, 300), claims: r };
     }
@@ -600,6 +672,17 @@ function writeProgress(wsKey) {
       if (act.dsh) lines.push(act.dsh.running
         ? `> 子对话：**${act.dsh.running} 个会话在跑**（本工作区共 ${act.dsh.total} 个）——AI 正在干活`
         : `> 子对话：没有会话在跑（本工作区共 ${act.dsh.total} 个）`);
+      // quest_spawn 派的子对话（2026-09-22）：可见性硬约束——progress.md 必须能看到谁在替谁干活。
+      const spawns = buildSpawns(wsKey);
+      const open = spawns.filter((s) => s.status === 'running' || s.status === 'overdue');
+      if (open.length) {
+        lines.push('', '## 👥 派出的子对话（quest_spawn）', '');
+        for (const s of open) {
+          const icon = s.status === 'overdue' ? '⏰' : '▶';
+          const dl = s.deadlineAt ? ` · 时限 ${new Date(s.deadlineAt).toLocaleTimeString('zh-CN', { hour12: false })}` : '';
+          lines.push(`- ${icon} **${s.title}**（${s.spawnId.slice(0, 30)}…）${s.by ? ` · 派发 ${s.by.slice(8, 16)}…` : ''}${dl}${s.status === 'overdue' ? ' · **超期未交简报**' : ''}`);
+        }
+      }
     }
     let curBucket = -1;
     for (const { n, st } of nodeDisplayOrder(plan, state)) {
@@ -867,7 +950,7 @@ function dispatchJob(wsKey, node, body = {}) {
       const ckW = findLatestCheckpoint(node.cwd || '.');
       child = spawn('cmd.exe', ['/c', node.command], { cwd: node.cwd || undefined, windowsHide: true, stdio: ['ignore', job.outFd, job.outFd], env: ckW ? { ...process.env, QUEST_RESUME_FROM: ckW.file } : process.env });
     }
-    appendEvent(wsKey, { t: 'node.dispatched', node: node.id, jobId, pid: child.pid, logTs, dispatchedBy: body.dispatchedBy || undefined });   // 派发者会话（失败上报点名回它）
+    appendEvent(wsKey, { t: 'node.dispatched', node: node.id, jobId, pid: child.pid, logTs, dispatchedBy: body.dispatchedBy || undefined, explicit: body.explicit || undefined });   // 派发者会话（失败上报点名回它）
     // P4 进程树：同步 run 实例
     try {
       const runId = body?.runId || findRunId(wsKey, node.id);
@@ -908,6 +991,31 @@ function dispatchJob(wsKey, node, body = {}) {
     // 就截断（append 句柄会自动跟到新 EOF）。截断丢的是旧 stdout，账本/指标/总结都不依赖它。
     const capMB = node.maxLogMB > 0 ? node.maxLogMB : 256;
     job.timers.push(setInterval(() => {
+      // F1（2026-09-24）progress_push：每 progressMinutes 把日志尾摘要推给派发者——替代 AI 用
+      // Start-Sleep 盯日志的反模式（实测 kl 轮询 83 次）。只推署名派发；停滞检测：连续两个
+      // 周期日志零增长 → 一次 stalled 警报（日志写错路径/训练卡死/静默循环）。
+      const pushMin = Number(node.progressMinutes) || 0;
+      if (pushMin > 0 && !node.quiet) {
+        job.prog = job.prog || { lastAt: startedAt, lastSize: -1, stalls: 0, stalledWarned: false };
+        if (Date.now() - job.prog.lastAt >= pushMin * 60000) {
+          job.prog.lastAt = Date.now();
+          try {
+            const st = fs.statSync(logFile);
+            const grew = st.size !== job.prog.lastSize;
+            job.prog.lastSize = st.size;
+            job.prog.stalls = grew ? 0 : job.prog.stalls + 1;
+            const runMin = Math.round((Date.now() - startedAt) / 60000);
+            if (job.prog.stalls >= 2 && !job.prog.stalledWarned) {
+              job.prog.stalledWarned = true;
+              appendEvent(wsKey, { t: 'node.progress-stalled', node: node.id, runMinutes: runMin });
+              pushProgressToDispatcher(wsKey, node, `⏸【停滞警报】${node.id} 已跑 ${runMin} 分钟，连续 ${job.prog.stalls} 个周期日志零增长（${pushMin}min/周期）——检查日志路径/是否卡死。终态判定不受影响，这是过程警报。`).catch(() => {});
+            } else {
+              const digest = grew ? lastMeaningfulLine(readTail(logFile, 4096)) : '（本周期日志无新增）';
+              pushProgressToDispatcher(wsKey, node, `📍【进度】${node.id} · 已跑 ${runMin} 分钟 · ${digest}`).catch(() => {});
+            }
+          } catch {}
+        }
+      }
       // 断点第二层（防假）：长任务 20 分钟内无新存档 → 提醒一次（存档路径写错/未生效）
       if (!job.ckWarned && node.expectMinutes >= 20 && !node.noCheckpoint && Date.now() - startedAt > 20 * 60000) {
         const latest = findLatestCheckpoint(node.shell === 'wsl' ? hostPathFor(node.cwd || '') : node.cwd || '');
@@ -985,7 +1093,9 @@ function handleNodeExit(wsKey, node, ctx) {
   if (job.cancelledByHuman) {
     appendEvent(wsKey, { t: 'node.cancelled', node: node.id, reason: job.cancelledByHuman });
     pushInbox({ node: node.id, verdict: 'cancelled' });
-    if (!node.quiet && notifyKind(CFG) !== 'off') qqPush(wsKey, `[🛑 人工终止] ${node.id} · 已跑 ${formatDur(runSec)}\n原因：${job.cancelledByHuman}\n（不触发自动修复）`.slice(0, 400)).catch(() => {});
+    // 2026-09-23（用户定稿通道分工）：私聊只保留 静默收敛 + AI 点名；人工终止确认不再发 QQ——
+    // AI 批量收线(tag)会一次几十条轰炸；/q停 的回执走命令通道、账本留痕已足够审计。
+    // if (!node.quiet && notifyKind(CFG) !== 'off') qqPush(wsKey, `[🛑 人工终止] ...`)
     orchestrate(wsKey).catch(() => {});
     return;
   }
@@ -1025,6 +1135,28 @@ function handleNodeExit(wsKey, node, ctx) {
 /** 本工作区 quest 自建过的会话（收尾 worker 等）——失败上报的"最新会话"回退绝不能命中它们：
  *  临时会话干完这轮就永不再醒，投进去的上报=死信（2026-09-18 复盘 b551f7b4：9/16 21:56 的
  *  失败上报在收尾 worker 收件箱里躺了 36 小时，直到人工归档才清掉）。 */
+/** 把会话挂进 DSH 的 workspace 分组表（2026-09-21 用户实测：quest 用 API 建的会话不在
+ *  workspace.json 的 tables.workspaces[].sessionIds 里 → DSH 侧栏显示"未分组"，翻页新主对话就这样）。
+ *  DSH 数据目录取自配置 dshHome（如 E:\\dsh\\.dsh）；未配置则跳过（不影响翻页，仅可能显示未分组）。 */
+function addSessionToWorkspaceGroup(wsPath, sessionId) {
+  const home = String(CFG.dshHome || '').trim();
+  if (!home || !wsPath || !sessionId) return false;
+  const p = path.join(home, 'storages', 'workspace.json');
+  const raw = fs.readFileSync(p, 'utf8');
+  const j = JSON.parse(raw);
+  const ws = j?.tables?.workspaces;
+  if (!ws || typeof ws !== 'object') return false;
+  const norm = (s) => String(s || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const key = Object.keys(ws).find((k) => norm(ws[k]?.path) === norm(wsPath));
+  if (!key) return false;
+  const arr = Array.isArray(ws[key].sessionIds) ? ws[key].sessionIds : (ws[key].sessionIds = []);
+  if (arr.includes(sessionId)) return true;
+  arr.unshift(sessionId);                       // 最新在前（与 DSH 侧栏顺序一致）
+  fs.writeFileSync(p, JSON.stringify(j));       // 与 DSH 的写并发风险：极端情况下可能被 DSH 覆盖，不致命
+  log(`workspace 分组挂载: ${sessionId.slice(8, 16)} → ${ws[key].title || key}`);
+  return true;
+}
+
 function questSpawnedSids(wsKey) {
   const out = new Set();
   try {
@@ -1035,10 +1167,79 @@ function questSpawnedSids(wsKey) {
       // notify.converge 事件把 sessionId 记成**被通知的主对话**（2026-09-16 的 566db392 就这么
       // 被拉黑的），通配收集会把主对话永久标成自建会话：定向层拒收它、兜底层跳过它，
       // 上报永远散弹进子会话（2026-09-19 复盘：4 次上报 4 个子会话）。
-      if (ev.sessionId && (ev.t === 'notify.converge.worker' || String(ev.t).startsWith('fix.'))) out.add(String(ev.sessionId));
+      // spawn.created（2026-09-22 quest_spawn 派的子对话）同属 quest 自建——它们不该成为兜底目标。
+      if (ev.sessionId && (ev.t === 'notify.converge.worker' || String(ev.t).startsWith('fix.') || ev.t === 'spawn.created')) out.add(String(ev.sessionId));
     }
   } catch {}
   return out;
+}
+
+// ── quest_spawn：AI 派真子对话（2026-09-22 L3）─────────────────────────────
+// 现状痛点（用户内测原话）："没有'起子对话'的动词 ⇒ '派子对话'对 AI 只是纸上概念，
+// 于是退化成'自己写 + 子代理帮'"。本节把"派子对话"变成动作：
+//   /api/spawn 建会话 + 种子提示（身份/纪律/简报契约）→ 账本 spawn.created
+//   子对话干完调 quest_notify 交结构化简报 → spawn.reported + 定向回派发者
+//   超期未报 → sweep 标 overdue + 催一次派发者（一次性，防风暴）
+// 登记表从账本重建（spawn.created/reported/overdue），无独立状态文件，重启不丢。
+
+/** 读账本重建子对话登记：[{spawnId,sessionId,title,by,at,deadlineAt,status}]，status∈running/reported/overdue。 */
+function buildSpawns(wsKey) {
+  const list = [];
+  try {
+    const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+    for (const l of raw) {
+      let ev; try { ev = JSON.parse(l); } catch { continue; }
+      if (ev.t === 'spawn.created') {
+        list.push({
+          spawnId: String(ev.spawnId || ''), sessionId: String(ev.sessionId || ''),
+          title: String(ev.title || ''), by: String(ev.by || ''),
+          at: tsOf(ev.at), deadlineAt: Number(ev.deadlineAt) || 0,
+          status: 'running',
+        });
+      } else if (ev.t === 'spawn.reported' && ev.spawnId) {
+        const s = list.find((x) => x.spawnId === ev.spawnId); if (s) { s.status = 'reported'; s.reportedAt = tsOf(ev.at); }
+      } else if (ev.t === 'spawn.overdue' && ev.spawnId) {
+        const s = list.find((x) => x.spawnId === ev.spawnId); if (s && s.status === 'running') s.status = 'overdue';
+      }
+    }
+  } catch {}
+  return list;
+}
+
+/** 活跃 spawn 的 sessionId → 登记项（/api/notify 的简报通道鉴权用）。 */
+function activeSpawnOf(wsKey, sessionId) {
+  if (!sessionId) return null;
+  return buildSpawns(wsKey).find((s) => s.sessionId === String(sessionId) && s.status === 'running') || null;
+}
+
+/** 超期巡检：过 deadline 仍 running 的 spawn 标 overdue + 催一次派发者（账本防重）。 */
+async function sweepSpawns() {
+  let wl;
+  try { wl = await questWorkspacesList(); } catch { return; }
+  for (const w of (wl?.workspaces || []).filter((x) => !x.junk)) {
+    const wsKey = w.wsKey;
+    let spawns;
+    try { spawns = buildSpawns(wsKey); } catch { continue; }
+    const late = spawns.filter((s) => s.status === 'running' && s.deadlineAt && Date.now() > s.deadlineAt);
+    if (!late.length) continue;
+    const state = buildState(wsKey);
+    let wsPath = ''; try { wsPath = parsePlan(state.plan || '').meta?.workspace || ''; } catch {}
+    for (const s of late) {
+      appendEvent(wsKey, { t: 'spawn.overdue', spawnId: s.spawnId, sessionId: s.sessionId, title: s.title });
+      if (s.by) {
+        try {
+          const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+          const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+          await api.sessions.prompt({
+            sessionId: s.by, mode: 'queue',
+            content: [{ type: 'text', text: `⏰【子对话超期】${s.title}（${s.spawnId}）已过约定时限仍未交简报。建议：quest_status 看 spawned 区确认状态；必要时直接查它动过的文件（progress.md / 工作区最新改动），或另派节点接手。` + roleTail(wsKey, s.by) }],
+          });
+        } catch (e) { log('spawn.overdue 催报失败:', e?.message); }
+      }
+      log(`spawn.overdue ${wsKey}: ${s.spawnId}`);
+    }
+    writeProgress(wsKey);
+  }
 }
 
 /** 死信复活：失败上报投给的会话若一直没醒（默认 6 小时）且节点至今仍失败——把要点转投主对话，
@@ -1090,7 +1291,7 @@ async function reviveStaleEscalations(wsKey) {
         const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
         await api.sessions.prompt({
           sessionId: target, mode: 'queue',
-          content: [{ type: 'text', text: `🔁【失败上报·死信复活】节点 ${x.node} 的失败上报投给会话 ${x.sessionId.slice(8, 16)}… 后 ${Math.round((now - x.at) / 3600e3)} 小时未被读取（该会话可能已不会再醒）。节点当前仍是失败态——若已处理请忽略，否则定位修复后 quest_dispatch 重派。` }],
+          content: [{ type: 'text', text: `🔁【失败上报·死信复活】节点 ${x.node} 的失败上报投给会话 ${x.sessionId.slice(8, 16)}… 后 ${Math.round((now - x.at) / 3600e3)} 小时未被读取（该会话可能已不会再醒）。节点当前仍是失败态——若已处理请忽略，否则定位修复后 quest_dispatch 重派。` + roleTail(wsKey, target || '') }],
         });
       } catch (e) { log('escalate-revive 投递失败:', e?.message); }
     }
@@ -1132,10 +1333,22 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
     const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
     // 目标：本工作区最新会话（queue；没有则放弃——不值得为一条失败上报新开会话）
     const lr = await api.sessions.list({});
-    if (!lr.result.ok) return;
+    // 2026-09-24 修（piml cmp3 失败通知丢失）：list 失败/空列表原先**静默 return**——无账本痕迹、
+    // 无重试,DSH 一次抖动 = 失败上报永久丢失（主对话不知道任务死了）。现在:①list 失败直接退回
+    // converge-state 登记的主对话（这条路不依赖 list）;②仍投不出去就落带 error 的 notify.escalate
+    // ——reviveStaleEscalations 会按 6h 兜底复活,不再无声。
+    if (!lr.result.ok) {
+      const mainFallback = String(loadConvergeState()[wsKey]?.mainSessionId || '');
+      if (!mainFallback) { appendEvent(wsKey, { t: 'notify.escalate', node: node.id, error: `DSH 列表查询失败且无登记主对话:${String(lr.result.error || '').slice(0, 80)}` }); return; }
+      try {
+        await api.sessions.prompt({ sessionId: mainFallback, mode: 'queue', content: [{ type: 'text', text: `❌【失败上报·降级直投】节点 ${node.id} 判定 ${j.verdict}（${j.via}）。${summary ? '\n' + String(summary).slice(0, 300) : ''}\n（DSH 列表查询失败，按登记主对话直投；定位修复后 quest_dispatch 重派）` + roleTail(wsKey, mainFallback) }] });
+        appendEvent(wsKey, { t: 'notify.escalate', node: node.id, sessionId: mainFallback, via: 'main-fallback-listfail' });
+        return;
+      } catch (e) { appendEvent(wsKey, { t: 'notify.escalate', node: node.id, error: `直投也失败:${String(e?.message || e).slice(0, 80)}` }); return; }
+    }
     let key; try { key = wsKeyOf(wsPath); } catch { key = ''; }
     const mine = (lr.result.value?.items ?? []).filter((x) => { try { return wsKeyOf(String(x.cwd ?? '')) === key; } catch { return false; } });
-    if (!mine.length) return;
+    if (!mine.length) { appendEvent(wsKey, { t: 'notify.escalate', node: node.id, error: '本工作区在 DSH 无可见会话（列表空）' }); return; }
     // 定向优先级（2026-09-16 防双重修改）：①账本里记录的派发者会话（点名回它——派发者若是子对话，
     // 也只回它，绝不扩散到主对话）；②没有记录（旧节点/插件未升级）才退回"最新会话"启发式。
     // （by 已在冷却判断前扫出——见上。）
@@ -1177,25 +1390,76 @@ const runSecText = (j) => (j.runSec != null ? ` · 跑了 ${Math.round(j.runSec)
 
 /** 成功回执（2026-09-19 署名回执制）：节点完成 → 一行短讯队列给署名派发者。
  *  无署名（自动链/旧节点/未升级插件）不回执——那类由收尾汇总兜底。 */
+/** 角色锚点尾巴（2026-09-21 用户实测："主对话和子对话交流久了会忘记自己是主对话"）。
+ *  长对话里"我是主对话"没有稳定锚点，全靠上下文推断；而主对话天天收子对话格式的回报，
+ *  久了会漂移成"我也该向谁汇报"。每条 quest→会话 的消息都带上收件人角色，反复强化。 */
+function roleTail(wsKey, sid) {
+  try {
+    const main = String(loadConvergeState()[wsKey]?.mainSessionId || '');
+    if (main && String(sid) === main) {
+      return '\n——角色：主对话（汇总筛选后决定是否点名用户；回报到你为止）';
+    }
+    return '\n——角色：子对话（结果交给主对话，别越级）';
+  } catch { return ''; }
+}
+
+/** F1（2026-09-24）progress_push 的投递腿：把一行进度摘要按回执同款通道推给派发者。
+ *  只推署名派发的节点（回执制同款边界——自动链节点不推，防轰炸）；投递失败只落账不重试。 */
+async function pushProgressToDispatcher(wsKey, node, text) {
+  let by = '';
+  try {
+    const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+    for (let i = raw.length - 1; i >= 0; i--) { let ev; try { ev = JSON.parse(raw[i]); } catch { continue; } if (ev.node === node.id && (ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.dispatchedBy) { by = String(ev.dispatchedBy); break; } }
+  } catch {}
+  if (!by) return false;
+  try {
+    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+    const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    await api.sessions.prompt({ sessionId: by, mode: 'queue', content: [{ type: 'text', text }] });
+    return true;
+  } catch (e) { log('progress_push 投递失败:', e?.message); return false; }
+}
+
+/** F1：日志尾的"最后一行有意义内容"（≤160 字符），做进度摘要用。 */
+function lastMeaningfulLine(tailText) {
+  const lines = String(tailText || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  return (lines[lines.length - 1] || '').slice(0, 160);
+}
+
 async function maybeNotifyReceipt(wsKey, nodeId, runSec, summary) {
   let by = '';
+  let isQuick = false;
+  let isExplicit = false;
   try {
     const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
     for (let i = raw.length - 1; i >= 0; i--) {
       let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
-      if (ev.node === nodeId && (ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.dispatchedBy) { by = String(ev.dispatchedBy); break; }
+      if (ev.node !== nodeId) continue;
+      if (ev.t === 'quick.dispatched') isQuick = true;                  // 单发任务（人/会话主动派）
+      if (ev.t === 'node.dispatched' && ev.explicit) isExplicit = true; // 手工派 plan 节点（/api/dispatch，含 QQ /q派发）
+      if ((ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.dispatchedBy && !by) by = String(ev.dispatchedBy);
+      if ((isQuick || isExplicit) && by) break;
     }
   } catch {}
-  if (!by) return;
+  // 2026-09-20 补洞（用户抓到的不对称）：无署名任务**成功时完全静默**——失败有兜底（主对话层），
+  // 成功没有。无署名的来源是常态：QQ 桥 /q派发 不带署名、插件未升级/未重启时派的任务、readopted 的旧任务。
+  // 兜底规则：**人主动派的**（quick 单发，或手工 dispatch 的 plan 节点）→ 回执给登记主对话；
+  // plan 链自动派发（纯 node.dispatched 无 explicit）→ 保持静默（收尾汇总覆盖，防轰炸）。
+  let via = 'signed';
+  if (!by) {
+    const mainSid = loadConvergeState()[wsKey]?.mainSessionId || '';
+    if ((!isQuick && !isExplicit) || !mainSid) return;
+    by = mainSid; via = 'main-fallback';
+  }
   try {
     const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
     const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
     await api.sessions.prompt({
       sessionId: by, mode: 'queue',
-      content: [{ type: 'text', text: `✅【回执】节点 ${nodeId} 完成（${runSec != null ? Math.max(1, Math.round(runSec / 60)) + ' 分钟' : '时长未知'}）。${String(summary || '').split('\n')[0].slice(0, 150)}\n接下一步；产物/日志 quest_log，全景 quest_status。` }],
+      content: [{ type: 'text', text: `✅【回执】节点 ${nodeId} 完成（${runSec != null ? Math.max(1, Math.round(runSec / 60)) + ' 分钟' : '时长未知'}）。${String(summary || '').split('\n')[0].slice(0, 150)}\n接下一步；产物/日志 quest_log，全景 quest_status。${via === 'main-fallback' ? '\n（本任务派发时未记录署名——QQ 桥派发或插件未升级；按兜底规则回执给主对话。）' : ''}${roleTail(wsKey, by)}` }],
     });
-    appendEvent(wsKey, { t: 'notify.receipt', node: nodeId, sessionId: by });
-    log(`notify.receipt ${wsKey}: ${nodeId} → ${String(by).slice(8, 16)}`);
+    appendEvent(wsKey, { t: 'notify.receipt', node: nodeId, sessionId: by, via });
+    log(`notify.receipt ${wsKey}: ${nodeId} → ${String(by).slice(8, 16)}${via === 'main-fallback' ? '（兜底）' : ''}`);
   } catch (e) {
     appendEvent(wsKey, { t: 'notify.receipt', node: nodeId, error: String(e?.message || e).slice(0, 120) });
     log('notify.receipt 失败:', e?.message);
@@ -1206,8 +1470,12 @@ async function maybeNotifyReceipt(wsKey, nodeId, runSec, summary) {
  * notify.nodeEvents: false → 中途的成败/警告/修复类推送全部静音（收尾汇报与人工终止确认不受影响），
  * 需要人时由主对话用 quest_notify 工具点名——通知时点从'每个节点'收敛到'AI 判断需要人'。 */
 function nodeEventPush(wsKey, text) {
-  if (CFG.notify?.nodeEvents === false) return;
-  qqPush(wsKey, text).catch(() => {});
+  // 2026-09-23 根修（kl 反馈"同一个 catch 崩溃影响 5 节点"）：两处早退都必须返回 Promise——
+  // ① nodeEvents:false（生产 9/19 起就是它）：裸 return undefined ⇒ 7 个调用点的 .catch 同步抛
+  //    TypeError；fixer 在 fix.reported 之后崩（吞掉重派/结案），dispatchJob 预检失败路径更会让
+  //    /api/run 挂死到超时。② kind=off 时 qqPush 返回 undefined（2026-09-22 只修了这半）。
+  if (CFG.notify?.nodeEvents === false) return Promise.resolve();
+  return Promise.resolve(qqPush(wsKey, text)).catch(() => {});
 }
 
 // ── 失败风暴聚合（2026-09-17 用户定稿："同一波失败只发一条汇总"）──────────────
@@ -1247,6 +1515,9 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   }
   const ok = j.verdict === 'ok';
   try { appendEvent(wsKey, { t: ok ? 'node.completed' : 'node.failed', node: node.id, verdict: j.verdict }); } catch (e) { log('落账本失败:', e?.message); }
+  // 实验登记簿（2026-09-29 #1/#2）：终态自动落一条骨架（含环境指纹），假设/指标/结论
+  // 由 agent 用 quest_exp_log 补记。fire-and-forget + 全容错——登记失败不影响节点收尾。
+  registerExperiment(wsKey, node, j, runSec).catch(() => {});
   // 第 2 级·失败上报（2026-09-16 用户定稿）：失败要报告给派发它的主对话——否则派发者永远蒙在鼓里。
   // 指针式短讯（不带日志）+ 冷却防轰炸；目标=本工作区最新会话（queue 语义，忙则等）。auto_fix 已接手的跳过（修复者自己知道）。
   if (!ok && !node.quiet && !node.autoFix) maybeNotifyFailure(wsKey, node, j, summary).catch((e) => log('失败上报异常:', e?.message));
@@ -1268,7 +1539,31 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   orchestrate(wsKey).catch(() => {});
   // WA 触发器：失败 + 节点声明 auto_fix + 预算未烧完 → 修复会话（最小修复+备份+重派）
   if (!ok && node.autoFix) {
-    runFixer(wsKey, node, j, summary).catch((e) => log('fixer 异常:', e?.message));
+    // 2026-09-23（三件"静默失败"复盘）：auto_fix 接手会跳过即时失败上报（防修复中重复打扰），
+    // 但派发者至少要知道"已被接手"——否则像今早那样：失败被吸收、修复又当场崩，
+    // 两头无消息，派发者以为任务凭空消失。给署名派发者发一行接手回执（不设冷却，同点名回执制）。
+    maybeNotifyReceipt(wsKey, node.id, 0, `🛠【已接手自动修复】节点 ${node.id} 判定 ${j.verdict}（${j.via}）。修复中：改好自动重派并回执；放弃或超时会再通知你。`).catch(() => {});
+    runFixer(wsKey, node, j, summary).catch(async (e) => {
+      // 2026-09-23 保险：fixer 自身崩溃不能再次静音失败——落账 + 把被吸收的那条失败上报补发给派发者。
+      // 同日降级（kl 建议"fixer 异常不改判定"）：若本次修复已成功落账 fix.reported（崩在收尾通知层，
+      // 5 节点事故的实形——修复本身结论有效），则只记 fix.error，**不再把节点当失败重发上报**。
+      log('fixer 异常:', e?.message);
+      let repairConcluded = false;
+      try {
+        const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+        let lastAttempt = -1;
+        for (let i = 0; i < raw.length; i++) {
+          let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+          if (ev.node !== node.id) continue;
+          if (ev.t === 'fix.attempt') lastAttempt = i;
+          if (ev.t === 'fix.reported' && i > lastAttempt) { repairConcluded = true; break; }
+        }
+      } catch {}
+      try { appendEvent(wsKey, { t: 'fix.error', node: node.id, error: String(e?.message || e).slice(0, 300), ...(repairConcluded ? { note: '修复已落账，崩溃仅影响收尾通知，不重发失败上报' } : {}) }); } catch {}
+      if (!repairConcluded) {
+        await maybeNotifyFailure(wsKey, node, { ...j, via: `${j.via}（修复器异常：${String(e?.message || e).slice(0, 80)}）` }, summary).catch(() => {});
+      }
+    });
   }
 }
 
@@ -1514,7 +1809,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
   const { createTurnCollector } = await import('./lib/dsh-client-v2.mjs');
   let sessionId = null;
   try {
-    const created = await api2.sessions.create({ cwd: node.cwd || os.homedir(), agentPreset: CFG.fixerPreset || 'quest-fixer' });
+    const created = await api.sessions.create({ cwd: node.cwd || os.homedir(), agentPreset: CFG.fixerPreset || 'quest-fixer' });
     if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 120));
     sessionId = created.result.value.sessionId;
     activeWorkers.add(sessionId);
@@ -1530,7 +1825,7 @@ async function runFixer(wsKey, node, j, diagnosis) {
     })();
     const script = String(node.command || '').match(/\b([\w.\-]+\.py)\b/)?.[1] || '';
 
-    await api2.sessions.prompt({
+    await api.sessions.prompt({
       sessionId, mode: 'queue',
       content: [{ type: 'text', text: `【自动修复任务】节点 ${node.id} 第 ${attempt}/${node.fixBudget ?? 2} 次尝试失败，请你做最小修复。
 
@@ -1596,7 +1891,7 @@ ${diff}` : ''}`.slice(0, 900)).catch(() => {});
     if (sessionId) {
       activeWorkers.delete(sessionId);
       workerCollectors.delete(sessionId);
-      try { await api2.workspace.archiveSession({ sessionId }); } catch {}
+      try { await api.workspace.archiveSession({ sessionId }); } catch {}
     }
   }
 }
@@ -1632,6 +1927,22 @@ const tsOf = (x) => (x ? Date.parse(x) || 0 : 0);
 //   2) 会话按 cwd 匹配工作区（复用 wsKeyOf 的归一化），匹配不到就退化为不门控。
 //   3) 这是 DSH 的内部 RPC 形状，不是稳定公开 API：所有异常都必须被吞掉并降级。
 let dshSessCache = { at: 0, items: null };
+
+/** 会话的可读标签（2026-09-21 用户实测："8c7a3897 这个名字和乱码没啥区别"）。
+ *  QQ 消息里不能再甩十六进制前缀——用 DSH 侧栏里用户认识的那个**会话标题**。
+ *  走 dshSessCache（巡检每轮刷新的全局缓存，同步零成本）；查不到时退回短 ID。 */
+function sessionLabel(sid) {
+  const short = String(sid || '').slice(8, 16);
+  try {
+    const items = dshSessCache.items;
+    if (Array.isArray(items)) {
+      const s = items.find((x) => String(x.sessionId) === String(sid));
+      const t = String(s?.projections?.values?.title || '').trim();
+      if (t) return `「${t.slice(0, 24)}」`;
+    }
+  } catch {}
+  return short ? `${short}…` : '(未知会话)';
+}
 
 /** 刷新会话列表缓存（只由巡检与非请求路径调用）。 */
 async function refreshDshSessions() {
@@ -1680,7 +1991,9 @@ function dshActivity(wsDir) {
   };
 }
 const WS_SKIP_DIRS = new Set(['.git', 'node_modules', 'archive', '__pycache__', 'logs', 'out', 'runs']);
-const WS_SKIP_FILES = new Set(['progress.md', 'research-state.md', 'plan.md']);
+// 2026-09-23 补：line-summary*.md 是收敛会话每轮写的、quest-status-full.txt 是 status 渲染落盘的——
+// 都算"活动"就会自激（收敛→写文件→工作区活跃→再收敛）。
+const WS_SKIP_FILES = new Set(['progress.md', 'research-state.md', 'plan.md', 'quest-status-full.txt']);
 
 /**
  * 工作区活跃度：最近有没有文件被改动（回答"子对话是不是在改代码"）。
@@ -1701,7 +2014,7 @@ function workspaceActivity(wsDir, minutes) {
         if (depth > 0 && !WS_SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) walk(path.join(dir, e.name), depth - 1);
         continue;
       }
-      if (!e.isFile() || WS_SKIP_FILES.has(e.name)) continue;
+      if (!e.isFile() || WS_SKIP_FILES.has(e.name) || /^line-summary.*\.md$/i.test(e.name) || /^line-summary.*\.bak/i.test(e.name)) continue;
       try { found.push({ name: e.name, mtimeMs: fs.statSync(path.join(dir, e.name)).mtimeMs }); } catch {}
     }
   };
@@ -1779,9 +2092,29 @@ function convergeAutoOn(wsKey) {
   const st = loadConvergeState()[wsKey] || {};
   return st.auto !== false;   // 缺省=开（buff 默认生效；只有显式 off 才关）
 }
+/** 工作区路径解析（2026-09-23，"收尾会话落在 qq-bridge"事故的根修）：
+ *  quest 建的每个会话都必须有**明确的 cwd**——此前自动收尾在 plan 头缺 workspace 时兜底成 ''，
+ *  sessions.create({cwd: undefined}) 落到 DSH 进程默认 cwd（当时是 qq-bridge）⇒ 收尾会话写
+ *  line-summary 到真正的工作区 = "工作区之外" ⇒ 沙箱要人工审批，汇报卡死等人点。
+ *  解析链：plan 头 workspace → 账本里最近一次派发的 cwd → 调用方兜底；仍为空返回 ''（调用方必须处理）。 */
+function resolveWsPath(wsKey, fallback = '') {
+  try {
+    const w = parsePlan(buildState(wsKey).plan || '').meta?.workspace;
+    if (w && String(w).trim()) return String(w).trim();
+  } catch {}
+  try {
+    const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+    for (let i = raw.length - 1; i >= 0; i--) {
+      let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+      const c = ev.cwd || ev.workspace;
+      if ((ev.t === 'quick.dispatched' || ev.t === 'node.dispatched' || ev.t === 'spawn.created') && c && String(c).trim()) return String(c).trim();
+    }
+  } catch {}
+  return String(fallback || '').trim();
+}
+
 /** 每日定时重开：过了任一 reopenTime 且今天还没重开过 → 开（2 小时内巡检到都算，防错过）。 */
-function checkReopenConverge(wsKey, nc) {
-  const times = Array.isArray(nc?.reopenTimes) ? nc.reopenTimes : [];
+function checkReopenConverge(wsKey, nc) {  const times = Array.isArray(nc?.reopenTimes) ? nc.reopenTimes : [];
   if (!times.length) return false;
   const now = new Date();
   const cur = now.getHours() * 60 + now.getMinutes();
@@ -1862,7 +2195,7 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false, waitA
   if (!wrote) {
     log(`converge ${wsKey}: 总结文件在 ${Math.round(timeoutMs / 60000)} 分钟内未更新（超时，仍将通知主对话）`);
     if (notifyKind(CFG) !== 'off' && CFG.notify?.converge?.qq !== false) {
-      qqPush(wsKey, `[⚠️ 收尾超时] 收尾会话 ${String(workerSid).slice(8, 16)}… 在 ${Math.round(timeoutMs / 60000)} 分钟内没有写出 line-summary-${stamp}.md（可能卡住或上下文太重）。总结仍会以文件指针形式通知主对话。`.slice(0, 400)).catch(() => {});
+      qqPush(wsKey, `[⚠️ 收尾超时] 收尾会话 ${sessionLabel(workerSid)} 在 ${Math.round(timeoutMs / 60000)} 分钟内没有写出 line-summary-${stamp}.md（可能卡住或上下文太重）。总结仍会以文件指针形式通知主对话。`.slice(0, 400)).catch(() => {});
     }
   }
 
@@ -1894,6 +2227,7 @@ async function runConvergeAndNotify(wsKey, wsPath, info, { manual = false, waitA
       `【全线收敛·总结已完成${manual ? '·手动' : ''}】任务线全部结束（${info.nodes.length} 节点：${Object.entries(info.counts).map(([k, v]) => v + ' ' + k).join(' / ')}）。`,
       wrote ? `全局总结已由收尾会话写入 line-summary-${stamp}.md。要点：\n${headline}` : `收尾会话可能超时，总结文件在 line-summary-${stamp}.md（自己去读）。`,
       '**接下来自动推进**：① 先把本轮做了什么追加进 research-state.md 的「任务总览」区（时间倒序、一行一条：`日期时刻 · 做了什么 · 结果/数字`，旧的往下排）——用户不在场时全靠它知道你干了什么。② 读待办清单——有下一项就直接写新 plan 派发（不用等用户）；全部完成或遇到需拍板的事项才用 quest_notify 点名用户（中间过程不用通知）。',
+      roleTail(wsKey, mainSid),
     ].join('\n') }],
   });
   log(`converge ${wsKey}: 已通知主对话 ${String(mainSid).slice(8, 16)}（总结${wrote ? '✓' : '超时'}）`);
@@ -1926,7 +2260,8 @@ async function maybeNotifyConverge(wsKey, st, info, { immediate = false } = {}) 
     const lastConv = (st.lineEvents ?? []).filter((e) => e.t === 'notify.converge' && !e.error).pop();
     if (lastConv && Date.now() - tsOf(lastConv.at) < cooldownMs) return;   // 冷却内不重复唤醒
   }
-  const wsPath = (() => { try { return parsePlan(st.plan).meta?.workspace || ''; } catch { return ''; } })();
+  const wsPath = resolveWsPath(wsKey);   // 2026-09-23：不再兜底 ''（会把收尾会话建进 DSH 默认 cwd）
+  if (!wsPath) { log(`converge ${wsKey}: 解析不到工作区路径，跳过本轮收尾（plan 头缺 workspace 且账本无派发记录）`); return { skipped: 'no-workspace-path' }; }
   // 事件立即写入（不等两阶段走完——阶段 2 含最长 15 分钟等总结文件，等它事件永远迟到）
   appendEvent(wsKey, { t: 'notify.converge', counts: info.counts, phase: 'started' });
   runConvergeAndNotify(wsKey, wsPath, info).then((result) => {
@@ -1948,8 +2283,13 @@ function evaluateQuiet(wsKey) {
     if (!st.plan) return null;
     if (!parsePlan(st.plan).nodes.length && !Object.keys(st.nodes || {}).length) return null;
     const info = lineActivity(st);
+    // 2026-09-23 根修（收敛通知 28 连发事故）：防重发守卫原来比 lastAct（含一切账本行级事件）vs lastQuiet——
+    // 但收敛机制自己每轮写的 notify.converge 事件永远比上一轮 line.quiet 新 ⇒ "有新动作"永真 ⇒ 每轮巡检
+    // 都再触发收敛（实测 1-3 分钟一轮、135 轮）。守卫必须只看**节点活动**：quest 的记账/通知类行级事件
+    // （notify.*、line.*、probe.*）不代表任务有进展。
     const lastQuiet = tsOf((st.lineEvents ?? []).filter((e) => e.t === 'line.quiet').pop()?.at);
-    if (info.lastAct === 0 || info.lastAct <= lastQuiet) {
+    const lastNodeAct = Math.max(0, ...Object.values(st.nodes || {}).map((n) => tsOf(n.lastEventAt)));
+    if (lastNodeAct === 0 || lastNodeAct <= lastQuiet) {
       return { quiet: false, active: info.active.length, idleMinutes: info.idleMinutes };
     }
     // 注意：任务在跑、或还在静默窗口内、或工作区刚被改过 → 都不算收敛
@@ -1981,6 +2321,95 @@ function evaluateQuiet(wsKey) {
 function sweepQuiet() {
   // 会话缓存每轮刷新一次（一次 RPC），失败自动降级；随后各工作区同步读缓存
   refreshDshSessions().then(() => sweepQuietDirs()).catch(() => sweepQuietDirs());
+}
+
+/** 每日晨报（2026-09-20 用户定稿）：工作日固定时刻，quest 直接读账本拼报告→QQ，零 token、不唤醒任何会话。
+ *  配置 notify.dailyReport: { times:["08:05"], workingDaysOnly:true(默认，跳过周六日), enabled:true }。
+ *  与 reopenTimes 同款"2 小时窗口 + 当日去重"防错过/防重发。
+ *  2026-09-21 修复（用户实测"又给我发了一遍晨报"）：去重状态原来存内存变量，quest 重启即清空 →
+ *  同一天第二次触发（本地 08:05 发过，09:08 重启 quest，09:09 巡检又发）。改为**持久化到文件**，
+ *  并把日期键从 UTC 改成**本地日期**（原来 now.toISOString() 在 UTC±8 跨日边界会算错天）。 */
+function dailyReportStateFile() { return path.join(HOMEOverride, 'daily-report-state.json'); }
+function loadDailyReportState() {
+  try { return JSON.parse(fs.readFileSync(dailyReportStateFile(), 'utf8')) || {}; } catch { return {}; }
+}
+function saveDailyReportState(s) {
+  try { fs.writeFileSync(dailyReportStateFile(), JSON.stringify(s)); } catch {}
+}
+function maybeDailyReport() {
+  const cfgD = CFG.notify?.dailyReport;
+  if (!cfgD || cfgD.enabled === false) return;
+  const times = Array.isArray(cfgD.times) && cfgD.times.length ? cfgD.times : ['08:05'];
+  const now = new Date();
+  const day = now.getDay();
+  if ((cfgD.workingDaysOnly !== false) && (day === 0 || day === 6)) return;   // 周六日不发
+  const cur = now.getHours() * 60 + now.getMinutes();
+  const localDay = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  for (const t of times) {
+    const [h, m] = String(t).split(':').map(Number);
+    if (!Number.isFinite(h)) continue;
+    const tm = h * 60 + (m || 0);
+    if (cur < tm || cur >= tm + 120) continue;
+    const key = localDay + 'T' + t;
+    if (loadDailyReportState().last === key) return;
+    saveDailyReportState({ last: key, at: now.toISOString() });
+    buildAndPushDailyReport(t).catch((e) => log('晨报推送失败:', e?.message));
+    return;
+  }
+}
+
+async function buildAndPushDailyReport(stamp) {
+  const parts = [`☀️ 晨报 ${stamp}（工作日自动·零 token）`];
+  try {
+    const wl = await questWorkspacesList();
+    const list = (wl?.workspaces || []).filter((w) => !w.junk);
+    for (const w of list) {
+      try {
+        const st = buildState(w.wsKey);
+        const nodes = Object.values(st.nodes || {});
+        const running = nodes.filter((n) => n.status === 'running').length;
+        const total = nodes.length;
+        const yh = new Date(Date.now() - 12 * 3600e3).toISOString();
+        const raw = fs.readFileSync(path.join(dirOf(w.wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+        let ok12 = 0, bad12 = 0; const badNames = [];
+        for (let i = raw.length - 1; i >= 0; i--) {
+          let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+          if (ev.at && ev.at < yh) break;
+          if (ev.t === 'node.completed') ok12++;
+          else if (ev.t === 'node.failed') { bad12++; if (!badNames.length && ev.node) { const j = (st.nodes[ev.node]?.events || []).length; } badNames.push(ev.node); }
+        }
+        const lineAct = lineActivity(st);
+        const statusTxt = running > 0 ? `▶ ${running} 节点在跑` : lineAct?.quiet ? '🌙 静默' : '· 空闲';
+        const conv = loadConvergeState()[w.wsKey];
+        parts.push(`${running > 0 ? '🔥' : '🌙'} ${w.title || w.wsKey.slice(-22)}：${statusTxt}（${total} 节点）｜12h 完成 ${ok12} / 失败 ${bad12}${bad12 ? '（' + [...new Set(badNames)].slice(0, 3).map((x) => x.slice(0, 24)).join('、') + (badNames.length > 3 ? '…' : '') + '）' : ''}｜收尾${conv?.auto === false ? '关❌' : '开✅'}`);
+      } catch (e) { parts.push(`❓ ${w.wsKey.slice(-22)}：读取失败 ${String(e?.message || e).slice(0, 40)}`); }
+    }
+  } catch (e) { parts.push('（工作区列表读取失败：' + String(e?.message || e).slice(0, 60) + '）'); }
+  const text = parts.join('\n').slice(0, 1500);
+  if (notifyKind(CFG) !== 'off') await qqPushDirect(text);
+  log(`daily-report ${stamp} 已发送（${parts.length - 1} 个工作区）`);
+}
+
+/** 工作区列表（晨报用；与 /api/workspaces 同源但不需要 req）。 */
+async function questWorkspacesList() {
+  const base = path.join(HOMEOverride);
+  let dirs = [];
+  try { dirs = fs.readdirSync(base, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return { workspaces: [] }; }
+  const list = [];
+  for (const d of dirs) {
+    try {
+      const f = path.join(base, d, 'plan.md');
+      if (!fs.existsSync(f)) continue;
+      const head = fs.readFileSync(f, 'utf8').split('\n').slice(0, 3).join('\n');
+      const wm = head.match(/^#\s*任务线[：:](.+)$/m);
+      const wsm = head.match(/^workspace:\s*(.+)$/m);
+      if (!wsm) continue;
+      const junk = /^_orphaned/.test(d) || /^-mnt-/.test(d) || d === 'logs';
+      list.push({ wsKey: d, title: wm ? wm[1].trim().slice(0, 30) : '', workspace: wsm[1].trim(), junk });
+    } catch {}
+  }
+  list.sort((a, b) => Number(a.junk) - Number(b.junk) || b.wsKey.localeCompare(a.wsKey));
+  return { workspaces: list };
 }
 
 function sweepQuietDirs() {
@@ -2121,12 +2550,18 @@ const formatDur = (s) => (s < 60 ? `${s}秒` : s < 3600 ? `${Math.floor(s / 60)}
 
 // ── QQ 推送（P3：直打 bridge console，零 bridge 改动）──────────────────
 /** 通知前缀：[实验标题或工作区名]。多实验并行时用户能分辨是哪条任务线在说话。 */
-function qqTag(wsKey) {
+/** QQ 消息前缀（2026-09-21 用户定稿版式）：**对话名在前、任务名在括号里**——
+ *  用户关心"这是哪个对话在说话"（他交流的对象），任务线名是次要上下文。
+ *  格式：[<会话标题>（<任务线标题>）] ；过长各自截断并加省略号；会话未知时退回只用任务名。 */
+function qqTag(wsKey, fromSid) {
   try {
     const st = buildState(wsKey);
     const p = st.plan ? parsePlan(st.plan) : null;
-    const label = p?.meta?.title || path.basename(String(p?.meta?.workspace || wsKey));
-    return `[${String(label).split('\n')[0].slice(0, 24)}] `;
+    const rawTask = String(p?.meta?.title || path.basename(String(p?.meta?.workspace || wsKey))).split('\n')[0].trim();
+    const task = rawTask.slice(0, 16).replace(/[（(【\[、，,：:；;\-—\s]+$/, '') + (rawTask.length > 16 ? '…' : '');
+    const sid = String(fromSid || loadConvergeState()[wsKey]?.mainSessionId || '');
+    const conv = sid ? sessionLabel(sid).replace(/^「|」$/g, '').slice(0, 14) : '';
+    return conv ? `[${conv}（${task}）] ` : `[${task}] `;
   } catch { return `[${wsKey}] `; }
 }
 
@@ -2146,9 +2581,9 @@ function queueQQ(message) {
     fs.writeFileSync(QQ_QUEUE_FILE, JSON.stringify(arr.slice(-60), null, 1));
   } catch {}
 }
-async function qqPush(wsKey, message) {
+async function qqPush(wsKey, message, fromSid) {
   if (notifyKind(CFG) === 'off') return;
-  const full = `${qqTag(wsKey)}${message}`;
+  const full = `${qqTag(wsKey, fromSid)}${message}`;
   for (let attempt = 1; attempt <= 3; attempt++) {
     const r = await qqPushDirect(full);
     if (r.ok) return;
@@ -2182,13 +2617,24 @@ setInterval(async () => {
 }, 2 * 60 * 1000);
 
 // 静默巡检（quietMinutes/sweepSeconds 可配；测试用小值）
-setInterval(() => { try { sweepQuiet(); } catch (e) { log('sweepQuiet 异常:', e?.message); } }, Math.max(5, Number(CFG.sweepSeconds ?? 60)) * 1000);
+// 启动时立刻刷一次会话缓存（2026-09-21）：QQ 通知要把会话显示成"标题"（sessionLabel），
+// 靠巡检的 60s 周期太晚——首条通知会退回十六进制短 ID（用户实测："和乱码没啥区别"）。
+refreshDshSessions().catch(() => {});
+setInterval(() => { try { sweepQuiet(); } catch (e) { log('sweepQuiet 异常:', e?.message); } try { maybeDailyReport(); } catch (e) { log('daily-report 检查异常:', e?.message); } try { sweepSpawns().catch((e) => log('sweepSpawns 异常:', e?.message)); } catch (e) { log('sweepSpawns 异常:', e?.message); } }, Math.max(5, Number(CFG.sweepSeconds ?? 60)) * 1000);
 
 /** 产物图直推：把节点刚产出的 png/jpg 发 owner QQ（bridge /api/send/private-image，base64 image 段）。 */
 async function qqPushImage(wsKey, imagePath, caption) {
-  const r = await sendImage(CFG, imagePath, `${qqTag(wsKey)}${caption}`, { fs, timeoutMs: 20000 });
-  if (!r.ok && r.error !== 'off') log('图片直推失败:', r.error);
-  return r.ok;
+  // F4（2026-09-24）：图片与文字同款 3 次退避重试——此前图片一次性(2026-09-22 kl 发频谱图 502 丢图)。
+  // 不落盘排队(图片文件可能被后续运行覆盖,补发旧路径会推错图),三次失败只留日志。
+  const full = `${qqTag(wsKey)}${caption}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const r = await sendImage(CFG, imagePath, full, { fs, timeoutMs: 20000 });
+    if (r.ok) return true;
+    if (r.error === 'off') return false;
+    if (attempt < 3) { await new Promise((res) => setTimeout(res, attempt * 3000)); continue; }
+    log(`图片直推失败(3 次重试后放弃): ${r.error}`);
+  }
+  return false;
 }
 
 // ── worker 子会话（P2：复用 dsh-client-v2）──────────────────────────────
@@ -2292,6 +2738,12 @@ async function runWorker(wsKey, node, j, runSec) {
 // runGate.enabled=false 可整体关闭（回到 v0.2 行为）。
 
 const RUN_GATE_FILE = path.join(HOMEOverride, 'run-gate.json');
+
+// 主对话接管请求（2026-09-21）：AI 请求换主对话时的待确认队列（用户 QQ /q确认 <id> 放行）。
+const ROLE_GATE_FILE = path.join(HOMEOverride, 'role-gate.json');
+let roleGate = { pending: [] };
+try { roleGate = JSON.parse(fs.readFileSync(ROLE_GATE_FILE, 'utf8')) || { pending: [] }; } catch {}
+function saveRoleGate() { try { fs.writeFileSync(ROLE_GATE_FILE, JSON.stringify(roleGate)); } catch {} }
 const runGateCfg = Object.assign(
   { enabled: true, nightStartHour: 23, nightEndHour: 8, nightQuota: 3, dayTimeoutMinutes: 30 },
   CFG.runGate || {}
@@ -2434,17 +2886,46 @@ const server = http.createServer(async (req, res) => {
       }));
       const unread = inbox.splice(0); // 取走即清
       writeProgress(wsKey); // 查询即刷新：progress.md 不再等下一个节点事件（排序/状态实时保鲜）
+      // spawned：quest_spawn 派的子对话（2026-09-22 L3）——AI 与人都要能看见"谁在替我干活"。
+      const spawned = buildSpawns(wsKey).slice(-20).reverse().map((s) => ({
+        spawnId: s.spawnId, title: s.title, status: s.status,
+        sessionId: s.sessionId, by: s.by || '',
+        at: s.at, reportedAt: s.reportedAt || null,
+      }));
       // workspace 优先取 plan.md 里声明的绝对路径（权威），入参只做缺省——/q翻页 等下游要拿真路径去匹配 DSH 会话
       const act = lineActivity(state);
+      // 2026-09-23（kl P3）：failed 大数不再一锅端——拆四类让人一眼分清"实验真崩"与"记账 suspect"。
+      //   ok=正常完成 | suspect=判据未命中/产物存疑（记账层） | crash=startup-failed/crashed（脚本层）
+      //   infra=timeout/cancelled（执行环境/人工层）。failed 原字段保留兼容旧消费方。
+      const verdictBuckets = { ok: 0, suspect: 0, crash: 0, infra: 0 };
+      for (const n of nodes) {
+        if (n.status === 'completed') verdictBuckets.ok++;
+        else if (n.status === 'failed') {
+          if (n.verdict === 'suspect') verdictBuckets.suspect++;
+          else if (['startup-failed', 'crashed', 'preflight-failed'].includes(n.verdict)) verdictBuckets.crash++;
+          else verdictBuckets.infra++;   // timeout / cancelled / 未知
+        } else if (n.status === 'timeout' || n.status === 'cancelled') verdictBuckets.infra++;
+      }
       return json(200, {
+        asOf: new Date().toISOString(),   // 2026-09-23（kl P2）：快照时刻——汇总与实况赛跑时,消费方能自判新鲜度
         plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes, closedAt: state.closedAt || null, closedReason: state.closedReason || '' },
         line: {
-          active: act.active.length, nodes: act.nodes.length, counts: act.counts,
+          active: act.active.length, nodes: act.nodes.length, counts: act.counts, verdictBuckets,
           idleMinutes: act.idleMinutes, quietMinutes: act.quietMinutes,
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.6.6', convergeAuto: convergeAutoOn(wsKey),
+        unread, questVersion: '0.8.2', convergeAuto: convergeAutoOn(wsKey), spawned,
+        // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
+        // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
+        role: (() => {
+          const caller = String(u.searchParams.get('sessionId') || '').trim();
+          const main = String(loadConvergeState()[wsKey]?.mainSessionId || '');
+          if (!caller) return 'unknown';
+          if (main && caller === main) return 'main';
+          return 'subagent';
+        })(),
+        mainSessionId: loadConvergeState()[wsKey]?.mainSessionId || null,
       });
     }
     // 历史计划列表（2026-09-14）：控制台用下拉栏调出以前那些短流程 plan。
@@ -2497,10 +2978,45 @@ const server = http.createServer(async (req, res) => {
       }
       return json(200, { ok: true, plans });
     }
+    // ── F3（2026-09-24）配置热加载：改 quest-config.json 后不必等重启窗口 ──────────
+    // 教训：2026-09-23 关收敛链时,配置改了但内存态没换,23:00 定时器照旧翻案,只能干等几小时空窗重启。
+    // 语义边界：notify/converge/worker/fixer/sweep/qu gate 等**运行时读 CFG 的**全部即时生效；
+    // 端口/DSH baseUrl/令牌等**启动期消费的**要重启才换（返回体里会标出来）。防呆：JSON 损坏拒收不动现状。
+    if (req.method === 'POST' && u.pathname === '/api/config/reload') {
+      let fresh;
+      try { fresh = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch (e) {
+        return json(200, { ok: false, error: `配置文件解析失败,已拒收(内存态未动): ${String(e?.message || e).slice(0, 120)}` });
+      }
+      const before = JSON.stringify(CFG);
+      for (const k of Object.keys(CFG)) delete CFG[k];
+      Object.assign(CFG, fresh);
+      const beforeObj = JSON.parse(before);
+      const changed = Object.keys(fresh).filter((k) => JSON.stringify(fresh[k]) !== JSON.stringify(beforeObj[k] ?? null));
+      log('config.reload: 生效键 [' + changed.join(', ') + ']（启动期键 port/dshBaseUrl 等需重启）');
+      appendEvent(lastActiveWs, { t: 'config.reloaded', changed });
+      return json(200, { ok: true, changed, note: '运行时语义已即时生效;port/dshBaseUrl/token 等启动期键需重启' });
+    }
     if (req.method === 'POST' && u.pathname === '/api/plan') {
       const body = await readBody(req);
       const parsed = parsePlan(body.markdown || '');
       if (parsed.errors.length) return json(400, { ok: false, errors: parsed.errors });
+      // 写入时预检（2026-09-22 用户内测提议）：command 里的 .py 脚本存在性 + py_compile，
+      // **只警告不拦**——当天实测"plan 三个脚本都不存在，建好了却派不了"，写入时提醒比派发时
+      // 才发现省一整轮。并行跑、总预算 ~20s（复用派发预检 preflight()，含车道判断）。
+      const warnings = [];
+      try {
+        const pyNodes = parsed.nodes.filter((n) => /\b[\w./\\:-]+\.py\b/.test(n.command)).slice(0, 6);
+        if (pyNodes.length) {
+          const results = await Promise.all(pyNodes.map(async (n) => {
+            const script = (n.command.match(/\b([\w./\\:-]+\.py)\b/) || [])[1] || '';
+            const base = path.resolve(n.cwd || '.', script);
+            if (!fs.existsSync(base)) return `${n.id}: 脚本不存在 ${script}（cwd=${n.cwd || '(未写)'}）——先建文件再派发，否则预检必挂`;
+            const pf = await preflight(n);
+            return pf?.error ? `${n.id}: ${String(pf.error).slice(0, 160)}` : '';
+          }));
+          for (const w of results) if (w) warnings.push(w);
+        }
+      } catch {}
       const dir = dirOf(wsKey);
       // ⑦ 覆盖保护：plan.md 是"任务线的唯一真相"，被整体替换时旧 plan 里还没干净收尾的节点
       // 会连状态一起蒸发（历史上发生过：AI 重写 plan 顺手删掉待办/失败节点，人再看不见）。
@@ -2529,7 +3045,7 @@ const server = http.createServer(async (req, res) => {
       fs.writeFileSync(planFile, body.markdown, 'utf8');
       if (archived) appendEvent(wsKey, { t: 'plan.archived', file: path.basename(archived) });
       appendEvent(wsKey, { t: fs.existsSync(path.join(dir, 'ledger.jsonl')) ? 'plan.reloaded' : 'plan.created', nodes: parsed.nodes.map((n) => n.id), ...(body.force === true ? { forced: true } : {}) });
-      return json(200, { ok: true, nodes: parsed.nodes.map((n) => n.id), workspace: ws, ...(archived ? { archived: path.basename(archived) } : {}) });
+      return json(200, { ok: true, nodes: parsed.nodes.map((n) => n.id), workspace: ws, ...(warnings.length ? { warnings } : {}), ...(archived ? { archived: path.basename(archived) } : {}) });
     }
     // P4：进程树查询
     if (req.method === 'GET' && u.pathname === '/api/runs') {
@@ -2555,6 +3071,7 @@ const server = http.createServer(async (req, res) => {
         command: String(b.command), cwd: b.cwd,
         expectMinutes: Number(b.expectMinutes) || 30, quiet: b.quiet === true,
         autoFix: b.autoFix === true, fixBudget: 2,
+        progressMinutes: Number(b.progressMinutes) || 0,   // F1：进度推送（分钟，0=关）
         handoff: String(b.handoff || '快速单发任务').slice(0, 2000),
         success: String(b.success || '').slice(0, 300),
         after: [], when: '', watchRules: [],
@@ -2582,6 +3099,24 @@ const server = http.createServer(async (req, res) => {
     // v0.3 门禁裁决：/q确认 /q拒绝 的后端
     if (req.method === 'POST' && u.pathname === '/api/gate/decide') {
       const b = await readBody(req);
+      // 分支：主对话接管请求（gate.role-request）——与 runGate 共用 /q确认 /q拒绝 入口
+      const rr = (roleGate.pending || []).find((r) => r.id === String(b.id || '') && r.status === 'pending');
+      if (rr) {
+        rr.decidedAt = Date.now();
+        if (b.approve) {
+          rr.status = 'approved'; saveRoleGate();
+          const all2 = loadConvergeState();
+          all2[rr.wsKey] = { ...(all2[rr.wsKey] || {}), mainSessionId: rr.sessionId };
+          saveConvergeState(all2);
+          appendEvent(rr.wsKey, { t: 'converge.main', sessionId: rr.sessionId, via: 'user-confirmed' });
+          qqPush(rr.wsKey, `[✅ 已放行] 主对话接管：${sessionLabel(rr.sessionId)} 成为本工作区主对话（原 ${sessionLabel(rr.prev)} 退位）。`.slice(0, 400), rr.sessionId).catch(() => {});
+          return json(200, { ok: true, action: 'role-takeover', mainSessionId: rr.sessionId });
+        }
+        rr.status = 'rejected'; saveRoleGate();
+        appendEvent(rr.wsKey, { t: 'gate.role-rejected', sessionId: rr.sessionId, gateId: rr.id });
+        qqPush(rr.wsKey, `[🚫 已作废] 主对话接管请求（来自 ${sessionLabel(rr.sessionId)}）——在位主对话不变。`.slice(0, 400), rr.sessionId).catch(() => {});
+        return json(200, { ok: true, action: 'role-rejected' });
+      }
       const rec = runGate.pending.find((r) => r.id === String(b.id || '') && r.status === 'pending');
       if (!rec) return json(404, { ok: false, error: `没有待确认的 ${b.id}` });
       rec.decidedAt = Date.now();
@@ -2630,27 +3165,186 @@ const server = http.createServer(async (req, res) => {
       list.sort((a, b) => b.running - a.running || Number(a.junk) - Number(b.junk) || b.nodes - a.nodes || a.wsKey.localeCompare(b.wsKey));
       return json(200, { workspaces: list });
     }
+    // ── quest_spawn：派一个真子对话（2026-09-22 L3）─────────────────────────
+    // 给 AI "派子对话"的动词：建 DSH 会话 + 种子提示（身份/纪律/简报契约）。
+    // handoff 复用 plan 节点那套写法（用户定稿："一套写作技能、两种执行形态：
+    // 节点里跑脚本、子对话里跑判断/写码"）。可见性（用户硬约束①）：spawned 进
+    // /api/status 的 spawned 区与 progress.md；有界返回（硬约束②）：干完必须
+    // 交结构化简报（经 quest_notify 的简报通道回派发者），超期 sweep 催报。
+    // ── quest_tell：向 spawn 出的子对话发消息（2026-09-23，kl P4）──────────────
+    // 背景DSH 的 send_message 有父子会话限制（"belongs to another parent session"），
+    // 派发者对 spawn 子对话"能停不能引导"。服务端没有这个限制（sessions.prompt 对任意会话可投），
+    // 所以引导消息走 quest 中转：找到 spawn 登记 → queue 模式投递 → 账本留痕。
+    if (req.method === 'POST' && u.pathname === '/api/tell') {
+      const b = await readBody(req);
+      const target = String(b.spawnId || b.sessionId || '').trim();
+      const text = String(b.message || '').trim().slice(0, 4000);
+      if (!target || !text) return json(400, { ok: false, error: '缺少 spawnId（或 sessionId）/message' });
+      const spawns = buildSpawns(wsKey);
+      const sp = spawns.find((s) => s.spawnId === target || s.sessionId === target || s.spawnId.startsWith(target) || target.startsWith(s.spawnId));
+      if (!sp) return json(200, { ok: false, error: `没找到子对话「${target.slice(0, 40)}」——quest_status 的 spawned 区可查 spawnId。` });
+      const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+      const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+      try {
+        await api.sessions.prompt({
+          sessionId: sp.sessionId, mode: 'queue',
+          content: [{ type: 'text', text: `【派发者引导】${text}` }],
+        });
+        appendEvent(wsKey, { t: 'spawn.told', spawnId: sp.spawnId, sessionId: sp.sessionId, len: text.length });
+        return json(200, { ok: true, spawnId: sp.spawnId, title: sp.title, note: sp.status === 'running' ? '已投递（queue：它忙则排队）' : `注意：该子对话状态是 ${sp.status}（可能已交简报收工）` });
+      } catch (e) {
+        return json(200, { ok: false, error: `投递失败：${String(e?.message || e).slice(0, 140)}` });
+      }
+    }
+    // ── 实验登记簿（2026-09-29 #1/#2）────────────────────────────────────────
+    if (req.method === 'POST' && u.pathname === '/api/exp/log') {
+      const b = await readBody(req);
+      const nodeRef = String(b.node || '').trim();
+      const cut = (v, n) => { const s = String(v ?? '').trim(); return s ? s.slice(0, n) : ''; };
+      const note = {
+        kind: 'note', at: new Date().toISOString(), by: String(b.dispatchedBy || '').trim(),
+        hypothesis: cut(b.hypothesis, 800), config: cut(b.config, 800),
+        conclusion: cut(b.conclusion, 800), direction: cut(b.direction, 80),
+      };
+      if (b.metrics !== undefined) {
+        if (typeof b.metrics !== 'object' || Array.isArray(b.metrics) || b.metrics === null) return json(400, { ok: false, error: 'metrics 必须是对象（如 {"val_loss": 0.123, "acc": 0.91}）' });
+        const flat = {};
+        for (const [k, v] of Object.entries(b.metrics).slice(0, 20)) flat[String(k).slice(0, 40)] = typeof v === 'number' ? v : String(v).slice(0, 80);
+        note.metrics = flat;
+      }
+      if (!note.hypothesis && !note.conclusion && !note.config && !note.metrics) {
+        return json(400, { ok: false, error: '至少要有一条：hypothesis（跑之前想验证什么）/ metrics（数值结果对象）/ conclusion（一句话结论）。只写 config 也算，但尽量补齐假设与结论——没登记的实验翻页后等于白跑。' });
+      }
+      let exp = '';
+      if (nodeRef) {
+        // 挂到该节点最新一条 auto 骨架上（重跑同节点会产生多条骨架，note 挂最近一条）
+        const autos = readExps(wsKey).filter((r) => r.kind === 'auto' && r.node === nodeRef);
+        const latest = autos[autos.length - 1];
+        if (!latest) return json(200, { ok: false, error: `没找到节点 ${nodeRef} 的自动登记（该节点没跑过命令？）——去掉 node 参数可登记一条独立实验。` });
+        exp = latest.exp;
+      } else {
+        exp = `e${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+        appendExp(wsKey, { kind: 'manual', exp, at: note.at, node: '', title: cut(b.title, 80), command: '', shell: '', cwd: '', verdict: '', runSec: null, env: {}, artifacts: [] });
+      }
+      appendExp(wsKey, { ...note, exp });
+      return json(200, { ok: true, exp, attachedToNode: !!nodeRef });
+    }
+    if (req.method === 'GET' && u.pathname === '/api/exp/query') {
+      const q = String(u.searchParams.get('q') || '').toLowerCase().trim();
+      const direction = String(u.searchParams.get('direction') || '').toLowerCase().trim();
+      const limit = Math.min(50, Math.max(1, Number(u.searchParams.get('limit')) || 10));
+      let exps = foldExps(readExps(wsKey));
+      if (direction) exps = exps.filter((e) => (e.direction || '').toLowerCase().includes(direction));
+      if (q) exps = exps.filter((e) => [e.title, e.command, e.hypothesis, e.conclusion, e.direction, e.node, String(e.metrics ? JSON.stringify(e.metrics) : '')].join(' ').toLowerCase().includes(q));
+      exps.sort((a, b2) => String(b2.at).localeCompare(String(a.at)));
+      return json(200, { ok: true, total: exps.length, experiments: exps.slice(0, limit).map((e) => ({ ...e, env: { interpreter: e.env.interpreter || '', version: e.env.version || '', git: e.env.git ?? null } })) });
+    }
+    if (req.method === 'POST' && u.pathname === '/api/spawn') {
+      const b = await readBody(req);
+      const title = String(b.title || '').trim().slice(0, 60);
+      const handoff = String(b.handoff || '').trim().slice(0, 6000);
+      const by = String(b.dispatchedBy || '').trim();
+      if (!title || !handoff) return json(400, { ok: false, error: '缺少 title/handoff（handoff 复用 plan 节点写法：角色/验证什么/指标与健康范围/产物在哪/已知的坑）' });
+      if (!by) return json(400, { ok: false, error: '缺少派发者身份（dispatchedBy）——插件层会自动带上；直连 HTTP 需手动传' });
+      const state = buildState(wsKey);
+      // 2026-09-23：spawn 的 cwd 必须解析成功——建在错误 cwd 的子对话写工作区文件会撞沙箱审批
+      const wsPath = resolveWsPath(wsKey, ws);
+      if (!wsPath) return json(400, { ok: false, error: '解析不到工作区路径（plan 头缺 workspace、账本无派发记录、也未传 ws）——子对话必须建在明确的工作区里' });
+      const deadlineMin = Math.min(1440, Math.max(5, Number(b.deadlineMinutes) || 240));
+      const spawnId = `spawn-${title.replace(/[^\w一-龥-]/g, '_').slice(0, 40)}-${Date.now().toString(36)}`;
+      const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+      const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+      try {
+        const created = await api.sessions.create({ cwd: hostPathFor(wsPath) || wsPath });
+        if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 160));
+        const sid = created.result.value.sessionId;
+        // 种子提示：身份 + 交接 + 纪律 + 简报契约（有界返回）。写作口径与 PLAN-TEMPLATE 一致。
+        const seed = [
+          `【子对话上任】你是工作区「${wsPath}」的子对话「${title}」，由 ${by.slice(8, 16)}… 派出，独立推进下面这个阶段。`,
+          ``,
+          `── 交接（派发者写）──`,
+          handoff,
+          ``,
+          `── 运行纪律 ──`,
+          `1. 预计超 1 分钟的命令一律 quest_run（后台+判定+回执）；秒级看中间量用 quest_probe。禁止本地终端跑长命令/轮询。`,
+          `2. 会产出需要追踪结果的步骤，写成 plan 节点或 quest_run（追溯留痕）；你修自己的失败节点。`,
+          `3. 你**不能再派子对话**（只有一层）；需要并行检索用你自己的会话内子代理。`,
+          `4. 全局纪律见 ~/.dsh/AGENTS.md（身份自查：quest_status 的 role 字段）。`,
+          ``,
+          `── 简报契约（有界返回，完成即终态）──`,
+          `干完（或确定干不下去）时，调 quest_notify 发简报，首行必须是：`,
+          `【子对话简报·${spawnId}】`,
+          `正文 ≤15 行，结构：做了什么｜产物路径（绝对路径）｜关键读数/结论｜阻塞与不确定项｜建议下一步。`,
+          `发完简报你的任务就结束了——不要再派新任务、不要再发消息（等派发者或用户来找你）。`,
+        ].join('\n');
+        await api.sessions.prompt({ sessionId: sid, mode: 'queue', content: [{ type: 'text', text: seed }] });
+        appendEvent(wsKey, {
+          t: 'spawn.created', spawnId, sessionId: sid, title, by,
+          deadlineAt: Date.now() + deadlineMin * 60000,
+        });
+        writeProgress(wsKey);
+        log(`spawn.created ${wsKey}: ${spawnId} → ${sid.slice(8, 16)}…（by ${by.slice(8, 16)}…，时限 ${deadlineMin}min）`);
+        return json(200, { ok: true, spawnId, sessionId: sid, deadlineMinutes: deadlineMin });
+      } catch (e) {
+        appendEvent(wsKey, { t: 'spawn.failed', title, error: String(e?.message || e).slice(0, 200) });
+        return json(200, { ok: false, error: `子对话创建失败：${String(e?.message || e).slice(0, 160)}` });
+      }
+    }
     if (req.method === 'POST' && u.pathname === '/api/notify') {
       // AI 点名用户（2026-09-18 用户定稿："中间不用通知我；需要我的时候再通知"）。
       // 2026-09-19 收权：QQ 点名**仅主对话可用**——阶段汇总与决策请求由主对话统一发声，
       // 子对话把结果报给主对话（署名回执制），不再各自打扰用户。
       const b = await readBody(req);
-      const msg = String(b.message || '').trim().slice(0, 800);
+      // 2026-09-20 修（用户实测痛点）"99% 需要我决定的对话看不见要决定啥"：
+      // 原来这里 slice(0,800) 是**硬切**——决策消息常 1000+ 字，切点正好吃掉"要你决定什么"。
+      // 现在对齐 notify.mjs 的 clampMessage（4000 字、头尾保留），再长由桥 splitForQQ 拆条（4000/段）。
+      const rawMsg = String(b.message || '').trim();
+      const msg = rawMsg.length > 4000
+        ? rawMsg.slice(0, 2400) + '\n…（中段省略）…\n' + rawMsg.slice(-1580)
+        : rawMsg;
       if (!msg) return json(400, { ok: false, error: '缺少 message' });
+      // 2026-09-20 三次修订（用户纠正架构）：恢复"**仅登记主对话可点名**"。
+      // 用户的心智模型是对的：一个工作区一个主对话，其余都是它派出的子对话；
+      // 子对话结果走**署名回执**回到各自派发者，再由主对话筛选后决定是否打扰用户。
+      // 此前实测的"子对话越级想发 QQ"，根因是 **署名链断裂**（任务 dispatchedBy 为空 →
+      // 回执回不到派发者 → 子对话以为自己要汇报用户），不是闸门太严。署名已修（插件 quest_run
+      // 漏传 + /api/dispatch 丢弃），闸门随之收紧；被拒时引导它把结果交给主对话。
       const caller = String(b.sessionId || '').trim();
+      // ── 子对话简报通道（2026-09-22 quest_spawn 配套）─────────────────────
+      // 活跃 spawned 子对话调 quest_notify = 交简报（种子提示里约定的契约），不算越级点名：
+      // 全文定向回**派发者**（不是 QQ 用户——要不要打扰用户由派发者/主对话决定），账本记终态。
+      const sp = activeSpawnOf(wsKey, caller);
+      if (sp) {
+        const full = `📋【子对话简报】${sp.title}（${sp.spawnId}）\n${msg}`;
+        let routed = false;
+        if (sp.by) {
+          try {
+            const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+            const api = new NodeApiClient(CFG.dshBaseUrl, 20000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+            await api.sessions.prompt({ sessionId: sp.by, mode: 'queue', content: [{ type: 'text', text: full }] });
+            routed = true;
+          } catch (e) { log('spawn 简报投递失败:', e?.message); }
+        }
+        appendEvent(wsKey, { t: 'spawn.reported', spawnId: sp.spawnId, sessionId: sp.sessionId, by: sp.by || undefined, routed });
+        writeProgress(wsKey);
+        log(`spawn.reported ${wsKey}: ${sp.spawnId}${routed ? '' : '（未能投递派发者，仅留痕）'}`);
+        return json(200, { ok: routed, note: routed ? '简报已交回派发者。你的任务到此为止——停在这里，等派发者/用户来找。' : '简报已入账本，但派发者会话不可达；你的任务到此为止。' });
+      }
       const mainSid = loadConvergeState()[wsKey]?.mainSessionId || '';
-      if (mainSid) {
-        if (!caller) return json(200, { ok: false, error: `QQ 点名仅主对话可用（本工作区登记的主对话是 ${mainSid.slice(8, 16)}…）。子对话请把结果回执给主对话，由它汇总点名。` });
-        if (caller !== mainSid) return json(200, { ok: false, error: `QQ 点名仅主对话可用——你是 ${caller.slice(8, 16)}…，不是本工作区登记的主对话。先把结果回执给主对话（它会阶段汇总并点名用户）。` });
-      }   // 未登记主对话的工作区放行（fail-open，翻页/指定后自动收紧）
-      const cdMs = Math.max(5, Number(CFG.notify?.userPingCooldownSec) || 60) * 1000;
+      if (mainSid && caller && caller !== mainSid) {
+        return json(200, { ok: false, error: `你是子对话（${caller.slice(8, 16)}…），不是本工作区的主对话（${mainSid.slice(8, 16)}…）。规矩：子对话把结果/总结交回主对话（用 DSH 的 send_message 发给它，或写进工作区文件并在你的收尾消息里说明），由主对话筛选后统一通知用户。` });
+      }
+      const cdMs = Math.max(5, Number(CFG.notify?.userPingCooldownSec) || 600) * 1000;   // 默认 10 分钟/工作区
+      // 2026-09-23（kl P8）：更正/撤回类消息绕过冷却——冷却挡住"16× 作废"那类更正 10 分钟，
+      // 晚到的撤回比不发更糟。首行 retract:/更正/撤回 即视为更正通道（滥用由主对话自律约束）。
+      const isRetract = /^\s*(retract:|更正[:：]|撤回[:：]|作废[:：])/i.test(rawMsg);
       let lastPing = 0;
       try {
         const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
         for (let i = raw.length - 1; i >= 0; i--) { let ev; try { ev = JSON.parse(raw[i]); } catch { continue; } if (ev.t === 'notify.user-ping') { lastPing = tsOf(ev.at); break; } }
       } catch {}
-      if (lastPing && Date.now() - lastPing < cdMs) return json(200, { ok: false, error: `冷却中（${Math.round((cdMs - (Date.now() - lastPing)) / 1000)}s 后可再发）` });
-      appendEvent(wsKey, { t: 'notify.user-ping' });
+      if (!isRetract && lastPing && Date.now() - lastPing < cdMs) return json(200, { ok: false, error: `冷却中（${Math.round((cdMs - (Date.now() - lastPing)) / 1000)}s 后可再发）——每工作区默认 10 分钟一条；更正/撤回类消息首行写"更正："可立即发。` });
+      appendEvent(wsKey, { t: 'notify.user-ping', from: caller || undefined });
       try {
         if (notifyKind(CFG) === 'off') return json(200, { ok: false, error: '通知出口为 off（配 notify.kind）' });
         await qqPush(wsKey, `[🔔 AI 点名·需要你] ${msg}`);
@@ -2840,7 +3534,9 @@ const server = http.createServer(async (req, res) => {
       } catch (e) { results.errors.push(`list: ${e.message}`); }
       // 3) 开新会话（cwd 用 Windows 原生形态——/mnt/c 形态在 Windows 侧是无效路径）
       try {
-        const created = await api.sessions.create({ cwd: hostPathFor(String(b.ws ?? '')) || b.ws, agentPreset: b.preset || undefined });
+        // 2026-09-23：flip 新会话的 cwd 也走统一解析链（b.ws 缺失时不再静默落 DSH 默认 cwd）
+        const flipCwd = hostPathFor(String(b.ws ?? '')) || b.ws || resolveWsPath(wsKey);
+        const created = await api.sessions.create({ cwd: flipCwd || undefined, agentPreset: b.preset || undefined });
         if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 150));
         results.created = created.result.value.sessionId;
         if (!results.created) throw new Error('create 返回 ok 但没有 sessionId');
@@ -2854,7 +3550,7 @@ const server = http.createServer(async (req, res) => {
           await api.sessions.prompt({
             sessionId: results.created, mode: 'queue',
             content: [{ type: 'text', text: [
-              '【翻篇恢复】工作区刚完成一次翻篇归档。按顺序做三件事，然后停下等用户：',
+              '【翻篇恢复】工作区刚完成一次翻篇归档。**你是本工作区的新任主对话**（旧主对话已归档退休——注意：你比它更"高"一层，子对话的回报到你为止，你要做的是汇总筛选后决定是否打扰用户，不是替谁跑腿）。按顺序做三件事，然后停下等用户：',
               `1. 读取 ${path.join(wsHost, 'research-state.md')} —— 这是老会话归档前写的交接文档${results.handoff?.wrote ? '（刚写新鲜的 ✓）' : rsOk ? '（注意：本次翻页老会话没来得及重写，内容可能是旧的，缺的部分去 archive/ 里 grep）' : '（文件不存在！先看第 3 步的任务线全景，并提醒用户补交接）'}。`,
               '2. 调用 quest_status（brief 模式）拿任务线全景：在跑的、最近失败的、计划状态。',
               '3. 用 5~8 行向用户复述你理解的现状：目标、已完成（带关键数字）、正在跑、坑（别再踩的）、建议下一步。**复述完就停，等用户确认后再动手**——宁可问，不要猜。',
@@ -2874,6 +3570,9 @@ const server = http.createServer(async (req, res) => {
           all[fk] = { ...(all[fk] || {}), mainSessionId: results.created };
           saveConvergeState(all);
         } catch {}
+        // 2026-09-21（用户实测）：quest 用 API 建的会话不会进 DSH 的 workspace 分组表 →
+        // 侧栏显示在"未分组"（翻页新主对话就这样）。这里把新会话挂进对应工作区的 sessionIds。
+        try { addSessionToWorkspaceGroup(String(b.ws ?? ''), results.created); } catch (e) { log('workspace 分组挂载失败（不影响翻页）:', e?.message); }
       }
       appendEvent(wsKeyOf(String(b.ws ?? '')) || wsKey, { t: 'flip.done', ws: b.ws, archived: results.archived.length, matched: results.matched ?? null, created: results.created });
       return json(200, { ok: results.errors.length === 0, ...results });
@@ -2951,12 +3650,46 @@ const server = http.createServer(async (req, res) => {
         if (action === 'main') {
           // 指定主对话（2026-09-16）：总结/收尾的定向目标。session/list 无 archived 标记，
           // 启发式必翻车（老主对话 2985M 还躺在列表里）⇒ 允许显式指定；翻页成功时自动更新为接班。
+          // 2026-09-21 加防护（用户提出："主动注册主对话需要我的权限，不然子对话也可能抢权限"）：
+          // 此前本端点无鉴权——任何会话（含子对话）都能改注册表，工具描述里的"只在用户要求时调用"
+          // 只是君子协定。现在分三档：①无主对话（首次注册）直接生效；②已是本人（幂等）直接返回；
+          // ③已有他人在位 ⇒ 生成待确认请求 + 推 QQ，用户 /q确认 <id> 才换人（30 分钟不确认自动作废）。
+          // 用户直接经桥发 /q主对话 <前缀> 的路径（带 userAuthorized 标记）不受此限。
           const sid = String(b.sessionId || '');
           if (!sid) return json(200, { ok: false, error: '缺 sessionId' });
-          stateAll[wsKey] = { ...cur, mainSessionId: sid };
-          saveConvergeState(stateAll);
-          appendEvent(wsKey, { t: 'converge.main', sessionId: sid });
-          return json(200, { ok: true, mainSessionId: sid, note: '主对话已指定：后续总结/收尾都发给它（直到下次翻页自动换新接班）' });
+          // 2026-09-21 跨工作区硬校验（用户问："不是那种全局 ceo 互相抢权限吧"）：
+          // 主对话是**每工作区独立**的职位——但 AI 可以显式传 ws 参数指向别的工作区。
+          // 这里核对"调用者会话的 cwd 是否就是目标工作区"，不匹配直接拒（用户亲手操作路径除外）。
+          if (!b.userAuthorized) {
+            try {
+              const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+              const apiC = new NodeApiClient(CFG.dshBaseUrl, 15000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+              const lrC = await apiC.sessions.list({});
+              const sC = (lrC.result.value?.items ?? []).find((x) => String(x.sessionId) === sid);
+              if (sC) {
+                let cwdKey = ''; try { cwdKey = wsKeyOf(String(sC.cwd || '')); } catch {}
+                if (cwdKey && cwdKey !== wsKey) {
+                  return json(200, { ok: false, error: `跨工作区操作被拒：你的会话目录属于 ${cwdKey.slice(-28)}，而目标是 ${wsKey.slice(-28)}。主对话每工作区独立——你只能接管自己工作区。（若确需跨区，请用户经 QQ 亲手操作。）` });
+                }
+              }
+            } catch { /* 校验失败不阻断（DSH 不可达时按原逻辑走） */ }
+          }
+          const curMain = String(cur.mainSessionId || '');
+          const userAuthorized = b.userAuthorized === true;   // 桥的 /q主对话 走这条（用户亲手操作）
+          if (userAuthorized || !curMain || curMain === sid) {
+            stateAll[wsKey] = { ...cur, mainSessionId: sid };
+            saveConvergeState(stateAll);
+            appendEvent(wsKey, { t: 'converge.main', sessionId: sid, via: userAuthorized ? 'user' : (!curMain ? 'first' : 'idempotent') });
+            return json(200, { ok: true, mainSessionId: sid, note: !curMain ? '首次注册主对话（此前无人在位）' : (curMain === sid ? '你已在位（幂等）' : '主对话已指定（用户授权）') });
+          }
+          // 已有他人在位：需要用户确认
+          const id = 'rg-' + Date.now().toString(36);
+          roleGate.pending = (roleGate.pending || []).filter((r) => r.status !== 'pending' || Date.now() - r.at < 30 * 60000);
+          roleGate.pending.push({ id, wsKey, sessionId: sid, prev: curMain, at: Date.now(), status: 'pending' });
+          saveRoleGate();
+          appendEvent(wsKey, { t: 'gate.role-request', sessionId: sid, prev: curMain, gateId: id });
+          qqPush(wsKey, `[🔔 主对话接管请求] 会话来访：${sessionLabel(sid)} 请求接管本工作区主对话（当前在位：${sessionLabel(curMain)}）。\n放行：/q确认 ${id}\n作废：/q拒绝 ${id}（或 30 分钟内不回复，自动作废）`.slice(0, 400), sid).catch(() => {});
+          return json(200, { ok: false, pending: true, id, error: `已有主对话在位于 ${curMain.slice(8, 16)}…——已向用户请求确认（${id}）。用户 QQ 回复 /q确认 ${id} 后你才接管；期间保持子对话职责。` });
         }
         const auto = action === 'on' ? true : action === 'off' ? false : !(cur.auto !== false);
         stateAll[wsKey] = { ...cur, auto };
@@ -2977,7 +3710,7 @@ const server = http.createServer(async (req, res) => {
       if (!ws) return json(400, { ok: false, error: '缺少 ws 参数（工作区路径）' });   // 空 ws 会退化成无主收敛（2026-09-16 踩过：账本写进 quests 根目录）
       const state = buildState(wsKey);
       const info = lineActivity(state);
-      const wsPath = (() => { try { return parsePlan(state.plan || '').meta?.workspace || ws; } catch { return ws; } })();
+      const wsPath = resolveWsPath(wsKey, ws);   // 2026-09-23：统一解析链（plan 头→账本→入参），防 cwd 落 DSH 默认
       try {
         // 两阶段（与自动收尾同架构）：轻量会话干总结 → 主对话收通知。事件立即写，后续异步。
         // waitAsync：回执只等"派发"（建会话+发提示词），等总结（最长 15 分钟）转后台——
@@ -2996,6 +3729,31 @@ const server = http.createServer(async (req, res) => {
     // P1-4：人工终止。杀树 + cancelled 独立终态（fixer 无视，绝不续杯），worker/总结全部静默。
     if (req.method === 'POST' && u.pathname === '/api/cancel') {
       const body = await readBody(req);
+      // 2026-09-23（kl P7）：tag 批量收线——节点 id 前缀/片段匹配（大小写不敏感），
+      // 在跑的逐个走正常杀树；非终态（pending/frozen/ready）的直接落 cancelled 终态。
+      // 典型场景：一批被取代的 quick-xxx_*_* 分散节点，不用一个个挑。
+      if (body.tag) {
+        const tag = String(body.tag).toLowerCase();
+        const st = buildState(wsKey);
+        const matched = Object.values(st.nodes || {}).filter((n) => String(n.id ?? '').toLowerCase().includes(tag));
+        const running = matched.filter((n) => n.status === 'running');
+        const idle = matched.filter((n) => ['pending', 'frozen', 'ready'].includes(n.status));
+        const results = [];
+        for (const n of idle) {
+          appendEvent(wsKey, { t: 'node.cancelled', node: n.id, reason: `tag 批量收线(${body.tag})` });
+          results.push(`${n.id}: cancelled`);
+        }
+        for (const n of running) {
+          const job = activeJobs.get(`${wsKey}|${n.id}`);
+          if (job) {
+            job.cancelledByHuman = `tag 批量收线: ${String(body.reason || body.tag).slice(0, 120)}`;
+            killJobTree(job, job.child.pid);
+            results.push(`${n.id}: 已发杀树`);
+          } else { results.push(`${n.id}: 在跑但不在活动表（等对账）`); }
+        }
+        writeProgress(wsKey);
+        return json(200, { ok: true, tag: body.tag, matched: matched.length, detail: results.slice(0, 30), note: `匹配 ${matched.length}（杀在跑 ${running.length}，收 idle ${idle.length}）；不匹配的已终态节点不动。` });
+      }
       {
         // 先解析 id：短后缀/片段唯一就当成它；解析不到直接 404，不写账本（防幽灵节点）
         const st0 = buildState(wsKey);
@@ -3065,7 +3823,9 @@ const server = http.createServer(async (req, res) => {
           if (['frozen', 'ready'].includes(state.nodes[id]?.status ?? '')) appendEvent(wsKey, { t: 'node.unfrozen', node: id });
         }
       }
-      const r = await dispatchJob(wsKey, node, { runId: body.runId });
+      // dispatchedBy 必须透传（2026-09-20 补洞：此处只传 runId，插件/QQ 桥带来的署名被丢弃——
+      // plan 节点是主流用法，丢了署名等于署名回执制对正式任务全线失效）。
+      const r = await dispatchJob(wsKey, node, { runId: body.runId, dispatchedBy: body.dispatchedBy, explicit: true });
       return json(200, r);
     }
     if (req.method === 'GET' && u.pathname === '/api/log') {
@@ -3118,6 +3878,24 @@ const server = http.createServer(async (req, res) => {
       }
       const command = String(b.command);
       const cwd = String(b.cwd);
+      // 2026-09-23（kl P6）：探针没有 shell——顶层（引号外）的 |、&、;、换行 后面的段落会被静默丢弃
+      // （实测：python -c 后跟一段 PowerShell，第二段无声蒸发）。直接拒绝并说明。
+      // 引号感知：-c "import time; time.sleep(600)" 里的分号是 Python 语法，必须放行——
+      // 只拦引号**外**的元字符（粗粒度引号追踪，够这个白名单场景用）。
+      const topMeta = (() => {
+        let q = null;
+        for (let i = 0; i < command.length; i++) {
+          const c = command[i];
+          if (q) { if (c === q) q = null; else if (c === '\\') i++; continue; }
+          if (c === '"' || c === "'") { q = c; continue; }
+          if (c === '|' || c === '&' || c === ';' || c === '\n' || c === '\r') return c;
+        }
+        return null;
+      })();
+      if (topMeta) {
+        const pretty = { '|': '|', '&': '&', ';': ';', '\n': '换行', '\r': '换行' }[topMeta];
+        return json(200, { ok: false, error: `探针不支持 shell 语法（顶层检测到 ${pretty}，其后的命令会被静默丢弃）——拆成多次探针，或把逻辑写进 -c 的引号内代码里；真正的管道/串联命令用 quest_run。` });
+      }
       const cls = classifyRunCommand(command, cwd);
       const allowC = cls.why === '解释器 -c 内联代码不可静态审查'; // 探针放行 -c（quest_run 依然要过门）
       if (cls.level !== 'ok' && !allowC) {
@@ -3300,7 +4078,16 @@ server.listen(CFG.port || 3110, '127.0.0.1', () => {
       const ids = new Set([...Object.keys(state.nodes), ...planById.keys()]);
       for (const id of ids) {
         const n = state.nodes[id];
-        if (n?.status !== 'running' || !n.pid) continue;
+        if (n?.status !== 'running') continue;
+        // 2026-09-22 修（piml 幽灵 mu6akfu5 复盘）：无 pid 的 running 节点以前被 continue 跳过——
+        // 派发记录不完整（只有 gate/plan.created 事件）或 pid 字段丢失时，节点会在账本里永久挂
+        // running：对账不管它、/api/cancel 的 fallback 只留痕不翻终态、sweep 反复写 cancel.fallback
+        // 也没用（4 天幽灵实测）。现在直接按幽灵安葬：标 cancelled + 写明依据，账本可审计。
+        if (!n.pid) {
+          appendEvent(wsKey, { t: 'node.cancelled', node: id, reason: '重启对账：running 但无 pid（派发记录不完整的幽灵），按无进程处理安葬' });
+          log(`reconcile: 幽灵安葬 ${wsKey} ${id}（running 无 pid）`);
+          continue;
+        }
         const node = planById.get(id) ?? {
           // 账本独有的快速单发节点：**车道/命令/预期时长从账本恢复**（buildState 读 quick.dispatched）。
           // 以前这里硬编码 shell:'windows' —— WSL 车道的快速单发在重启后会被当 Windows 处理，

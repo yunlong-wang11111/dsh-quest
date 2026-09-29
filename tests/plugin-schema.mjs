@@ -20,7 +20,7 @@ const tools = [];
 const re = /ctx\.tools\.register\(defineTool\(\{\s*name: '([a-z_]+)',[\s\S]*?\}\)\);/g;
 let m;
 while ((m = re.exec(src))) tools.push({ name: m[1], body: m[0] });
-s.check('① 抽到全部 11 个工具（2026-09-18 +quest_notify）', tools.length === 11, tools.map((t) => t.name).join(','));
+s.check('① 抽到全部 16 个工具（2026-09-29 +quest_exp_log/quest_exp_query）', tools.length === 16, tools.map((t) => t.name).join(','));
 
 const flip = tools.find((t) => t.name === 'quest_flip');
 const plan = tools.find((t) => t.name === 'quest_plan');
