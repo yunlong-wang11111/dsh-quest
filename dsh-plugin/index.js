@@ -512,6 +512,7 @@ function apply(ctx, config = {}) {
         type: 'object', additionalProperties: true,
         properties: {
           questVersion: { type: 'string' },
+          updateAvailable: { type: 'object', additionalProperties: true, description: '有新版时非空:{current,latest,notified}' },
           role: { type: 'string', description: 'main=你是主对话；subagent=你是子对话；unknown=身份未传' },
           plan: { type: 'object', additionalProperties: true, properties: { workspace: { type: 'string' }, nodes: { type: 'array', items: { type: 'object', additionalProperties: true, properties: {
             id: { type: 'string' }, status: { type: 'string' }, verdict: { type: 'string' }, via: { type: 'string' },
@@ -529,8 +530,9 @@ function apply(ctx, config = {}) {
       },
       render: (args, v) => {
         if (v.error) return [{ type: 'text', text: `查询失败：${v.error}` }];
+        const upd = v.updateAvailable ? `📦 quest 新版本 v${v.updateAvailable.latest} 可用（当前 v${v.updateAvailable.current}）——转告用户即可，升级由基础设施侧执行。\n` : '';
         const nodes = v.plan?.nodes || [];
-        if (!nodes.length) return [{ type: 'text', text: '当前工作区没有任务线计划。先用 quest_plan 写一个。' }];
+        if (!nodes.length) return [{ type: 'text', text: `${upd}当前工作区没有任务线计划。先用 quest_plan 写一个。` }];
         const asOf = v.asOf ? `（快照 ${v.asOf.slice(11, 19)}Z）` : '';
         const vb = v.line?.verdictBuckets;
         const head = vb ? `四类计数：✅ok ${vb.ok}｜⚠️suspect(记账) ${vb.suspect}｜❌crash(脚本) ${vb.crash}｜🛠infra(超时/终止) ${vb.infra}` : '';
@@ -552,7 +554,7 @@ function apply(ctx, config = {}) {
         const done = nodes.filter((n) => n.status === 'completed');
         const recentDone = done.slice(-12).reverse();
         const parts = [
-          `${roleTag ? roleTag + '\n' : ''}${unread ? `📣 自上次查看：${unread}\n` : ''}任务线 ${nodes.length} 节点${asOf}${head ? '\n' + head : ''}`,
+          `${upd}${roleTag ? roleTag + '\n' : ''}${unread ? `📣 自上次查看：${unread}\n` : ''}任务线 ${nodes.length} 节点${asOf}${head ? '\n' + head : ''}`,
           ...(hot.length ? ['', `▸ 需关注（在跑/异常，全量 ${hot.length}）：`, ...hot.slice(0, 25).map(line)] : []),
           ...(recentDone.length ? ['', `▸ 最近完成（最新 ${recentDone.length}/${done.length}）：`, ...recentDone.map(line)] : []),
           ...(v.spawned?.length ? ['', `▸ 子对话：${v.spawned.map((s) => `${s.title}(${s.status})`).join('、')}`] : []),

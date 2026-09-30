@@ -1,5 +1,7 @@
 # dsh-quest
 
+![version](https://img.shields.io/github/v/tag/yunlong-wang11111/dsh-quest?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&sort=semver)
+
 > **多 agent 协作的科研作业系统**——主对话决策、子对话并行执行、进程层跑任务：后台执行、事件驱动监控、自动派发与流转、机器判定验收、署名回执路由，AI 只负责"立项与验收"。
 > A multi-agent orchestration system for research: a decision-making main agent, parallel sub-conversations, and a process lane for jobs — background execution, event-driven monitoring, auto-dispatch, machine-verified acceptance, and signed receipts — while the model only plans and reviews.
 
@@ -260,6 +262,45 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 | `off` | — | — | **纯机械模式**：判定、指标提取、超时、重试、通知照常，只是没有 AI 写的总结 |
 
 实测（机械模式）：`python mech_test.py` → `completed | ok | finish-keyword`，loss 指标 `1.5 → 1.05` 自动提取——**全程零模型调用**。
+
+## v0.8.4 新增（2026-10-01，判定器宽限复核）
+
+- **误报根修**：fire-and-forget 脚本（真活甩后台、脚本秒退）在退出瞬间验产物必然扑空——连续误判 suspect 上报。现判据声明了**产物**且首判失败时，等 30s（ 可调，0=关闭）让后台活落盘后**复核翻案**，翻案标注「宽限复核」；复核仍失败维持原判
+- 配套纪律（AGENTS）：quest_run 的脚本要同步干完再退，或拆「点火+验收」两节点
+
+## v0.8.3 新增（2026-09-30，版本更新通知）
+
+- **更新通知**：quest 每日检查一次 GitHub 最新 Release；有新版时 ①`quest_status` 顶部挂提示行（AI 查状态即见、自动转告用户——对所有装机用户生效）②推送走该机器配置的 notify 出口（桥/webhook：Telegram/钉钉/飞书/企微/ntfy 模板见下文）。每版本只推一次（状态文件去重）；`updateCheck:false` 可关；notify off 的环境完全静默
+- ⚠️ 本功能随本版首次分发——**v0.8.3 是最后一版需要"人工知道"的更新**，此后凡升到 ≥0.8.3 的机器，新版本会自动提醒
+
+## v0.8.2 新增（2026-09-29，实验登记簿+环境指纹）
+
+- **实验登记簿**：任务终态自动登记实验骨架（命令/车道/判定/耗时）到工作区 `experiments.jsonl`——机器记骨架零纪律；`quest_exp_log` 补记假设/metrics/结论/方向标签，`quest_exp_query` 折叠查询（全文检索+方向过滤）。append-only 事件溯源永不改写：翻页/换会话后查登记簿，不翻聊天记录——实验记忆从会话上下文解耦
+- **环境指纹**：骨架自动带解释器版本（白名单判定，不执行任意首词）+ git HEAD（非 git 工作区记 null）——复现凭证；3 秒超时全容错，采不到不影响收尾
+- 工具 14→16；测试 26 套全过（新增 `tests/exp-registry.mjs` 14 用例）
+
+## v0.8.1 新增（2026-09-24，失败上报防丢）
+
+- DSH 列表查询失败时降级直投登记主对话；投递失败落带 error 的账本事件（revive 兜底可复活），不再静默 return（piml cmp3 通知丢失复盘）
+
+## v0.8.0 新增（2026-09-24，progress_push 批次 F1–F4）
+
+- **progress_push（F1）**：节点声明 `progress_minutes` 即定时收进度摘要 + 停滞检测（≥2 周期 stalled 警报推派发者）——替代 AI 轮询盯日志
+- **判据带路径直查（F2）**：产物判据含路径时按 cwd 解析 stat——子目录声明误报根修（piml 实测 165 条失败里 121 条属此类，73%）
+- **/api/config/reload（F3）**：配置热加载，JSON 防呆拒损——"改配置≠生效"的三层状态（文件/内存/每 ws）闭环
+- **图片推送 3 次退避重试（F4）**
+
+## v0.7.4 新增（2026-09-23，收敛通知自激循环根修）
+
+- 防重发守卫改比**节点活动**（原比全体账本事件 ⇒ notify.converge 自身每轮比上轮"新"，1-3 分钟一轮 135 连发）；workspaceActivity 排除 line-summary*/quest-status-full.txt（quest 自写文件不算工作区活动）
+
+## v0.7.3 新增（2026-09-23，通知通道分工定稿）
+
+- 私聊只留 静默收敛 + AI 点名 + 晨报；人工终止确认不再发 QQ（AI tag 批量收线会轰炸，账本留痕足够审计）
+
+## v0.7.2 新增（2026-09-23，fixer 崩溃面修复）
+
+- nodeEventPush 两处早退都返回 Promise（nodeEvents:false 下 7 个调用点 `.catch` 同步崩——fixer 报告后吞重派/结案、预检失败挂死 /api/run）；fixer 异常不改判定：修复已落账只记 fix.error，不重发失败上报
 
 ## v0.7.1 新增（2026-09-23，内测 P2–P8 批次）
 

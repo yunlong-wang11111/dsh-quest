@@ -1081,7 +1081,7 @@ function setupWatch(wsKey, node, job, logFile, pid) {
  * 子进程退出统一收尾：真实 child 的 exit 事件与再认领孤儿的轮询发现共用。
  * code 为 null 表示拿不到退出码（quest 重启后再认领），按退出码 0 走证据判定（关键词/产物），via 里注明。
  */
-function handleNodeExit(wsKey, node, ctx) {
+async function handleNodeExit(wsKey, node, ctx) {
   const { code, timedOut, logFile, startedAt, timeoutMs, job, pid } = ctx;
   job.timers.forEach(clearTimeout); job.timers.forEach(clearInterval); activeJobs.delete(`${wsKey}|${node.id}`);
   if (ctx.out) { try { fs.closeSync(ctx.out); } catch {} }
@@ -1119,6 +1119,24 @@ function handleNodeExit(wsKey, node, ctx) {
     let j;
     try { j = judge(node, codeEff == null ? 0 : codeEff, runSec, logFile); }
     catch (e) { j = { verdict: 'suspect', via: 'judge-error', detail: String(e && e.message || e).slice(0, 200) }; log('判定器异常:', e && e.message); }
+    // 宽限复核（2026-10-01 误报根修）：fire-and-forget 脚本把真活甩后台、自己秒退——
+    // 判定器在退出瞬间查产物必然扑空（实测：TikZ 重编脚本 1s 退出，PNG 还在后台编译，
+    // 连续 4 个节点被误判 suspect 上报打扰）。判据声明了**产物**且首判失败时，等 30s
+    // 让后台活落盘，重新扫一遍再定谳；二翻成功标注 grace，失败维持原判。
+    if (j.verdict === 'suspect' && j.via === 'success-claim-failed') {
+      const claims = parseSuccessClaims(node.success);
+      const graceMs = CFG.judge && Number.isFinite(CFG.judge.graceMs) ? CFG.judge.graceMs : 30000;
+      if (claims.artifacts.length > 0 && graceMs > 0) {
+        await new Promise((r) => setTimeout(r, graceMs));
+        try {
+          const j2 = judge(node, codeEff == null ? 0 : codeEff, runSec, logFile);
+          if (j2.verdict === 'ok') {
+            j = { ...j2, via: `${j2.via}（宽限复核:30s 后产物落盘）` };
+            log(`宽限复核翻案 ${node.id}: 后台产物落盘，suspect→ok`);
+          }
+        } catch {}
+      }
+    }
     if (codeEff == null) j.via = `${j.via}（退出码未知：quest 重启后再认领，日志里也没写 EXIT_CODE）`;
     appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined, ...(j.detail ? { detail: j.detail } : {}) });
     finishNode(wsKey, node, { ...j, logFile }, codeEff, runSec, startedAt);
@@ -2336,6 +2354,40 @@ function loadDailyReportState() {
 function saveDailyReportState(s) {
   try { fs.writeFileSync(dailyReportStateFile(), JSON.stringify(s)); } catch {}
 }
+
+// ── 版本更新通知（2026-09-30 用户需求:"更新这么频繁,更新时通知一下"）───────────
+// 与 pocket 面板提示同效,但 quest 是常驻服务:检查 GitHub 最新 release,
+// 发现新版 ①QQ 推一次(每版本只推一次,状态文件去重) ②inbox+status 暴露给 AI。
+// 测试沙箱(notify off)与 updateCheck:false 时完全静默,不发网络请求之外的副作用。
+const QUEST_VERSION = '0.8.4';
+const QUEST_REPO = 'yunlong-wang11111/dsh-quest';
+let updateInfo = null; // {current, latest, notified} 挂到 /api/status
+function updateCheckStateFile() { return path.join(HOMEOverride, 'update-check-state.json'); }
+async function checkQuestUpdate() {
+  if (CFG.updateCheck === false || notifyKind(CFG) === 'off') return;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 10000);
+    const r = await fetch(`https://api.github.com/repos/${QUEST_REPO}/releases/latest`, {
+      headers: { 'user-agent': 'dsh-quest', accept: 'application/vnd.github+json' },
+      signal: ctl.signal,
+    });
+    clearTimeout(t);
+    if (!r.ok) return;
+    const tag = ((await r.json()) || {}).tag_name || '';
+    const latest = String(tag).replace(/^v/i, '');
+    if (!/^\d+\.\d+\.\d+/.test(latest) || latest === QUEST_VERSION) { updateInfo = null; return; }
+    let st = {}; try { st = JSON.parse(fs.readFileSync(updateCheckStateFile(), 'utf8')) || {}; } catch {}
+    updateInfo = { current: QUEST_VERSION, latest, notified: st.notified === latest };
+    if (st.notified === latest) return; // 该版本已推过
+    st.notified = latest; st.at = new Date().toISOString();
+    try { fs.writeFileSync(updateCheckStateFile(), JSON.stringify(st)); } catch {}
+    updateInfo.notified = true;
+    pushInbox({ node: 'quest-update', verdict: 'update', summary: `quest 新版本 v${latest}(当前 v${QUEST_VERSION})` });
+    sendText(CFG, `📦 汇报:quest 有新版本 v${latest}(当前 v${QUEST_VERSION})。\nGitHub Releases 可查变更;升级由基础设施侧(工位机)执行即可,其他机器装了本插件的按仓库 README 更新。`, { fs, timeoutMs: 8000 }).catch((e) => log('更新通知推送失败:', e?.message));
+    log(`发现新版本 v${latest}(当前 v${QUEST_VERSION}),已通知`);
+  } catch (e) { /* 网络失败静默——更新检查是锦上添花,绝不影响主流程 */ }
+}
 function maybeDailyReport() {
   const cfgD = CFG.notify?.dailyReport;
   if (!cfgD || cfgD.enabled === false) return;
@@ -2621,6 +2673,10 @@ setInterval(async () => {
 // 靠巡检的 60s 周期太晚——首条通知会退回十六进制短 ID（用户实测："和乱码没啥区别"）。
 refreshDshSessions().catch(() => {});
 setInterval(() => { try { sweepQuiet(); } catch (e) { log('sweepQuiet 异常:', e?.message); } try { maybeDailyReport(); } catch (e) { log('daily-report 检查异常:', e?.message); } try { sweepSpawns().catch((e) => log('sweepSpawns 异常:', e?.message)); } catch (e) { log('sweepSpawns 异常:', e?.message); } }, Math.max(5, Number(CFG.sweepSeconds ?? 60)) * 1000);
+
+// 版本更新检查:启动 3 分钟后首查,之后每 24h 一次(错峰避开启动风暴)
+setTimeout(() => { checkQuestUpdate().catch(() => {}); }, 3 * 60 * 1000);
+setInterval(() => { checkQuestUpdate().catch(() => {}); }, 24 * 3600 * 1000);
 
 /** 产物图直推：把节点刚产出的 png/jpg 发 owner QQ（bridge /api/send/private-image，base64 image 段）。 */
 async function qqPushImage(wsKey, imagePath, caption) {
@@ -2915,7 +2971,7 @@ const server = http.createServer(async (req, res) => {
           quiet: act.quiet, wsQuiet: act.wsQuiet, dshQuiet: act.dshQuiet, dsh: act.dsh,
           workspace: act.ws ? { recent: act.ws.recent, windowMinutes: act.ws.windowMinutes, latest: act.ws.latest } : null,
         },
-        unread, questVersion: '0.8.2', convergeAuto: convergeAutoOn(wsKey), spawned,
+        unread, questVersion: QUEST_VERSION, updateAvailable: updateInfo, convergeAuto: convergeAutoOn(wsKey), spawned,
         // 2026-09-21 用户提议的"职位注册制"：任何会话传 ?sessionId= 即可自查身份，
         // 不用每条消息都背角色提醒（省 token，且是主动查询、比被动提醒更可靠）。
         role: (() => {

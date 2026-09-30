@@ -20,6 +20,8 @@ const EXCLUDE_FILES = new Set([
   'LICENSE',                 // 内容一致，仓库元文件交给仓库自己
   '.gitignore', '.gitattributes',
   'quest-autostart.vbs.startup-backup',
+  'sandbox-020-e2e.mjs',        // 0.2.0 升级时的本地诊断脚本(2026-09-30 曾误入开源仓)
+  /sandbox-.*.mjs/,            // 同类沙箱诊断脚本一律不同步
 ]);
 const EXCLUDE_DIR_NAMES = new Set(['node_modules', '.git']);
 const EXCLUDE_PATTERNS = [/\.(bak|log)(~|$)/i, /\.bak-[0-9]/i, /~$/];
