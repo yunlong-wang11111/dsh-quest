@@ -1,5 +1,7 @@
 # dsh-quest
 
+![version](https://img.shields.io/github/v/tag/yunlong-wang11111/dsh-quest?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&sort=semver)
+
 > **多 agent 协作的科研作业系统**——主对话决策、子对话并行执行、进程层跑任务：后台执行、事件驱动监控、自动派发与流转、机器判定验收、署名回执路由，AI 只负责"立项与验收"。
 > A multi-agent orchestration system for research: a decision-making main agent, parallel sub-conversations, and a process lane for jobs — background execution, event-driven monitoring, auto-dispatch, machine-verified acceptance, and signed receipts — while the model only plans and reviews.
 
@@ -260,6 +262,11 @@ env = { QUEST_URL = "http://127.0.0.1:3110" }
 | `off` | — | — | **纯机械模式**：判定、指标提取、超时、重试、通知照常，只是没有 AI 写的总结 |
 
 实测（机械模式）：`python mech_test.py` → `completed | ok | finish-keyword`，loss 指标 `1.5 → 1.05` 自动提取——**全程零模型调用**。
+
+## v0.8.3 新增（2026-09-30，版本更新通知）
+
+- **更新通知**：quest 每日检查一次 GitHub 最新 Release；有新版时 ①`quest_status` 顶部挂提示行（AI 查状态即见、自动转告用户——对所有装机用户生效）②推送走该机器配置的 notify 出口（桥/webhook：Telegram/钉钉/飞书/企微/ntfy 模板见下文）。每版本只推一次（状态文件去重）；`updateCheck:false` 可关；notify off 的环境完全静默
+- ⚠️ 本功能随本版首次分发——**v0.8.3 是最后一版需要"人工知道"的更新**，此后凡升到 ≥0.8.3 的机器，新版本会自动提醒
 
 ## v0.8.2 新增（2026-09-29，实验登记簿+环境指纹）
 
