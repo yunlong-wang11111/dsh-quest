@@ -3295,6 +3295,44 @@ const server = http.createServer(async (req, res) => {
       exps.sort((a, b2) => String(b2.at).localeCompare(String(a.at)));
       return json(200, { ok: true, total: exps.length, experiments: exps.slice(0, limit).map((e) => ({ ...e, env: { interpreter: e.env.interpreter || '', version: e.env.version || '', git: e.env.git ?? null } })) });
     }
+    // ── 研究时间轴（2026-10-01 用户需求："大时间轴进 quest 控制台"）─────────────
+    // 合并三源：实验登记簿(experiments.jsonl) + 账本节点终态 + spawn 记录，
+    // 按时间升序给 dashboard-v2 的时间轴 tab 渲染。任务总揽的正式继任者。
+    if (req.method === 'GET' && u.pathname === '/api/timeline') {
+      const since = Number(u.searchParams.get('since')) || 0; // ms 纪元，0=全部
+      const events = [];
+      // ① 实验登记簿（fold 后的视图：骨架+note 折叠）
+      try {
+        for (const e of foldExps(readExps(wsKey))) {
+          const ts = Date.parse(e.at);
+          if (!Number.isFinite(ts) || ts < since) continue;
+          events.push({ kind: 'exp', at: e.at, ts, exp: e.exp, title: e.title || e.node || '', direction: e.direction || '',
+            hypothesis: e.hypothesis || '', conclusion: e.conclusion || '', metrics: e.metrics || null,
+            command: e.command || '', verdict: e.verdict || '', noteCount: e.noteCount || 0 });
+        }
+      } catch {}
+      // ② 账本节点终态（完成/失败/超时——每根一个时间点）
+      try {
+        const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').split('\n').filter(Boolean);
+        for (const line of raw) {
+          let ev; try { ev = JSON.parse(line); } catch { continue; }
+          if (!['node.completed', 'node.failed', 'node.timeout'].includes(ev.t)) continue;
+          const ts = Date.parse(ev.at);
+          if (!Number.isFinite(ts) || ts < since) continue;
+          events.push({ kind: 'node', at: ev.at, ts, node: ev.node, verdict: ev.verdict || ev.t.split('.')[1] });
+        }
+      } catch {}
+      // ③ spawn 记录（子对话上任）
+      try {
+        for (const sp of buildSpawns(wsKey)) {
+          const ts = Date.parse(sp.startedAt || sp.at || '');
+          if (!Number.isFinite(ts) || ts < since) continue;
+          events.push({ kind: 'spawn', at: sp.startedAt || sp.at, ts, title: sp.title, spawnId: sp.spawnId });
+        }
+      } catch {}
+      events.sort((a, b2) => a.ts - b2.ts);
+      return json(200, { ok: true, total: events.length, events: events.slice(-800) }); // 上限800防大账本撑爆
+    }
     if (req.method === 'POST' && u.pathname === '/api/spawn') {
       const b = await readBody(req);
       const title = String(b.title || '').trim().slice(0, 60);
