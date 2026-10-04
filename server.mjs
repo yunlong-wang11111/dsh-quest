@@ -1218,6 +1218,8 @@ function buildSpawns(wsKey) {
         const s = list.find((x) => x.spawnId === ev.spawnId); if (s) { s.status = 'reported'; s.reportedAt = tsOf(ev.at); }
       } else if (ev.t === 'spawn.overdue' && ev.spawnId) {
         const s = list.find((x) => x.spawnId === ev.spawnId); if (s && s.status === 'running') s.status = 'overdue';
+      } else if (ev.t === 'spawn.closed' && ev.spawnId) {
+        const s = list.find((x) => x.spawnId === ev.spawnId); if (s) { s.status = 'closed'; s.closedAt = tsOf(ev.at); s.closeReason = ev.reason || ''; }
       }
     }
   } catch {}
@@ -1239,6 +1241,26 @@ async function sweepSpawns() {
     let spawns;
     try { spawns = buildSpawns(wsKey); } catch { continue; }
     const late = spawns.filter((s) => s.status === 'running' && s.deadlineAt && Date.now() > s.deadlineAt);
+    // 2026-10-04 自动收单:running/overdue 的 spawn,如果其 DSH 会话已空闲(不在跑)且超过 30 分钟,
+    // 自动 close——子对话干完活但没交简报时,不再永远挂着(用户实测 4 个僵尸 spawn 占屏)。
+    const active = spawns.filter((s) => ['running', 'overdue'].includes(s.status));
+    for (const s of active) {
+      if (!s.sessionId) continue;
+      try {
+        const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+        const api = new NodeApiClient(CFG.dshBaseUrl, 10000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+        const list = await api.sessions.list({});
+        const sess = (list.result?.value?.items || []).find((x) => String(x.sessionId) === String(s.sessionId));
+        if (sess && !sess.running) {
+          // 会话空闲;再看最近更新是否超过 30 分钟
+          const idleMs = Date.now() - (sess.updatedAt || 0);
+          if (idleMs > 30 * 60 * 1000) {
+            appendEvent(wsKey, { t: 'spawn.closed', spawnId: s.spawnId, sessionId: s.sessionId, title: s.title, reason: `自动收单:会话空闲 ${Math.round(idleMs / 60000)} 分钟` });
+            log(`spawn.auto-close ${wsKey}: ${s.title} (${s.spawnId.slice(0, 30)})`);
+          }
+        }
+      } catch {}
+    }
     if (!late.length) continue;
     const state = buildState(wsKey);
     let wsPath = ''; try { wsPath = parsePlan(state.plan || '').meta?.workspace || ''; } catch {}
