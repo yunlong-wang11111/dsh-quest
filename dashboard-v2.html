@@ -102,6 +102,7 @@
 <nav>
   <button data-t="tasks" class="on">任务线</button>
   <button data-t="logs">日志</button>
+  <button data-t="timeline">时间轴</button>
   <button data-t="files">文件</button>
 </nav>
 
@@ -177,6 +178,28 @@
     </div>
     <div id="sparkWrap"></div>
     <pre id="logText">选择一个节点…</pre>
+  </div>
+</section>
+
+<section id="timeline">
+  <!-- ── 研究时间轴（2026-10-01）：实验登记簿 + 节点终态 + 子对话上任，一屏看全局 ── -->
+  <div class="card">
+    <div class="row">
+      <b>研究时间轴</b>
+      <span class="mut" id="tlCount">…</span>
+      <input type="text" id="tlFilter" placeholder="按 direction / 标题 / 结论过滤" style="flex:1;min-width:200px" oninput="renderTimeline()">
+      <select id="tlRange" onchange="loadTimeline()">
+        <option value="0">全部</option>
+        <option value="86400000">24h</option>
+        <option value="604800000">7天</option>
+        <option value="2592000000">30天</option>
+      </select>
+      <span class="mut">● 实验 ○ 节点 ◆ 子对话</span>
+    </div>
+    <div style="position:relative; overflow-x:auto; border:1px solid var(--line); border-radius:8px; background:#0b0e12; min-height:180px; padding:8px">
+      <div id="tlCanvas" style="position:relative; min-width:600px; height:170px"></div>
+    </div>
+    <div id="tlDetail" style="margin-top:8px; display:none; border:1px solid var(--line); border-radius:8px; padding:10px; font-size:12.5px"></div>
   </div>
 </section>
 
@@ -371,6 +394,7 @@ async function loadTasks() {
   renderSpawned(d);
   renderRoute(d);
   loadGate();
+  loadTimeline();
   $('#nodes').innerHTML = nodesCache.map((n) => {
     const canDispatch = ['failed','timeout','cancelled','pending','skipped','ready','frozen'].includes(n.status);
     const canCancel = n.status === 'running';
@@ -814,6 +838,84 @@ async function doConverge() {
     const r = await post('/api/converge?ws=' + encodeURIComponent(curWs), { action: 'toggle' });
     toast(r.ok ? `自动收尾已${r.auto ? '开' : '关'}：${(r.note || '').slice(0, 90)}` : '失败：' + (r.error || ''));
   } catch (e) { toast('请求失败：' + e.message); }
+}
+
+
+// ── 研究时间轴（2026-10-01）：横轴时间、实验/节点/子对话三类事件 ──
+let tlEvents = [];
+async function loadTimeline() {
+  const since = document.getElementById('tlRange').value;
+  const d = await api('/api/timeline?ws=' + encodeURIComponent(curWs) + '&since=' + since);
+  tlEvents = d.ok ? d.events : [];
+  renderTimeline();
+}
+function tlVerdictColor(ev) {
+  if (ev.kind === 'exp') return ev.verdict === 'ok' ? 'var(--ok)' : ev.verdict === '' ? 'var(--dim)' : 'var(--warn)';
+  if (ev.kind === 'node') return ev.verdict === 'ok' ? 'var(--ok)' : 'var(--bad)';
+  return 'var(--acc)';
+}
+function tlDot(ev) {
+  if (ev.kind === 'spawn') return '◆';
+  return ev.kind === 'exp' ? '●' : '○';
+}
+function renderTimeline() {
+  const c = document.getElementById('tlCanvas');
+  const filter = (document.getElementById('tlFilter').value || '').toLowerCase().trim();
+  const evs = tlEvents.filter((e) => {
+    if (!filter) return true;
+    return [e.title, e.direction, e.hypothesis, e.conclusion, e.node, e.exp].join(' ').toLowerCase().includes(filter);
+  });
+  document.getElementById('tlCount').textContent = evs.length + ' 个事件';
+  if (!evs.length) { c.innerHTML = '<span class="mut">暂无事件（跑完任务自动登记）</span>'; return; }
+  const t0 = evs[0].ts, t1 = evs[evs.length - 1].ts || t0 + 1;
+  const span = Math.max(t1 - t0, 1);
+  const H = 160, M = 10;
+  // 按 kind 分泳道
+  const lane = { exp: 0, node: 1, spawn: 2 };
+  let html = '';
+  for (const kind of ['exp', 'node', 'spawn']) {
+    const y = M + lane[kind] * 48 + 12;
+    html += '<div style="position:absolute;left:0;right:0;top:' + y + 'px;height:1px;background:var(--line)"></div>';
+    html += '<span style="position:absolute;left:2px;top:' + (y - 16) + 'px;font-size:10px;color:var(--dim)">' +
+      (kind === 'exp' ? '实验' : kind === 'node' ? '节点' : '子对话') + '</span>';
+  }
+  for (const e of evs) {
+    const x = M + ((e.ts - t0) / span) * 580;
+    const y = M + lane[e.kind] * 48 + 12;
+    const col = tlVerdictColor(e);
+    const label = e.kind === 'exp' ? (e.title || e.exp) : e.kind === 'node' ? (e.node || '') : (e.title || '');
+    html += '<span style="position:absolute;left:' + x + 'px;top:' + (y - 7) + 'px;color:' + col +
+      ';font-size:11px;cursor:pointer" onclick="tlShowDetail(' + tlEvents.indexOf(e) + ')" title="' + String(label).slice(0, 50).replace(/"/g, '&quot;') + '">' + tlDot(e) + '</span>';
+    // 只给 exp 画标签（避免密集），node 和 spawn 纯点
+    if (e.kind === 'exp' && label) {
+      html += '<span style="position:absolute;left:' + (x + 8) + 'px;top:' + (y - 12) + 'px;font-size:10px;color:var(--dim);max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + String(label).slice(0, 14) + '</span>';
+    }
+  }
+  // 时间刻度：起止
+  const fmt = (ts) => new Date(ts).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
+  html += '<span style="position:absolute;left:' + M + 'px;bottom:0;font-size:10px;color:var(--dim)">' + fmt(t0) + '</span>';
+  html += '<span style="position:absolute;right:0;bottom:0;font-size:10px;color:var(--dim)">' + fmt(t1) + '</span>';
+  c.innerHTML = html;
+}
+function tlShowDetail(idx) {
+  const e = tlEvents[idx];
+  const el = document.getElementById('tlDetail');
+  el.style.display = 'block';
+  let rows = '<b>' + (e.title || e.node || e.spawnId || '') + '</b> <span class="mut">' + e.at + '</span>';
+  if (e.kind === 'exp') {
+    rows += '<div style="margin-top:5px">';
+    if (e.direction) rows += '<div>方向：<b>' + e.direction + '</b></div>';
+    if (e.hypothesis) rows += '<div>假设：' + e.hypothesis + '</div>';
+    if (e.metrics) rows += '<div>指标：<code>' + JSON.stringify(e.metrics) + '</code></div>';
+    if (e.conclusion) rows += '<div>结论：' + e.conclusion + '</div>';
+    if (e.command) rows += '<div class="mut mono" style="font-size:11px">' + e.command.slice(0, 120) + '</div>';
+    rows += '</div>';
+  } else if (e.kind === 'node') {
+    rows += '<div class="mut">节点终态：' + e.verdict + '</div>';
+  } else {
+    rows += '<div class="mut">子对话上任：' + (e.spawnId || '') + '</div>';
+  }
+  el.innerHTML = rows;
 }
 
 async function refreshAll() {

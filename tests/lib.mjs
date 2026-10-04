@@ -30,7 +30,7 @@ export async function startSandbox({ name, port, wsDirs = ['ws'], extraConfig = 
     ws[d] = p.replace(/\\/g, '/');
   }
   fs.writeFileSync(path.join(home, 'quest-config.json'), JSON.stringify({
-    port, workerBackend: 'off', fixerBackend: 'off', workersEnabled: false, notify: { kind: 'off' }, ...extraConfig,
+    port, workerBackend: 'off', fixerBackend: 'off', workersEnabled: false, notify: { kind: 'off' }, judge: { graceMs: 0 }, ...extraConfig,
   }, null, 2));
   const proc = spawn(process.execPath, [SERVER, '--home', home, '--port', String(port)], { stdio: ['ignore', 'pipe', 'pipe'] });
   let logText = '';

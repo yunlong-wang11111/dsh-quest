@@ -1081,7 +1081,7 @@ function setupWatch(wsKey, node, job, logFile, pid) {
  * 子进程退出统一收尾：真实 child 的 exit 事件与再认领孤儿的轮询发现共用。
  * code 为 null 表示拿不到退出码（quest 重启后再认领），按退出码 0 走证据判定（关键词/产物），via 里注明。
  */
-function handleNodeExit(wsKey, node, ctx) {
+async function handleNodeExit(wsKey, node, ctx) {
   const { code, timedOut, logFile, startedAt, timeoutMs, job, pid } = ctx;
   job.timers.forEach(clearTimeout); job.timers.forEach(clearInterval); activeJobs.delete(`${wsKey}|${node.id}`);
   if (ctx.out) { try { fs.closeSync(ctx.out); } catch {} }
@@ -1119,6 +1119,24 @@ function handleNodeExit(wsKey, node, ctx) {
     let j;
     try { j = judge(node, codeEff == null ? 0 : codeEff, runSec, logFile); }
     catch (e) { j = { verdict: 'suspect', via: 'judge-error', detail: String(e && e.message || e).slice(0, 200) }; log('判定器异常:', e && e.message); }
+    // 宽限复核（2026-10-01 误报根修）：fire-and-forget 脚本把真活甩后台、自己秒退——
+    // 判定器在退出瞬间查产物必然扑空（实测：TikZ 重编脚本 1s 退出，PNG 还在后台编译，
+    // 连续 4 个节点被误判 suspect 上报打扰）。判据声明了**产物**且首判失败时，等 30s
+    // 让后台活落盘，重新扫一遍再定谳；二翻成功标注 grace，失败维持原判。
+    if (j.verdict === 'suspect' && j.via === 'success-claim-failed') {
+      const claims = parseSuccessClaims(node.success);
+      const graceMs = CFG.judge && Number.isFinite(CFG.judge.graceMs) ? CFG.judge.graceMs : 30000;
+      if (claims.artifacts.length > 0 && graceMs > 0) {
+        await new Promise((r) => setTimeout(r, graceMs));
+        try {
+          const j2 = judge(node, codeEff == null ? 0 : codeEff, runSec, logFile);
+          if (j2.verdict === 'ok') {
+            j = { ...j2, via: `${j2.via}（宽限复核:30s 后产物落盘）` };
+            log(`宽限复核翻案 ${node.id}: 后台产物落盘，suspect→ok`);
+          }
+        } catch {}
+      }
+    }
     if (codeEff == null) j.via = `${j.via}（退出码未知：quest 重启后再认领，日志里也没写 EXIT_CODE）`;
     appendEvent(wsKey, { t: 'node.judged', node: node.id, verdict: j.verdict, via: j.via, file: j.file || undefined, ...(j.detail ? { detail: j.detail } : {}) });
     finishNode(wsKey, node, { ...j, logFile }, codeEff, runSec, startedAt);
@@ -1200,6 +1218,8 @@ function buildSpawns(wsKey) {
         const s = list.find((x) => x.spawnId === ev.spawnId); if (s) { s.status = 'reported'; s.reportedAt = tsOf(ev.at); }
       } else if (ev.t === 'spawn.overdue' && ev.spawnId) {
         const s = list.find((x) => x.spawnId === ev.spawnId); if (s && s.status === 'running') s.status = 'overdue';
+      } else if (ev.t === 'spawn.closed' && ev.spawnId) {
+        const s = list.find((x) => x.spawnId === ev.spawnId); if (s) { s.status = 'closed'; s.closedAt = tsOf(ev.at); s.closeReason = ev.reason || ''; }
       }
     }
   } catch {}
@@ -1221,6 +1241,26 @@ async function sweepSpawns() {
     let spawns;
     try { spawns = buildSpawns(wsKey); } catch { continue; }
     const late = spawns.filter((s) => s.status === 'running' && s.deadlineAt && Date.now() > s.deadlineAt);
+    // 2026-10-04 自动收单:running/overdue 的 spawn,如果其 DSH 会话已空闲(不在跑)且超过 30 分钟,
+    // 自动 close——子对话干完活但没交简报时,不再永远挂着(用户实测 4 个僵尸 spawn 占屏)。
+    const active = spawns.filter((s) => ['running', 'overdue'].includes(s.status));
+    for (const s of active) {
+      if (!s.sessionId) continue;
+      try {
+        const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+        const api = new NodeApiClient(CFG.dshBaseUrl, 10000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+        const list = await api.sessions.list({});
+        const sess = (list.result?.value?.items || []).find((x) => String(x.sessionId) === String(s.sessionId));
+        if (sess && !sess.running) {
+          // 会话空闲;再看最近更新是否超过 30 分钟
+          const idleMs = Date.now() - (sess.updatedAt || 0);
+          if (idleMs > 30 * 60 * 1000) {
+            appendEvent(wsKey, { t: 'spawn.closed', spawnId: s.spawnId, sessionId: s.sessionId, title: s.title, reason: `自动收单:会话空闲 ${Math.round(idleMs / 60000)} 分钟` });
+            log(`spawn.auto-close ${wsKey}: ${s.title} (${s.spawnId.slice(0, 30)})`);
+          }
+        }
+      } catch {}
+    }
     if (!late.length) continue;
     const state = buildState(wsKey);
     let wsPath = ''; try { wsPath = parsePlan(state.plan || '').meta?.workspace || ''; } catch {}
@@ -2341,7 +2381,7 @@ function saveDailyReportState(s) {
 // 与 pocket 面板提示同效,但 quest 是常驻服务:检查 GitHub 最新 release,
 // 发现新版 ①QQ 推一次(每版本只推一次,状态文件去重) ②inbox+status 暴露给 AI。
 // 测试沙箱(notify off)与 updateCheck:false 时完全静默,不发网络请求之外的副作用。
-const QUEST_VERSION = '0.8.3';
+const QUEST_VERSION = '0.8.5';
 const QUEST_REPO = 'yunlong-wang11111/dsh-quest';
 let updateInfo = null; // {current, latest, notified} 挂到 /api/status
 function updateCheckStateFile() { return path.join(HOMEOverride, 'update-check-state.json'); }
@@ -3276,6 +3316,44 @@ const server = http.createServer(async (req, res) => {
       if (q) exps = exps.filter((e) => [e.title, e.command, e.hypothesis, e.conclusion, e.direction, e.node, String(e.metrics ? JSON.stringify(e.metrics) : '')].join(' ').toLowerCase().includes(q));
       exps.sort((a, b2) => String(b2.at).localeCompare(String(a.at)));
       return json(200, { ok: true, total: exps.length, experiments: exps.slice(0, limit).map((e) => ({ ...e, env: { interpreter: e.env.interpreter || '', version: e.env.version || '', git: e.env.git ?? null } })) });
+    }
+    // ── 研究时间轴（2026-10-01 用户需求："大时间轴进 quest 控制台"）─────────────
+    // 合并三源：实验登记簿(experiments.jsonl) + 账本节点终态 + spawn 记录，
+    // 按时间升序给 dashboard-v2 的时间轴 tab 渲染。任务总揽的正式继任者。
+    if (req.method === 'GET' && u.pathname === '/api/timeline') {
+      const since = Number(u.searchParams.get('since')) || 0; // ms 纪元，0=全部
+      const events = [];
+      // ① 实验登记簿（fold 后的视图：骨架+note 折叠）
+      try {
+        for (const e of foldExps(readExps(wsKey))) {
+          const ts = Date.parse(e.at);
+          if (!Number.isFinite(ts) || ts < since) continue;
+          events.push({ kind: 'exp', at: e.at, ts, exp: e.exp, title: e.title || e.node || '', direction: e.direction || '',
+            hypothesis: e.hypothesis || '', conclusion: e.conclusion || '', metrics: e.metrics || null,
+            command: e.command || '', verdict: e.verdict || '', noteCount: e.noteCount || 0 });
+        }
+      } catch {}
+      // ② 账本节点终态（完成/失败/超时——每根一个时间点）
+      try {
+        const raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').split('\n').filter(Boolean);
+        for (const line of raw) {
+          let ev; try { ev = JSON.parse(line); } catch { continue; }
+          if (!['node.completed', 'node.failed', 'node.timeout'].includes(ev.t)) continue;
+          const ts = Date.parse(ev.at);
+          if (!Number.isFinite(ts) || ts < since) continue;
+          events.push({ kind: 'node', at: ev.at, ts, node: ev.node, verdict: ev.verdict || ev.t.split('.')[1] });
+        }
+      } catch {}
+      // ③ spawn 记录（子对话上任）
+      try {
+        for (const sp of buildSpawns(wsKey)) {
+          const ts = Date.parse(sp.startedAt || sp.at || '');
+          if (!Number.isFinite(ts) || ts < since) continue;
+          events.push({ kind: 'spawn', at: sp.startedAt || sp.at, ts, title: sp.title, spawnId: sp.spawnId });
+        }
+      } catch {}
+      events.sort((a, b2) => a.ts - b2.ts);
+      return json(200, { ok: true, total: events.length, events: events.slice(-800) }); // 上限800防大账本撑爆
     }
     if (req.method === 'POST' && u.pathname === '/api/spawn') {
       const b = await readBody(req);
