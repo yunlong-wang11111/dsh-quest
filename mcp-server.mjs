@@ -53,8 +53,8 @@ const server = new McpServer({ name: 'quest', version: '0.6.7' });
 
 server.tool(
   'quest_plan',
-  '写入任务线 plan.md（多节点流水线：依赖链 after、条件分支 when、自动修复 auto_fix、盯梢 watch_rules、WSL 车道 shell、冻结策略 freeze_on）。整体替换当前工作区的计划。若新计划会丢掉旧计划里未完成（非 completed）的节点，服务端会返回 409 并列出是被丢的哪些节点——先确认这是你要的，再带 force:true 重提交；不要把 409 当故障盲目重试。',
-  { markdown: z.string().describe('完整的 plan.md 内容'), ws: z.string().optional().describe('工作区绝对路径'), force: z.boolean().optional().describe('确认丢弃旧计划中未完成的节点（默认 false）') },
+  '写入任务线 plan.md（多节点流水线：依赖链 after、条件分支 when、自动修复 auto_fix、盯梢 watch_rules、WSL 车道 shell、冻结策略 freeze_on）。整体替换当前工作区的计划。若新计划会丢掉旧计划里未完成（非 completed）的节点，服务端会返回 409 并列出是被丢的哪些节点——先确认这是你要的，再带 force:true 重提交；不要把 409 当故障盲目重试。★节点格式（解析器只认这个，散文式 Markdown 会解析出 0 个节点）：每个节点以字面行 ---node: 节点id--- 开头，字段用行首裸 key（不要列表符号/反引号）：command: 完整命令行｜cwd: 工作目录｜success: 判据关键词(纯ASCII)｜expect_minutes: 估时｜after: 上游节点id逗号分隔｜auto_fix: true｜handoff: | 后跟缩进交接(角色/验证什么/指标/产物在哪/坑)。多节点 = 多个 ---node:--- 块。完整模板见 dsh-plugins/quest/PLAN-TEMPLATE.md',
+  { markdown: z.string().describe('完整的 plan.md 内容（含 ---node: id--- 标记块）'), ws: z.string().optional().describe('工作区绝对路径'), force: z.boolean().optional().describe('确认丢弃旧计划中未完成的节点（默认 false）') },
   async ({ markdown, ws, force }) => {
     const r = await q('POST', `/api/plan?ws=${encodeURIComponent(ws || '')}`, { markdown, ...(force === true ? { force: true } : {}) });
     return r.error ? fail(r) : ok(r);

@@ -427,18 +427,41 @@ function judge(node, exitCode, runSec, logFile, startedAtMs = null, endedAtMs = 
     return { verdict: 'crashed', via: 'nonzero-exit' };
   }
   // 产物扫描：一次收集，声明判据与通用兜底共用（原来只有"取最新一个"的用法）
+  // 2026-10-08 M1：有限深度递归（judge.scanDepth，默认 2）。旧版只扫 6 个固定目录的
+  // 第一层，产物落在 <cwd>/子项目/out/xxx（两层）时全数漏扫 ⇒ no-output / success-
+  // claim-failed 大面积误报（实测某工作区 839/1519 节点 suspect 的主要来源）。
+  // 深度 2 = 根目录文件 + 一级子目录文件 + 二级子目录文件（<cwd>/aic_race/out/x 命中）。
   const dirs = node.shell === 'wsl'
     ? [node.cwd, `${node.cwd}/out`, `${node.cwd}/logs`, `${node.cwd}/output`, `${node.cwd}/results`, `${node.cwd}/runs`].filter(Boolean).map(hostPathFor)
     : [node.cwd, path.join(node.cwd, 'out'), path.join(node.cwd, 'logs'), path.join(node.cwd, 'output'), path.join(node.cwd, 'results'), path.join(node.cwd, 'runs')];
   const artifacts = [];
-  for (const d of dirs) {
-    let entries; try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
-    for (const en of entries) {
-      if (!en.isFile()) continue;
-      const lower = en.name.toLowerCase();
-      if (QUEST_OWN_FILES.has(lower)) continue; // quest 台账不算产物
-      if (![...TEXT_EXTS, ...ARTIFACT_EXTS].some((x) => lower.endsWith(x))) continue;
-      try { const f = path.join(d, en.name); artifacts.push({ name: en.name, file: f, mtimeMs: fs.statSync(f).mtimeMs }); } catch {}
+  {
+    const SCAN_DEPTH = Math.max(0, Number(CFG.judge?.scanDepth ?? 2));
+    const SCAN_MAX_FILES = 4000;              // 总条目预算：防大仓库把判定拖慢
+    const SCAN_SKIP_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'venv', '.dsh', 'archive']);
+    const seenDirs = new Set();
+    let budget = SCAN_MAX_FILES;
+    for (const d of dirs) {
+      const queue = [{ dir: d, depth: 0 }];
+      while (queue.length && budget > 0) {
+        const { dir, depth } = queue.shift();
+        let dk; try { dk = path.resolve(dir); } catch { continue; }
+        if (seenDirs.has(dk)) continue;       // 根集合有包含关系时（cwd ⊃ out/…）只扫一次
+        seenDirs.add(dk);
+        let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+        for (const en of entries) {
+          if (en.isFile()) {
+            const lower = en.name.toLowerCase();
+            if (QUEST_OWN_FILES.has(lower)) continue; // quest 台账不算产物
+            if (![...TEXT_EXTS, ...ARTIFACT_EXTS].some((x) => lower.endsWith(x))) continue;
+            try { const f = path.join(dir, en.name); artifacts.push({ name: en.name, file: f, mtimeMs: fs.statSync(f).mtimeMs }); } catch {}
+            if (--budget <= 0) break;
+          } else if (en.isDirectory() && depth < SCAN_DEPTH) {
+            if (en.name.startsWith('.') || SCAN_SKIP_DIRS.has(en.name)) continue;
+            queue.push({ dir: path.join(dir, en.name), depth: depth + 1 });
+          }
+        }
+      }
     }
   }
   // startMs = 本次运行的起点。+2s 容文件系统时间戳粒度（快任务 runSec 舍入到 0 时避免自竞争）。
@@ -448,6 +471,15 @@ function judge(node, exitCode, runSec, logFile, startedAtMs = null, endedAtMs = 
   // 不设上界的话，后来别的运行产出的同名文件会满足老节点的判据 → 把被杀掉的任务也翻成成功（假阳性）。
   const endMs = endedAtMs != null ? endedAtMs + 120000 : Infinity;
   const tailLc = (logFile ? readTail(logFile, 4096) : '').toLowerCase();
+
+  // ⓪ 设计内中止（2026-10-08 三件套之二）：脚本自检主动早退（stdout 打 *_ABORTED / *_GEOM_BAD /
+  // FAILFAST: 标记行——手册既有惯例 S23_ABORTED/V5_GEOM_BAD/SIMLIB_GEOM_BAD）是设计内行为。
+  // 判 'aborted' 终态：不算 suspect、不触发修复器、不走产物宽限复核——此前被混进
+  // success-claim-failed 污染 suspect 信号（用户 2026-10-07 反馈"自检主动中止被判 suspect"）。
+  {
+    const mAb = tailLc.match(/(?:^|\n)[ \t]*(?:failfast[ \t]*[:\uff1a]|[a-z][a-z0-9_]*_(?:aborted|geom_bad))(?=[ \t]*[:\uff1a \r\n]|$)[^\n]*/);
+    if (mAb) return { verdict: 'aborted', via: 'fail-fast', detail: mAb[0].trim().slice(0, 140) };
+  }
 
   // ① 节点自己声明的成功判据优先（plan 的 success: 字段）——AI 写下的硬约定压过通用关键词表。
   //    声明了判据却没满足 → suspect（不是 failed）：可能只是没达到预期，交给人/AI 判。
@@ -1410,15 +1442,13 @@ async function maybeNotifyFailure(wsKey, node, j, summary) {
         sid = String(cand.reduce((a, c) => (Number(c.updatedAt || 0) >= Number(a.updatedAt || 0) ? c : a), cand[0]).sessionId);
       }
     }
-    await api.sessions.prompt({
-      sessionId: sid, mode: 'queue',
-      content: [{ type: 'text', text: [
-        `❌【失败上报】节点 ${node.id} 判定 ${j.verdict}（${j.via || '无判定路径'}）${runSecText(j)}`,
-        String(summary || j.detail || '').slice(0, 200) || '（无摘要）',
-        '详情：quest_log 读该节点日志尾；判据/产物情况见 quest_status。',
-        by ? '你是本节点的派发者：定位修复后 quest_dispatch 重派。' : '如果你是派发者：定位修复后 quest_dispatch 重派；与本线无关请忽略本消息。',
-      ].join('\n') }],
-    });
+    // 2026-10-08 三件套之一：失败上报同走合并窗口
+    queueReceiptPrompt(wsKey, sid, [
+      `❌【失败上报】节点 ${node.id} 判定 ${j.verdict}（${j.via || '无判定路径'}）${runSecText(j)}`,
+      String(summary || j.detail || '').slice(0, 200) || '（无摘要）',
+      '详情：quest_log 读该节点日志尾；判据/产物情况见 quest_status。',
+      by ? '你是本节点的派发者：定位修复后 quest_dispatch 重派。' : '如果你是派发者：定位修复后 quest_dispatch 重派；与本线无关请忽略本消息。',
+    ].join('\n'));
     appendEvent(wsKey, { t: 'notify.escalate', node: node.id, verdict: j.verdict, sessionId: sid, dispatchedBy: by || undefined });
     log(`notify.escalate ${wsKey}: ${node.id} → ${sid}`);
   } catch (e) {
@@ -1466,6 +1496,130 @@ function lastMeaningfulLine(tailText) {
   return (lines[lines.length - 1] || '').slice(0, 160);
 }
 
+// ── 回执合并（2026-10-08 三件套之一）────────────────────────────────────────
+// 用户反馈：一大批 verdict ok/no-checkpoint/suspect 每条都占主对话一轮上下文。
+// 规则：同一目标会话的回执/失败上报攒进 90s 窗口，满批 12 条立即冲刷；
+// 单条 = 原文照发；多条 = 合并摘要（各类计数 + 每条首行 180 字）。quest 重启会丢
+// 未冲刷批次（可接受：账本是真相源，回执只是通知）。
+const receiptBuf = new Map();   // `${wsKey}|${sid}` -> { items: [], timer }
+function queueReceiptPrompt(wsKey, sid, line) {
+  if (!sid || !line) return;
+  // 2026-10-08（审核会话遗留⑥收口）：窗口认配置 notify.receiptBatchSec（默认 90s，显式 0=立即发）——
+  // 与 QQ 侧的 notify.failureBatchSec（batchFailPush 用）分工互不干扰。
+  const winRaw = Number(CFG.notify?.receiptBatchSec);
+  const win = Number.isFinite(winRaw) && winRaw >= 0 ? winRaw : 90;
+  if (win === 0) { flushSingleReceipt(wsKey, sid, line); return; }
+  const key = wsKey + '|' + sid;
+  let b = receiptBuf.get(key);
+  if (!b) { b = { items: [], timer: null }; receiptBuf.set(key, b); }
+  b.items.push(String(line));
+  if (!b.timer) b.timer = setTimeout(() => { flushReceipts(key).catch(() => {}); }, win * 1000);
+  if (b.items.length >= 12) flushReceipts(key).catch(() => {});
+}
+async function flushSingleReceipt(wsKey, sid, line) {
+  try {
+    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+    const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    await api.sessions.prompt({ sessionId: sid, mode: 'queue', content: [{ type: 'text', text: line + roleTail(wsKey, sid) }] });
+  } catch (e) { log('回执直发失败:', e?.message); }
+}
+async function flushReceipts(key) {
+  const b = receiptBuf.get(key);
+  if (!b) return;
+  receiptBuf.delete(key);
+  if (b.timer) clearTimeout(b.timer);
+  const barI = key.indexOf('|');
+  const wsKey = key.slice(0, barI), sid = key.slice(barI + 1);
+  let text;
+  if (b.items.length === 1) {
+    text = b.items[0];
+  } else {
+    const counts = {};
+    for (const s of b.items) { const c = [...s][0]; counts[c] = (counts[c] || 0) + 1; }
+    const parts = [];
+    if (counts['\u2705']) parts.push(`完成 ${counts['\u2705']}`);
+    if (counts['\u274c']) parts.push(`失败 ${counts['\u274c']}`);
+    if (counts['\ud83d\udee0'] || counts['\ud83d\udd27']) parts.push(`修复中 ${(counts['\ud83d\udee0'] || 0) + (counts['\ud83d\udd27'] || 0)}`);
+    const known = ['\u2705', '\u274c', '\ud83d\udee0', '\ud83d\udd27'];
+    const otherN = Object.entries(counts).filter(([c]) => !known.includes(c)).reduce((a, [, n]) => a + n, 0);
+    if (otherN) parts.push(`其它 ${otherN}`);
+    text = `\ud83d\udccb【回执·合并 ${b.items.length} 条】${parts.join(' · ')}\n`
+      + b.items.map((s) => '- ' + s.split('\n')[0].slice(0, 180)).join('\n')
+      + '\n详情：quest_log 读各节点日志尾；全景 quest_status。';
+  }
+  text += roleTail(wsKey, sid);
+  try {
+    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+    const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    await api.sessions.prompt({ sessionId: sid, mode: 'queue', content: [{ type: 'text', text }] });
+  } catch (e) { log('回执合并投递失败:', e?.message); }
+}
+
+// ── 同脚本并发锁（2026-10-08 三件套之三）────────────────────────────────────
+// §5.18 事故：两个会话同时派同一脚本，"先删后写"空窗互踩（s28_3d.csv 被并发覆盖）。
+// 键 = 命令里第一个 .py 路径（与预检同款正则）；无 .py 用整串前 120 字符。
+// 限制（明示）：内存锁，quest 重启即清——重启后仍在跑的孤儿不识别（可接受，steady-state 并发才是主场景）。
+const scriptLocks = new Map();  // wsKey -> Map(scriptKey -> { node, startedAt })
+function scriptKeyOf(cmd) {
+  const m = String(cmd || '').match(/\b[\w./\\:-]+\.py\b/);
+  if (m && m[0]) return m[0].toLowerCase().replace(/\\/g, '/');
+  return String(cmd || '').slice(0, 120).toLowerCase();
+}
+
+// ── 连败熔断（2026-10-08 M3）：同前缀 quick 连续 startup/prefailure 失败 ≥N → 拒单 ──
+// 背景：FH1i v3~v6、ESP32 编译系都是 5 连 startup-failed——派发端每次换个新节点 id 盲试，
+// fixBudget 管不到（新节点预算重置），每败一条还吃一串回执。规则：quick-<title>-<ts36>
+// 去掉时间戳尾巴取前缀，账本窗口内该前缀连续 startup-failed / preflight-failed ≥ 阈值
+// （judge.startupStrike，默认 3，<2 关闭）即拒；中间出现任何 ok/crashed/aborted/timeout
+// 终态即断链重计。suspect 不计数也不断链（记账层信号，两可）。
+function startupStrike(wsKey, node) {
+  const N = Number(CFG.judge?.startupStrike ?? 3);
+  if (N < 2) return null;
+  const WIN = Number(CFG.judge?.startupStrikeMin ?? 30) * 60 * 1000;
+  const pref = String(node.id || '').slice(0, String(node.id || '').lastIndexOf('-'));
+  if (!pref) return null;
+  let raw;
+  try { raw = fs.readFileSync(path.join(dirOf(wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n'); } catch { return null; }
+  let strikes = 0; let lastWhy = '';
+  const cutoff = Date.now() - WIN;
+  for (let i = raw.length - 1; i >= 0 && i >= raw.length - 4000; i--) {
+    let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+    const at = Date.parse(ev.at || '') || 0;
+    if (at && at < cutoff) break;                       // 倒扫出窗口即停
+    if (!ev.node || !String(ev.node).startsWith(pref)) continue;
+    if (ev.t === 'node.judged') {
+      if (ev.verdict === 'startup-failed') { strikes++; if (!lastWhy) lastWhy = ev.via || ''; }
+      else if (ev.verdict && ev.verdict !== 'suspect') return null;  // ok/crashed/aborted/… 断链
+    } else if (ev.t === 'node.preflight-failed') {
+      strikes++; if (!lastWhy) lastWhy = String(ev.error || '').slice(0, 80);
+    }
+  }
+  return strikes >= N ? { n: strikes, why: lastWhy } : null;
+}
+
+function checkScriptLock(wsKey, cmd, ownNode) {
+  const m = scriptLocks.get(wsKey);
+  if (!m) return null;
+  const k = scriptKeyOf(cmd);
+  const cur = m.get(k);
+  if (cur && cur.node !== ownNode) {
+    // 陈旧锁兜底：取消/异常路径漏释放时，6 小时后自动失效（长任务 expectMinutes 也能对上）
+    if (Date.now() - cur.startedAt > 6 * 3600 * 1000) { m.delete(k); return null; }
+    return { held: cur, key: k };
+  }
+  return null;
+}
+function acquireScriptLock(wsKey, nodeId, cmd) {
+  let m = scriptLocks.get(wsKey);
+  if (!m) { m = new Map(); scriptLocks.set(wsKey, m); }
+  m.set(scriptKeyOf(cmd), { node: nodeId, startedAt: Date.now() });
+}
+function releaseScriptLock(wsKey, nodeId) {
+  const m = scriptLocks.get(wsKey);
+  if (!m) return;
+  for (const [k, v] of m) if (v.node === nodeId) m.delete(k);
+}
+
 async function maybeNotifyReceipt(wsKey, nodeId, runSec, summary) {
   let by = '';
   let isQuick = false;
@@ -1492,12 +1646,8 @@ async function maybeNotifyReceipt(wsKey, nodeId, runSec, summary) {
     by = mainSid; via = 'main-fallback';
   }
   try {
-    const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
-    const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
-    await api.sessions.prompt({
-      sessionId: by, mode: 'queue',
-      content: [{ type: 'text', text: `✅【回执】节点 ${nodeId} 完成（${runSec != null ? Math.max(1, Math.round(runSec / 60)) + ' 分钟' : '时长未知'}）。${String(summary || '').split('\n')[0].slice(0, 150)}\n接下一步；产物/日志 quest_log，全景 quest_status。${via === 'main-fallback' ? '\n（本任务派发时未记录署名——QQ 桥派发或插件未升级；按兜底规则回执给主对话。）' : ''}${roleTail(wsKey, by)}` }],
-    });
+    // 2026-10-08 三件套之一：改走 90s 合并窗口（多条同类回执不再逐条轰炸主对话上下文）
+    queueReceiptPrompt(wsKey, by, `✅【回执】节点 ${nodeId} 完成（${runSec != null ? Math.max(1, Math.round(runSec / 60)) + ' 分钟' : '时长未知'}）。${String(summary || '').split('\n')[0].slice(0, 150)}${via === 'main-fallback' ? '\n（本任务派发时未记录署名——QQ 桥派发或插件未升级；按兜底规则回执给主对话。）' : ''}`);
     appendEvent(wsKey, { t: 'notify.receipt', node: nodeId, sessionId: by, via });
     log(`notify.receipt ${wsKey}: ${nodeId} → ${String(by).slice(8, 16)}${via === 'main-fallback' ? '（兜底）' : ''}`);
   } catch (e) {
@@ -1554,6 +1704,7 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
     try { summary = await runWorker(wsKey, node, j, runSec); } catch (e) { log('worker 失败:', e.message); }
   }
   const ok = j.verdict === 'ok';
+  releaseScriptLock(wsKey, node.id);   // 2026-10-08 三件套之三：任何终态都释放同脚本锁
   try { appendEvent(wsKey, { t: ok ? 'node.completed' : 'node.failed', node: node.id, verdict: j.verdict }); } catch (e) { log('落账本失败:', e?.message); }
   // 实验登记簿（2026-09-29 #1/#2）：终态自动落一条骨架（含环境指纹），假设/指标/结论
   // 由 agent 用 quest_exp_log 补记。fire-and-forget + 全容错——登记失败不影响节点收尾。
@@ -1578,7 +1729,8 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   // 依赖编排：成功续链 / 失败冻结下游 / 全线落定推收尾铃
   orchestrate(wsKey).catch(() => {});
   // WA 触发器：失败 + 节点声明 auto_fix + 预算未烧完 → 修复会话（最小修复+备份+重派）
-  if (!ok && node.autoFix) {
+  // 2026-10-08 三件套之二：aborted = 设计内中止（自检早退），不是故障——不修、不报失败链
+  if (!ok && j.verdict !== 'aborted' && node.autoFix) {
     // 2026-09-23（三件"静默失败"复盘）：auto_fix 接手会跳过即时失败上报（防修复中重复打扰），
     // 但派发者至少要知道"已被接手"——否则像今早那样：失败被吸收、修复又当场崩，
     // 两头无消息，派发者以为任务凭空消失。给署名派发者发一行接手回执（不设冷却，同点名回执制）。
@@ -2381,7 +2533,7 @@ function saveDailyReportState(s) {
 // 与 pocket 面板提示同效,但 quest 是常驻服务:检查 GitHub 最新 release,
 // 发现新版 ①QQ 推一次(每版本只推一次,状态文件去重) ②inbox+status 暴露给 AI。
 // 测试沙箱(notify off)与 updateCheck:false 时完全静默,不发网络请求之外的副作用。
-const QUEST_VERSION = '0.8.4';
+const QUEST_VERSION = '0.8.5';
 const QUEST_REPO = 'yunlong-wang11111/dsh-quest';
 let updateInfo = null; // {current, latest, notified} 挂到 /api/status
 function updateCheckStateFile() { return path.join(HOMEOverride, 'update-check-state.json'); }
@@ -2875,6 +3027,7 @@ async function launchQuickRun(wsKey, node, extra = {}) {
     }
   } catch {}
   appendEvent(wsKey, { t: 'plan.created', nodes: [node.id] });
+  acquireScriptLock(wsKey, node.id, node.command);   // 三件套之三：真正起跑才占锁（/api/run 已预检冲突）
   // 记下真正执行的命令：quick 节点不在 plan.md 里，账本若只留 id，事后无法审计或复现
   // （2026-09-14「假崩溃」事故里，第一件想确认的就是"我们到底把什么命令发出去了"）
   appendEvent(wsKey, {
@@ -3082,6 +3235,11 @@ const server = http.createServer(async (req, res) => {
       // **只警告不拦**——当天实测"plan 三个脚本都不存在，建好了却派不了"，写入时提醒比派发时
       // 才发现省一整轮。并行跑、总预算 ~20s（复用派发预检 preflight()，含车道判断）。
       const warnings = [];
+      // 2026-10-08 修（"计划已写入(3节点)"实为 0 节点事故）：解析出 0 节点时大声警告——
+      // 散文式 Markdown(### 标题 + 列表项)解析不出任何节点，写入只落了元信息，派发无从下手。
+      if (!parsed.nodes.length && String(body.markdown || '').length > 100) {
+        warnings.push('⚠️ 解析出 0 个节点！节点必须以字面行 ---node: 节点id--- 开头，字段用行首裸 key（command: / cwd: / success: / after: / handoff: |），不要 Markdown 标题或列表符号。当前写入只有背景文字、没有任何可派发节点——请按此格式重写再提交。');
+      }
       try {
         const pyNodes = parsed.nodes.filter((n) => /\b[\w./\\:-]+\.py\b/.test(n.command)).slice(0, 6);
         if (pyNodes.length) {
@@ -3156,6 +3314,24 @@ const server = http.createServer(async (req, res) => {
         shell: b.shell === 'wsl' ? 'wsl' : 'windows',
       };
       const wsKey2 = wsKeyOf(b.cwd);
+      // 2026-10-08 三件套之三：同脚本并发预检——同一脚本已在跑就拒单
+      // （§5.18 事故：两会话并发同脚本，"先删后写"空窗互踩产物 + 重复回执）。
+      const lockHit = checkScriptLock(wsKey2, node.command, node.id);
+      if (lockHit) {
+        return json(200, {
+          ok: false,
+          error: `同脚本已在跑：${lockHit.held.node}（${lockHit.key}，起于 ${new Date(lockHit.held.startedAt).toTimeString().slice(0, 5)}）。已拒绝并发派发——等它完成（quest_status 看 running），或给本任务换产物文件名/加区分参数后重试。`,
+        });
+      }
+      // 2026-10-08 M3：连败熔断——同前缀 quick 在窗口内连续 startup/preflight 失败 ≥ 阈值即拒单，
+      // 提示派发端先探针复现、排查命令写法（车道/中文路径被预检截断/-c 内联不可静态审查）。
+      const strike = startupStrike(wsKey2, node);
+      if (strike) {
+        return json(200, {
+          ok: false,
+          error: `连败熔断：同前缀节点最近 ${CFG.judge?.startupStrikeMin ?? 30} 分钟已连续 ${strike.n} 次 startup/preflight 失败（最近一次：${strike.why || 'startup-failed'}）。继续盲试只会产出同样的秒败回执——请先用 quest_probe 复现命令排查写法（车道 shell 与路径匹配、路径含中文会被预检截断、-c 内联不可静态审查），确认能跑通再派。阈值可调：quest-config.json 的 judge.startupStrike / startupStrikeMin。`,
+        });
+      }
       const cls = runGateCfg.enabled === false ? { level: 'ok' } : classifyRunCommand(node.command, node.cwd);
       if (cls.level !== 'ok') {
         const night = tryNightSelfApprove(wsKey2, node, b);
@@ -3371,7 +3547,7 @@ const server = http.createServer(async (req, res) => {
       const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
       const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
       try {
-        const created = await api.sessions.create({ cwd: hostPathFor(wsPath) || wsPath });
+        const created = await api.sessions.create({ cwd: hostPathFor(wsPath) || wsPath, agentPreset: 'quest-worker' });
         if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 160));
         const sid = created.result.value.sessionId;
         // 种子提示：身份 + 交接 + 纪律 + 简报契约（有界返回）。写作口径与 PLAN-TEMPLATE 一致。
@@ -3446,8 +3622,10 @@ const server = http.createServer(async (req, res) => {
         log(`spawn.reported ${wsKey}: ${sp.spawnId}${routed ? '' : '（未能投递派发者，仅留痕）'}`);
         return json(200, { ok: routed, note: routed ? '简报已交回派发者。你的任务到此为止——停在这里，等派发者/用户来找。' : '简报已入账本，但派发者会话不可达；你的任务到此为止。' });
       }
+      // 2026-10-06 加强防漏：如果 caller 不在活跃 spawn 列表但也不等于 mainSid，拒绝点名。
+      // 之前有子对话漏网(activeSpawnOf 匹配失败)直接触达用户。
       const mainSid = loadConvergeState()[wsKey]?.mainSessionId || '';
-      if (mainSid && caller && caller !== mainSid) {
+      if (caller && mainSid && caller !== mainSid) {
         return json(200, { ok: false, error: `你是子对话（${caller.slice(8, 16)}…），不是本工作区的主对话（${mainSid.slice(8, 16)}…）。规矩：子对话把结果/总结交回主对话（用 DSH 的 send_message 发给它，或写进工作区文件并在你的收尾消息里说明），由主对话筛选后统一通知用户。` });
       }
       const cdMs = Math.max(5, Number(CFG.notify?.userPingCooldownSec) || 600) * 1000;   // 默认 10 分钟/工作区
@@ -3926,6 +4104,15 @@ const server = http.createServer(async (req, res) => {
       if (!node) return json(404, { ok: false, error: `节点 ${body.node} 不在当前 plan.md 里` });
       const st = state.nodes[node.id]?.status;
       if (st === 'running') return json(409, { ok: false, error: '该节点已在运行' });
+      // 2026-10-08 三件套之三：同脚本并发锁（plan 节点派发同受约束）
+      const lockHit2 = checkScriptLock(wsKey, node.command, node.id);
+      if (lockHit2) {
+        return json(409, {
+          ok: false,
+          error: `同脚本已在跑：${lockHit2.held.node}（${lockHit2.key}）。已拒绝并发派发——等它完成或调整产物命名后重试。`,
+        });
+      }
+      acquireScriptLock(wsKey, node.id, node.command);
       // 2026-09-09：显式派发冻结节点 = 人工解冻（重派上游后下游自动复活）。
       // 解冻自身 + 沿 after 边可达的所有冻结后代。
       if (st === 'frozen' || st === 'ready' || st === 'failed' || st === 'timeout') {
