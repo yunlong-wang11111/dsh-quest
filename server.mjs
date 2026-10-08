@@ -1691,7 +1691,10 @@ function batchFailPush(wsKey, icon, text) {
     }
     const lines = cur.items.slice(0, 10).map((it, i) => `${i + 1}. ${it.text.split('\n')[0].slice(0, 130)}`);
     const more = cur.items.length > 10 ? `\n…共 ${cur.items.length} 个` : '';
-    qqPush(wsKey, `[❌ 失败汇总·${cur.items.length} 个节点（${win}s 窗口聚合，防刷屏限流）]\n${lines.join('\n')}${more}\n逐个排查用 quest_log；全景与判据见 quest_status。`.slice(0, 800)).catch((e) => log('qqPush 异常:', e?.message));
+    // 2026-10-08 修（GV2 四连败强推用户事故）：聚合汇总原来直调 qqPush 绕过了 nodeEvents 总闸——
+    // failureBatchSec=0 时代此路径死路没人发现；审核会话恢复 45s 聚合后漏洞激活：
+    // 单条失败被闸门静音、多条聚合反而强推。改走 nodeEventPush(带闸)。
+    nodeEventPush(wsKey, `[❌ 失败汇总·${cur.items.length} 个节点（${win}s 窗口聚合，防刷屏限流）]\n${lines.join('\n')}${more}\n逐个排查用 quest_log；全景与判据见 quest_status。`.slice(0, 800));
     try { appendEvent(wsKey, { t: 'notify.fail-batch', count: cur.items.length }); } catch {}
   }, win * 1000);
   if (b.timer.unref) b.timer.unref();
