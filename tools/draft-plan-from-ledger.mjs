@@ -7,7 +7,7 @@
 // 你/AI 只要补上 `after:` 依赖与 `success:` 判据再提交即可。
 //
 // 用法：
-//   node tools/draft-plan-from-ledger.mjs "C:/Users/Solanine/Desktop/V8/code_kl"            # 打到屏幕
+//   node tools/draft-plan-from-ledger.mjs "__HOME__/Desktop/V8/code_kl"            # 打到屏幕
 //   node tools/draft-plan-from-ledger.mjs <ws> --last 12 --out draft.md                      # 写文件
 //   node tools/draft-plan-from-ledger.mjs <ws> --title "R3+R4 复盘" --last 6
 // 只读账本，不碰 plan.md、不调服务；起草结果要不要用由你决定。
