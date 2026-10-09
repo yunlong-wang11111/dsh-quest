@@ -3014,7 +3014,11 @@ function classifyRunCommand(command, cwd) {
     // 引用了工作区外的绝对路径（解释器本体除外）→ 提级确认
     const norm = (p) => String(p).replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
     const wsNorm = norm(cwd);
-    const outside = (cmd.match(/[a-z]:[\\\/][^\s"]+/ig) || []).filter((p) => !INTERPRETER_RE.test(p.split(/[\\\/]/).pop()) && !norm(p).startsWith(wsNorm));
+    // 2026-10-09 修（COMSOL/ABAQUS 探针连环确认）：runGate.trustedOutsideDirs 配置的
+    // 工作区外目录视为可信（本机 scratch 区:D:\comsol_work / D:\temp\abaqus_batch——
+    // 手册规定的产物根，脚本在那儿是常态而非越权）。
+    const trustedOut = (CFG.runGate?.trustedOutsideDirs || []).map(norm);
+    const outside = (cmd.match(/[a-z]:[\\\/][^\s"]+/ig) || []).filter((p) => !INTERPRETER_RE.test(p.split(/[\\\/]/).pop()) && !norm(p).startsWith(wsNorm) && !trustedOut.some((t) => norm(p).startsWith(t)));
     if (outside.length) return { level: 'confirm', why: `引用工作区外路径：${outside[0]}` };
     return { level: 'ok' };
   }
