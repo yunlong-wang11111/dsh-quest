@@ -2567,6 +2567,62 @@ async function checkQuestUpdate() {
     log(`发现新版本 v${latest}(当前 v${QUEST_VERSION}),已通知`);
   } catch (e) { /* 网络失败静默——更新检查是锦上添花,绝不影响主流程 */ }
 }
+/** 复核结果回流（2026-10-09 用户需求："GLM 回信能自动唤醒 DSH 吗"）：
+ *  巡检扫各工作区 review-queue 下各包的 verdict.json，新 verdict（2 小时内落盘且未通知过）
+ *  → 摘要投给该工作区主对话（复用晨报同款唤醒管道）；FAIL 额外推 owner QQ。
+ *  去重靠账本 review.notified 事件（按 包名+verdict mtime）。 */
+async function sweepReviewVerdicts() {
+  let wl;
+  try { wl = await questWorkspacesList(); } catch { return; }
+  for (const w of (wl?.workspaces || []).filter((x) => !x.junk)) {
+    try {
+      if (!w.workspace) continue;
+      const wsRq = path.join(String(w.workspace), 'review-queue');
+      if (!fs.existsSync(wsRq)) continue;
+      const noted = new Set();
+      try {
+        const raw = fs.readFileSync(path.join(dirOf(w.wsKey), 'ledger.jsonl'), 'utf8').trim().split('\n');
+        for (let i = raw.length - 1; i >= 0; i--) {
+          let ev; try { ev = JSON.parse(raw[i]); } catch { continue; }
+          if (ev.t === 'review.notified') { noted.add(ev.pkg + '@' + ev.mtime); }
+          if (noted.size > 50) break;
+        }
+      } catch {}
+      for (const ent of fs.readdirSync(wsRq, { withFileTypes: true })) {
+        if (!ent.isDirectory()) continue;
+        const vp = path.join(wsRq, ent.name, 'verdict.json');
+        if (!fs.existsSync(vp)) continue;
+        const st = fs.statSync(vp);
+        const mkey = ent.name + '@' + Math.floor(st.mtimeMs / 1000);
+        if (noted.has(mkey)) continue;
+        if (Date.now() - st.mtimeMs > 2 * 3600 * 1000) {   // 只回流新鲜 verdict;老的(如首批)静默补记
+          appendEvent(w.wsKey, { t: 'review.notified', pkg: ent.name, mtime: Math.floor(st.mtimeMs / 1000), skip: 'stale' });
+          continue;
+        }
+        let v = {}; try { v = JSON.parse(fs.readFileSync(vp, 'utf8')); } catch { continue; }
+        const isFail = String(v.verdict || '').toUpperCase() === 'FAIL';
+        const digest = [
+          `📋【复核结果回流】${ent.name}`,
+          `verdict: ${v.verdict || '?'} · method: ${v.method || '?'}${isFail ? '  ⚠️ FAIL——按约定需修正后重审' : ''}`,
+          String(v.method_detail || '').split('\n')[0].slice(0, 120),
+          `详情: review-queue/${ent.name}/verdict.json`,
+        ].join('\n');
+        const mainSid = loadConvergeState()[w.wsKey]?.mainSessionId || '';
+        if (mainSid) {
+          try {
+            const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+            const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+            await api.sessions.prompt({ sessionId: mainSid, mode: 'queue', content: [{ type: 'text', text: digest + roleTail(w.wsKey, mainSid) }] });
+          } catch (e) { log('review 回流投递失败:', e?.message); }
+        }
+        if (isFail) qqPush(w.wsKey, digest.slice(0, 500)).catch(() => {});
+        appendEvent(w.wsKey, { t: 'review.notified', pkg: ent.name, mtime: Math.floor(st.mtimeMs / 1000), verdict: v.verdict || '?', to: mainSid || undefined });
+        log(`review.notified ${w.wsKey}: ${ent.name} (${v.verdict})`);
+      }
+    } catch {}
+  }
+}
+
 function maybeDailyReport() {
   const cfgD = CFG.notify?.dailyReport;
   if (!cfgD || cfgD.enabled === false) return;
@@ -2851,7 +2907,7 @@ setInterval(async () => {
 // 启动时立刻刷一次会话缓存（2026-09-21）：QQ 通知要把会话显示成"标题"（sessionLabel），
 // 靠巡检的 60s 周期太晚——首条通知会退回十六进制短 ID（用户实测："和乱码没啥区别"）。
 refreshDshSessions().catch(() => {});
-setInterval(() => { try { sweepQuiet(); } catch (e) { log('sweepQuiet 异常:', e?.message); } try { maybeDailyReport(); } catch (e) { log('daily-report 检查异常:', e?.message); } try { sweepSpawns().catch((e) => log('sweepSpawns 异常:', e?.message)); } catch (e) { log('sweepSpawns 异常:', e?.message); } }, Math.max(5, Number(CFG.sweepSeconds ?? 60)) * 1000);
+setInterval(() => { try { sweepQuiet(); } catch (e) { log('sweepQuiet 异常:', e?.message); } try { maybeDailyReport(); } catch (e) { log('daily-report 检查异常:', e?.message); } try { sweepSpawns().catch((e) => log('sweepSpawns 异常:', e?.message)); } catch (e) { log('sweepSpawns 异常:', e?.message); } try { sweepReviewVerdicts().catch((e) => log('sweepReviewVerdicts 异常:', e?.message)); } catch (e) { log('sweepReviewVerdicts 异常:', e?.message); } }, Math.max(5, Number(CFG.sweepSeconds ?? 60)) * 1000);
 
 // 版本更新检查:启动 3 分钟后首查,之后每 24h 一次(错峰避开启动风暴)
 setTimeout(() => { checkQuestUpdate().catch(() => {}); }, 3 * 60 * 1000);
