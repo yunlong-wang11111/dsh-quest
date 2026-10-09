@@ -1280,7 +1280,7 @@ async function sweepSpawns() {
       if (!s.sessionId) continue;
       try {
         const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
-        const api = new NodeApiClient(CFG.dshBaseUrl, 10000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+        const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
         const list = await api.sessions.list({});
         const sess = (list.result?.value?.items || []).find((x) => String(x.sessionId) === String(s.sessionId));
         if (sess && !sess.running) {
@@ -2144,7 +2144,9 @@ async function refreshDshSessions() {
   try {
     // dsh-client 与 worker 会话处一致用动态 import（只在真要连 DSH 时才加载）
     const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
-    const api = new NodeApiClient(CFG.dshBaseUrl, 8000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+    // 2026-10-09 修（dsh:null 全天 + 自动收单瘫痪根因）：会话总数涨到 3483 后，
+    // sessions.list 响应跨过 8s 线——探测天天超时。8s→30s（桥同款 20s 都活着，留足余量）。
+    const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
     const resp = await api.sessions.list({});
     const items = resp?.result?.value?.items ?? [];
     dshSessCache = { at: Date.now(), items: Array.isArray(items) ? items : [] };
@@ -3285,7 +3287,21 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const archived = archivePlanIfNeeded(wsKey);   // 覆盖前先存档旧 plan（历史计划要能回看）
-      fs.writeFileSync(planFile, body.markdown, 'utf8');
+      // 2026-10-09 修（巡检全灭事故根因）：plan 头缺 workspace: 字段 ⇒ questWorkspacesList 不认
+      // 这个工作区 ⇒ 自动收单/超期催单/dsh 视野全灭（spawn 僵尸 80 分钟无人收就是它）。
+      // 写入前自动注入（能解析到工作区路径就补在标题行后；解析不到给警告）。
+      let mdOut = String(body.markdown || '');
+      if (!parsed.meta.workspace) {
+        const wsPathInj = resolveWsPath(wsKey, ws);
+        if (wsPathInj) {
+          const wsLine = `workspace: ${wsPathInj.replace(/\\/g, '/')}\n`;
+          mdOut = /^#[^\n]*\n/.test(mdOut) ? mdOut.replace(/^([^\n]*\n)/, '$1' + wsLine) : wsLine + mdOut;
+          warnings.push('已自动在 plan 头注入 workspace: ' + wsPathInj + '（缺它本工作区不被巡检认领）');
+        } else {
+          warnings.push('⚠️ plan 头缺 workspace: 且无法自动解析——本工作区将不被巡检认领（自动收单/催单失效）。请在头部加一行 workspace: <绝对路径>');
+        }
+      }
+      fs.writeFileSync(planFile, mdOut, 'utf8');
       if (archived) appendEvent(wsKey, { t: 'plan.archived', file: path.basename(archived) });
       appendEvent(wsKey, { t: fs.existsSync(path.join(dir, 'ledger.jsonl')) ? 'plan.reloaded' : 'plan.created', nodes: parsed.nodes.map((n) => n.id), ...(body.force === true ? { forced: true } : {}) });
       return json(200, { ok: true, nodes: parsed.nodes.map((n) => n.id), workspace: ws, ...(warnings.length ? { warnings } : {}), ...(archived ? { archived: path.basename(archived) } : {}) });
