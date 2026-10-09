@@ -3708,11 +3708,21 @@ const server = http.createServer(async (req, res) => {
         log(`spawn.reported ${wsKey}: ${sp.spawnId}${routed ? '' : '（未能投递派发者，仅留痕）'}`);
         return json(200, { ok: routed, note: routed ? '简报已交回派发者。你的任务到此为止——停在这里，等派发者/用户来找。' : '简报已入账本，但派发者会话不可达；你的任务到此为止。' });
       }
-      // 2026-10-06 加强防漏：如果 caller 不在活跃 spawn 列表但也不等于 mainSid，拒绝点名。
-      // 之前有子对话漏网(activeSpawnOf 匹配失败)直接触达用户。
+      // 2026-10-06 防漏：caller 不在活跃 spawn 列表且不等于 mainSid 时，不能直达用户。
+      // 2026-10-09 v2（边界层简报被弹回、用户被迫人肉转发事故）：原为硬拒——但 spawn 被自动收单后
+      // （长求解>30min 空闲≠死亡），子对话的简报就永远交不回。改为**兜底转投主对话**：
+      // 越级直达用户依然被防住，简报永远有去处。
       const mainSid = loadConvergeState()[wsKey]?.mainSessionId || '';
       if (caller && mainSid && caller !== mainSid) {
-        return json(200, { ok: false, error: `你是子对话（${caller.slice(8, 16)}…），不是本工作区的主对话（${mainSid.slice(8, 16)}…）。规矩：子对话把结果/总结交回主对话（用 DSH 的 send_message 发给它，或写进工作区文件并在你的收尾消息里说明），由主对话筛选后统一通知用户。` });
+        let routed = false;
+        try {
+          const { NodeApiClient } = await import('./lib/dsh-client-v2.mjs');
+          const api = new NodeApiClient(CFG.dshBaseUrl, 30000, { token: CFG.dshToken || undefined, tokenLog: CFG.dshTokenLog || undefined });
+          await api.sessions.prompt({ sessionId: mainSid, mode: 'queue', content: [{ type: 'text', text: `📋【子对话简报·兜底转交】（spawn 已被自动收单或未登记，按兜底规则交主对话）\n${msg}` + roleTail(wsKey, mainSid) }] });
+          routed = true;
+        } catch (e) { log('notify 兜底转投主对话失败:', e?.message); }
+        appendEvent(wsKey, { t: 'notify.relayed-to-main', sessionId: caller, routed });
+        return json(200, { ok: routed, note: routed ? '你的简报已转交主对话（spawn 记录已收单，走兜底通道）。任务到此为止。' : '简报未能送达主对话，已留痕。可改写进工作区文件并在收尾消息说明。' });
       }
       const cdMs = Math.max(5, Number(CFG.notify?.userPingCooldownSec) || 600) * 1000;   // 默认 10 分钟/工作区
       // 2026-09-23（kl P8）：更正/撤回类消息绕过冷却——冷却挡住"16× 作废"那类更正 10 分钟，
