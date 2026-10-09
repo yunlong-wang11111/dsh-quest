@@ -3713,6 +3713,15 @@ const server = http.createServer(async (req, res) => {
     // 流程：AI 先写好 research-state.md → 调本端点 → 本端点做会话切换
     if (req.method === 'POST' && u.pathname === '/api/flip') {
       const b = await readBody(req);
+      // ★ 翻页闸（2026-10-09 事故：工作区主对话自己调 quest_flip 翻了自己，未问用户）。
+      // 翻页是"动全部会话"的操作，铁律是用户点头。现在只认 QQ 通道：桥的 /q翻页
+      // 处理器带 via:'qq' 标记；MCP 工具(quest_flip)的参数面没有这个字段，直调必拒。
+      if (b.via !== 'qq') {
+        return json(200, {
+          ok: false,
+          error: '翻页已被限制为用户专属操作（2026-10-09 AI 自翻页事故后加闸）。AI 会话不得调用 quest_flip；需要翻页时请用 quest_notify 请示用户，由用户在 QQ 发「/q翻页」执行。',
+        });
+      }
       // ws 双通道兜底（2026-09-16 事故）：桥放 body.ws，插件放 URL query —— 以前只读 body，
       // 插件不显式传 ws 且 wsOf(exec) 取不到 cwd 时 b.ws=undefined ⇒ matched=0、create 进默认目录
       // （AI 两次翻页各建出一个游离会话、一个会话都没归档，就是它）。现在 query/body 谁有听谁的。
