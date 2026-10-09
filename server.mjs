@@ -3538,9 +3538,16 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       const title = String(b.title || '').trim().slice(0, 60);
       const handoff = String(b.handoff || '').trim().slice(0, 6000);
-      const by = String(b.dispatchedBy || '').trim();
+      let by = String(b.dispatchedBy || '').trim();
       if (!title || !handoff) return json(400, { ok: false, error: '缺少 title/handoff（handoff 复用 plan 节点写法：角色/验证什么/指标与健康范围/产物在哪/已知的坑）' });
-      if (!by) return json(400, { ok: false, error: '缺少派发者身份（dispatchedBy）——插件层会自动带上；直连 HTTP 需手动传' });
+      // 2026-10-09 修（"缺派发者身份"连环失败）：MCP 通道不带会话身份，旧笔记教的
+      // $env:DSH_SESSION_ID 在 0.2.0 不存在。兜底：缺省取本工作区登记主对话（spawn
+      // 本就只该由主对话发起）。"插件层会自动带上"是 0.1.x 原生插件时代的话，已失效。
+      if (!by) {
+        by = String(loadConvergeState()[wsKey]?.mainSessionId || '').trim();
+        if (by) log(`spawn.dispatchedBy 缺省 → 主对话 ${by.slice(8, 16)}… (${wsKey})`);
+      }
+      if (!by) return json(400, { ok: false, error: '缺少派发者身份（dispatchedBy），且本工作区无登记主对话可兜底——先让该工作区主对话收敛（或经 QQ /q派发）' });
       const state = buildState(wsKey);
       // 2026-09-23：spawn 的 cwd 必须解析成功——建在错误 cwd 的子对话写工作区文件会撞沙箱审批
       const wsPath = resolveWsPath(wsKey, ws);
