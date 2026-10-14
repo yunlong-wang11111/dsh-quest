@@ -53,7 +53,7 @@ const server = new McpServer({ name: 'quest', version: '0.6.7' });
 
 server.tool(
   'quest_plan',
-  '写入任务线 plan.md（多节点流水线：依赖链 after、条件分支 when、自动修复 auto_fix、盯梢 watch_rules、WSL 车道 shell、冻结策略 freeze_on）。整体替换当前工作区的计划。若新计划会丢掉旧计划里未完成（非 completed）的节点，服务端会返回 409 并列出是被丢的哪些节点——先确认这是你要的，再带 force:true 重提交；不要把 409 当故障盲目重试。★节点格式（解析器只认这个，散文式 Markdown 会解析出 0 个节点）：每个节点以字面行 ---node: 节点id--- 开头，字段用行首裸 key（不要列表符号/反引号）：command: 完整命令行｜cwd: 工作目录｜success: 判据关键词(纯ASCII)｜expect_minutes: 估时｜after: 上游节点id逗号分隔｜auto_fix: true｜handoff: | 后跟缩进交接(角色/验证什么/指标/产物在哪/坑)。多节点 = 多个 ---node:--- 块。完整模板见 dsh-plugins/quest/PLAN-TEMPLATE.md',
+  '写入任务线 plan.md（多节点流水线：依赖链 after、条件分支 when、自动修复 auto_fix、盯梢 watch_rules、WSL 车道 shell、冻结策略 freeze_on）。整体替换当前工作区的计划。若新计划会丢掉旧计划里未完成（非 completed）的节点，服务端会返回 409 并列出是被丢的哪些节点——先确认这是你要的，再带 force:true 重提交；不要把 409 当故障盲目重试。★节点格式（解析器只认这个，散文式 Markdown 会解析出 0 个节点）：每个节点以字面行 ---node: 节点id--- 开头，字段用行首裸 key（不要列表符号/反引号）：command: 完整命令行｜cwd: 工作目录｜success: 判据关键词(纯ASCII)｜expect_minutes: 估时｜after: 上游节点id逗号分隔｜auto_fix: true｜handoff: | 后跟缩进交接(角色/验证什么/指标/产物在哪/坑)。★意图节点：代码没写好时可不写 command，改写 intent: <要做什么一句话>——节点成 draft 状态上画布，派子对话按 handoff 施工后 quest_specify 回填命令即可派发（别因为"代码还没写"就绕开 plan 用 run/quick）。★when 条件分支语法（引用格式必须精确，写错会静默跳过下游）：when: 上游id.verdict == ok（或 != / 其它 verdict 值），或 when: 上游id.metrics.指标键 < 0.05（==/!=/<=/>=/</>，指标须是日志里会被提取的数值如 loss_last）——上游不满足条件时本节点自动 skip（适合过夜链"A 失败自动兜底 B"）。多节点 = 多个 ---node:--- 块。完整模板见 dsh-plugins/quest/PLAN-TEMPLATE.md',
   { markdown: z.string().describe('完整的 plan.md 内容（含 ---node: id--- 标记块）'), ws: z.string().optional().describe('工作区绝对路径'), force: z.boolean().optional().describe('确认丢弃旧计划中未完成的节点（默认 false）') },
   async ({ markdown, ws, force }) => {
     const r = await q('POST', `/api/plan?ws=${encodeURIComponent(ws || '')}`, { markdown, ...(force === true ? { force: true } : {}) });
@@ -64,9 +64,52 @@ server.tool(
 server.tool(
   'quest_dispatch',
   '派发/重派任务线里的某个节点（后台执行，不等待结束）。',
-  { node: z.string().describe('节点 id'), ws: z.string().optional().describe('工作区绝对路径') },
-  async ({ node, ws }) => {
-    const r = await q('POST', `/api/dispatch?ws=${encodeURIComponent(ws || '')}`, { node });
+  {
+    node: z.string().describe('节点 id'),
+    by: z.string().optional().describe('★署名（强烈建议传）：回执精确投给署名者。DSH 会话传自己的 sessionId；ZCode/GLM 传 zcode:glm'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async ({ node, by, ws }) => {
+    const r = await q('POST', `/api/dispatch?ws=${encodeURIComponent(ws || '')}`, { node, dispatchedBy: by || undefined });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_register_main',
+  [
+    '注册自己为本工作区的主对话（新工作区冷启动第一步——回执/简报/收敛通知的定向目标）。',
+    '分三档：无人在位（首次）直接生效；已是本人幂等返回；已有他人在位会生成待确认请求推 QQ，',
+    '由用户 /q确认 <id> 放行。跨工作区抢注会被拒（服务端核对调用会话 cwd）。',
+    '★ 什么时候用：你在一个新工作区开始干活、且要派 quest 任务/spawn 子对话/收回执之前，先调本工具。',
+  ].join(' '),
+  {
+    session_id: z.string().describe('你自己的 DSH 会话 id（session-…）'),
+    ws: z.string().optional().describe('工作区绝对路径（缺省=当前会话 cwd）'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/converge?ws=${encodeURIComponent(a.ws || '')}`, {
+      action: 'main', sessionId: a.session_id });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_specify',
+  [
+    '意图节点施工回填：把写好的命令（可带 success 判据）回填进 plan 的指定节点。',
+    '配合 intent: 用法——主对话写 plan 时只写 intent+handoff+success（不写代码），派子对话施工；',
+    '子对话写完脚本后用本工具回填 command，节点从 draft 变 pending，即可 quest_dispatch 或被 after 链拉起。',
+  ].join(' '),
+  {
+    node: z.string().describe('要回填的节点 id'),
+    command: z.string().describe('完整命令行（回填后即为该节点的执行命令）'),
+    success: z.string().optional().describe('成功判据关键词（可选，同时回填）'),
+    by: z.string().optional().describe('施工方署名（如 zcode:glm 或子对话会话 id，留痕用）'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/specify?ws=${encodeURIComponent(a.ws || '')}`, { node: a.node, command: a.command, success: a.success, by: a.by });
     return r.error ? fail(r) : ok(r);
   },
 );
@@ -84,12 +127,14 @@ server.tool(
     success: z.string().optional().describe('成功判据（白话即可）：引号关键词 / 文件名通配 / 指标阈值，会被判定器强制核对'),
     auto_fix: z.boolean().optional().describe('失败后是否自动修复'),
     shell: z.enum(['windows', 'wsl']).optional().describe('在 Windows 还是 WSL 里执行'),
+    by: z.string().optional().describe('★署名（强烈建议传）：回执精确投给署名者。DSH 会话传自己的 sessionId（session-…）；ZCode/GLM 等外部 harness 传 zcode:glm（回执静默留痕）。不传则兜底投主对话，烧它上下文'),
     ws: z.string().optional().describe('工作区绝对路径（缺省用 cwd）'),
   },
   async (a) => {
     const r = await q('POST', `/api/run?ws=${encodeURIComponent(a.ws || a.cwd)}`, {
       command: a.command, cwd: a.cwd, title: a.title, reason: a.reason,
       expectMinutes: a.expect_minutes, handoff: a.handoff, success: a.success, autoFix: a.auto_fix, shell: a.shell,
+      dispatchedBy: a.by || undefined,
     });
     return r.error ? fail(r) : ok(r);
   },
@@ -107,6 +152,30 @@ server.tool(
   },
   async (a) => {
     const r = await q('POST', `/api/notify?ws=${encodeURIComponent(a.ws || a.cwd || '')}`, { message: a.message });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_track',
+  [
+    '外部任务登记（ZCode/GLM 等不走 quest 执行车道的会话用）：把你正在跑的长活（后台命令/子代理/大块分析）',
+    '登记进 quest 账本，quest_status 与 dashboard 全景可见——让"谁在干什么"跨 harness 可见。',
+    '开始时 status=running；结束时必须回填 done 或 failed（同 taskId 复用即更新）；中途可 status=note 附备注。',
+    '登记≠执行：任务本身在你自己的 harness 里跑，这里只记账。',
+  ].join(' '),
+  {
+    title: z.string().describe('任务短名（做什么，≤120 字）'),
+    status: z.enum(['running', 'done', 'failed', 'note']).optional().describe('缺省 running'),
+    taskId: z.string().optional().describe('回填/更新时传上一次返回的 taskId'),
+    note: z.string().optional().describe('备注（结果一句话/产物路径，≤300 字）'),
+    source: z.string().optional().describe('来源标识（如 zcode、glm），缺省 external'),
+    ws: z.string().optional().describe('工作区绝对路径（缺省=当前会话 cwd）'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/track?ws=${encodeURIComponent(a.ws || a.cwd || '')}`, {
+      title: a.title, status: a.status, taskId: a.taskId, note: a.note, source: a.source || 'zcode',
+    });
     return r.error ? fail(r) : ok(r);
   },
 );
