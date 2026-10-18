@@ -947,8 +947,27 @@ const isQuestPid = (pid) => {
 // bash 退出 126 → 判定 crashed → 12 分钟的有效结果被判失败，且事后无法从账本看出命令被动过。
 const CMD_MAX_CHARS = 8000;
 const activeJobs = new Map();
+/** 2026-10-17 治理：worker 总结会话集合（账本 worker.session 出生登记）——只许总结，派单即越权 */
+function workerSessionsOf(wsKey) {
+  const out = new Set();
+  try {
+    for (const ev of readLedgerLines(wsKey)) {
+      if (ev.t === 'worker.session' && ev.sessionId) out.add(String(ev.sessionId));
+    }
+  } catch {}
+  return out;
+}
+
 function dispatchJob(wsKey, node, body = {}) {
   return new Promise(async (resolve) => {
+    // 2026-10-17 治理：worker 总结会话越权派单告警（放行不拦——但留痕+点名，fixer 重派不在告警范围）
+    try {
+      const by = String(body.dispatchedBy || node.dispatchedBy || '');
+      if (by && workerSessionsOf(wsKey).has(by)) {
+        appendEvent(wsKey, { t: 'worker.dispatch-alert', node: node.id, sessionId: by });
+        qqPush(wsKey, `⚠️ [治理] 总结会话 ${by.slice(8, 16)} 派了节点 ${node.id}（越权：worker 只许总结）。已放行执行，请知悉。`).catch(() => {});
+      }
+    } catch {}
     // 2026-10-10：意图节点（intent 无 command）不可直接派发——先施工回填（quest_specify）
     if (!node.command && node.intent) {
       resolve({ ok: false, kind: 'specify-required', error: `节点 ${node.id} 是意图节点（command 未回填）：${node.intent.slice(0, 120)}。让施工方（子对话/主对话）写完脚本后 quest_specify 回填命令，再派发。` });
@@ -2093,6 +2112,19 @@ async function runFixer(wsKey, node, j, diagnosis) {
   }
   appendEvent(wsKey, { t: 'fix.attempt', node: node.id, n: attempt });
 
+  // 2026-10-17 双修护栏：告知原派发者"自动修复已启动"——防它收到失败回执后自己重派、与 fixer 双修同一节点
+  try {
+    let fixBy = '';
+    for (const ev of readLedgerLines(wsKey)) {
+      if ((ev.t === 'quick.dispatched' || ev.t === 'node.dispatched') && ev.node === node.id && ev.dispatchedBy) {
+        fixBy = String(ev.dispatchedBy);
+        if (ev.t === 'quick.dispatched') break;
+      }
+    }
+    if (fixBy) queueReceiptPrompt(wsKey, fixBy,
+      `🔧【fix 已启动】节点 ${node.id}：quest 拉起自动修复（第 ${attempt} 次）。请勿重复处理——要接管就 quest_cancel 该节点（联动停修），修复结果会另行回执。`);
+  } catch {}
+
   const api = await getClient();
   const { createTurnCollector } = await import('./lib/dsh-client-v2.mjs');
   let sessionId = null;
@@ -3067,6 +3099,7 @@ async function runWorker(wsKey, node, j, runSec) {
     if (!created.result.ok) throw new Error(JSON.stringify(created.result.error).slice(0, 120));
     sessionId = created.result.value.sessionId;
     activeWorkers.add(sessionId);
+    try { appendEvent(wsKey, { t: 'worker.session', node: node.id, sessionId }); } catch {}  // 2026-10-17 出生登记（越权派单告警用）
 
     // 开工交接（第 1 prompt：让 worker 知道在监控什么；纯文本确认即可）
     const collector = createTurnCollector();
@@ -3301,6 +3334,15 @@ const server = http.createServer(async (req, res) => {
           else verdictBuckets.infra++;   // timeout / cancelled / 未知
         } else if (n.status === 'timeout' || n.status === 'cancelled') verdictBuckets.infra++;
       }
+      // 2026-10-17 治理：节点挂派发者（一次遍历账本建映射，前端/消费方一眼看清是谁派的）
+      try {
+        const byMap = new Map();
+        for (const line2 of readLedgerLines(wsKey)) {
+          let ev; try { ev = JSON.parse(line2); } catch { continue; }
+          if ((ev.t === 'node.dispatched' || ev.t === 'quick.dispatched') && ev.node && ev.dispatchedBy) byMap.set(ev.node, String(ev.dispatchedBy));
+        }
+        for (const n of nodes) n.by = byMap.get(n.id) || '';
+      } catch {}
       return json(200, {
         asOf: new Date().toISOString(),   // 2026-09-23（kl P2）：快照时刻——汇总与实况赛跑时,消费方能自判新鲜度
         plan: { workspace: plan.meta?.workspace || ws, title: plan.meta?.title || '', nodes, closedAt: state.closedAt || null, closedReason: state.closedReason || '' },
@@ -3726,10 +3768,10 @@ const server = http.createServer(async (req, res) => {
       // 2026-10-14 冷启动免考古：能派子对话的必是主对话——本工作区尚无登记时直接把派发者
       // 登记为主对话（省掉新会话考古 /api/converge 的端点/鉴权/自己 sessionId 的全过程）。
       try {
-        const stAll = loadConvergeState();
-        if (!stAll[wsKey]?.mainSessionId) {
-          stAll[wsKey] = { ...(stAll[wsKey] || {}), mainSessionId: by, auto: stAll[wsKey]?.auto };
-          saveConvergeState(stAll);
+        const stateAll = loadConvergeState();
+        if (!stateAll[wsKey]?.mainSessionId) {
+          stateAll[wsKey] = { ...(stateAll[wsKey] || {}), mainSessionId: by, auto: stateAll[wsKey]?.auto };
+          saveConvergeState(stateAll);
           log(`converge 自动登记（spawn 首派）: ${wsKey} main=${by.slice(8, 16)}…`);
         }
       } catch {}
@@ -4227,11 +4269,27 @@ const server = http.createServer(async (req, res) => {
       const stateAll = loadConvergeState();
       const cur = stateAll[wsKey] || {};
       if (req.method === 'GET') {
-        return json(200, { ok: true, auto: cur.auto !== false, mainSessionId: cur.mainSessionId || null, reopenTimes: CFG.notify?.converge?.reopenTimes ?? [] });
+        return json(200, { ok: true, auto: cur.auto !== false, mainSessionId: cur.mainSessionId || null, roles: cur.roles || {}, reopenTimes: CFG.notify?.converge?.reopenTimes ?? [] });
       }
       if (req.method === 'POST') {
         const b = await readBody(req);
         const action = String(b.action || 'toggle');
+        // 2026-10-14 岗位登记（action='role'）：ZCode/DSH 任意会话可登记/查询本工作区岗位
+          // （reviewer/main-assistant 等）——治"新会话读交接文件自封角色"（文件是知识不是授权）。
+          // holder 用会话标识（DSH: session-…；ZCode: zcode:<会话标识>）。岗位表随 converge-state 持久化。
+          if (action === 'role') {
+            const role = String(b.role || '').trim().slice(0, 40);
+            const holder = String(b.sessionId || '');
+            if (!role) return json(200, { ok: false, error: '缺 role（如 reviewer）' });
+            stateAll[wsKey] = stateAll[wsKey] || {};
+            stateAll[wsKey].roles = stateAll[wsKey].roles || {};
+            if (b.clear === true) delete stateAll[wsKey].roles[role];
+            else stateAll[wsKey].roles[role] = { holder, at: new Date().toISOString() };
+            saveConvergeState(stateAll);
+            appendEvent(wsKey, { t: 'converge.role', role, holder: holder.slice(0, 40), clear: b.clear === true || undefined });
+            return json(200, { ok: true, role, holder: b.clear === true ? null : holder, roles: stateAll[wsKey].roles });
+          }
+
         if (action === 'main') {
           // 指定主对话（2026-09-16）：总结/收尾的定向目标。session/list 无 archived 标记，
           // 启发式必翻车（老主对话 2985M 还躺在列表里）⇒ 允许显式指定；翻页成功时自动更新为接班。

@@ -400,7 +400,7 @@ async function loadTasks() {
     const canCancel = n.status === 'running';
     const resumable = n.status === 'failed' && (n.interrupted || n.verdict === 'suspect' || n.verdict === 'crashed' || n.verdict === 'timeout');
     return `<tr>
-      <td class="mono">${esc(n.id)}</td>
+      <td class="mono">${esc(n.id)}${n.by ? '<div class="mut" style="font-size:11px">派发 ' + esc(n.by.startsWith('zcode') ? '[zx]' : (n.by.startsWith('session-') ? '[dsh] ' + n.by.slice(8, 14) : n.by)) + '</div>' : ''}</td>
       <td><span class="st ${esc(n.status)}"></span>${esc(n.status)}</td>
       <td>${esc(n.verdict || '')}${n.via ? ' <span class="mut">' + esc(n.via) + '</span>' : ''}</td>
       <td>${n.runSeconds != null ? Math.round(n.runSeconds/60) + '分' : ''}</td>
