@@ -1,0 +1,13 @@
+{
+  "name": "dsh-quest-mcp",
+  "version": "0.8.5",
+  "description": "quest 任务线的 MCP 工具面: 17 个工具(派发/判定/账本/子对话/文献检索)。stdio MCP, 需本机 quest 服务(3110)在跑。",
+  "type": "module",
+  "main": "mcp-server.mjs",
+  "bin": { "dsh-quest-mcp": "mcp-server.mjs" },
+  "engines": { "dsh": ">=0.2.0" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "license": "MIT"
+}

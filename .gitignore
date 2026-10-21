@@ -6,3 +6,4 @@ quest-config.json
 converge-state.json
 *.bak*
 quest-autostart.vbs.startup-backup
+packages/mcp/node_modules/

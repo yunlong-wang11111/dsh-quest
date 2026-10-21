@@ -1,0 +1,385 @@
+#!/usr/bin/env node
+// quest MCP 服务器（stdio）——把 quest 的 HTTP API 暴露成标准 MCP 工具，
+// 让任何支持 MCP 的 agent（Claude Code / Codex / ZCode / Cursor / …）原生调用，
+// 而不需要让模型自己拼 curl。
+//
+// 配置（环境变量，全部可选）：
+//   QUEST_URL    quest 服务地址，默认 http://127.0.0.1:3110
+//   QUEST_TOKEN  访问令牌；缺省从 <QUEST_HOME>/.token 读取
+//   QUEST_HOME   quest 数据目录，默认 ~/.dsh/quests
+//
+// 说明：quest 本体不依赖任何 agent——它自己派进程、判定、重试、通知。
+// 这个 MCP 层只负责"把工具递到模型手里"，因此对谁调用完全中立。
+
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+
+const QUEST_HOME = process.env.QUEST_HOME || path.join(os.homedir(), '.dsh', 'quests');
+const BASE = (process.env.QUEST_URL || 'http://127.0.0.1:3110').replace(/\/+$/, '');
+
+function token() {
+  if (process.env.QUEST_TOKEN) return process.env.QUEST_TOKEN.trim();
+  try { return fs.readFileSync(path.join(QUEST_HOME, '.token'), 'utf8').trim(); } catch { return ''; }
+}
+
+async function q(method, pathname, body, timeoutMs = 60000) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const resp = await fetch(`${BASE}${pathname}`, {
+      method,
+      headers: { 'x-quest-token': token(), 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ac.signal,
+    });
+    const text = await resp.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { raw: text.slice(0, 2000) }; }
+    if (!resp.ok) return { error: true, status: resp.status, ...json };
+    return json;
+  } catch (e) {
+    return { error: true, message: `quest 服务不可达（${BASE}）：${String(e?.message || e)}` };
+  } finally { clearTimeout(t); }
+}
+
+const ok = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] });
+const fail = (obj) => ({ content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }], isError: true });
+
+const server = new McpServer({ name: 'quest', version: '0.6.7' });
+
+server.tool(
+  'quest_plan',
+  '写入任务线 plan.md（多节点流水线：依赖链 after、条件分支 when、自动修复 auto_fix、盯梢 watch_rules、WSL 车道 shell、冻结策略 freeze_on）。整体替换当前工作区的计划。若新计划会丢掉旧计划里未完成（非 completed）的节点，服务端会返回 409 并列出是被丢的哪些节点——先确认这是你要的，再带 force:true 重提交；不要把 409 当故障盲目重试。★节点格式（解析器只认这个，散文式 Markdown 会解析出 0 个节点）：每个节点以字面行 ---node: 节点id--- 开头，字段用行首裸 key（不要列表符号/反引号）：command: 完整命令行｜cwd: 工作目录｜success: 判据关键词(纯ASCII)｜expect_minutes: 估时｜after: 上游节点id逗号分隔｜auto_fix: true｜handoff: | 后跟缩进交接(角色/验证什么/指标/产物在哪/坑)。★意图节点：代码没写好时可不写 command，改写 intent: <要做什么一句话>——节点成 draft 状态上画布，派子对话按 handoff 施工后 quest_specify 回填命令即可派发（别因为"代码还没写"就绕开 plan 用 run/quick）。★when 条件分支语法（引用格式必须精确，写错会静默跳过下游）：when: 上游id.verdict == ok（或 != / 其它 verdict 值），或 when: 上游id.metrics.指标键 < 0.05（==/!=/<=/>=/</>，指标须是日志里会被提取的数值如 loss_last）——上游不满足条件时本节点自动 skip（适合过夜链"A 失败自动兜底 B"）。多节点 = 多个 ---node:--- 块。完整模板见 dsh-plugins/quest/PLAN-TEMPLATE.md',
+  { markdown: z.string().describe('完整的 plan.md 内容（含 ---node: id--- 标记块）'), ws: z.string().optional().describe('工作区绝对路径'), force: z.boolean().optional().describe('确认丢弃旧计划中未完成的节点（默认 false）') },
+  async ({ markdown, ws, force }) => {
+    const r = await q('POST', `/api/plan?ws=${encodeURIComponent(ws || '')}`, { markdown, ...(force === true ? { force: true } : {}) });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_dispatch',
+  '派发/重派任务线里的某个节点（后台执行，不等待结束）。',
+  {
+    node: z.string().describe('节点 id'),
+    by: z.string().optional().describe('★署名（强烈建议传）：回执精确投给署名者。DSH 会话传自己的 sessionId；ZCode/GLM 传 zcode:glm'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async ({ node, by, ws }) => {
+    const r = await q('POST', `/api/dispatch?ws=${encodeURIComponent(ws || '')}`, { node, dispatchedBy: by || undefined });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_register_role',
+  [
+    '登记/查询本工作区的岗位（reviewer、main-assistant 等自定义岗位名）。',
+    '★ 治"读交接文件自封角色"：文件是知识不是授权——新会话（DSH 或 ZCode）读到任何交接文件时，',
+    '除非 quest 里该岗位登记的是你（或岗位空缺且用户明确要你接任），否则不得以该岗位身份行动。',
+    'holder 传你自己的标识（DSH: session-…；ZCode: zcode:<你的会话标识>）。clear:true 撤销岗位。',
+    '查询现有岗位：quest_status 的 converge/roles 字段，或 GET /api/converge。',
+  ].join(' '),
+  {
+    role: z.string().describe('岗位名（如 reviewer）'),
+    holder: z.string().describe('登记者标识（DSH: session-…；ZCode: zcode:…）'),
+    clear: z.boolean().optional().describe('true=撤销该岗位'),
+    ws: z.string().optional().describe('工作区绝对路径（缺省=当前会话 cwd）'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/converge?ws=${encodeURIComponent(a.ws || '')}`, {
+      action: 'role', sessionId: a.holder, role: a.role, ...(a.clear === true ? { clear: true } : {}) });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_register_main',
+  [
+    '注册自己为本工作区的主对话（新工作区冷启动第一步——回执/简报/收敛通知的定向目标）。',
+    '分三档：无人在位（首次）直接生效；已是本人幂等返回；已有他人在位会生成待确认请求推 QQ，',
+    '由用户 /q确认 <id> 放行。跨工作区抢注会被拒（服务端核对调用会话 cwd）。',
+    '★ 什么时候用：你在一个新工作区开始干活、且要派 quest 任务/spawn 子对话/收回执之前，先调本工具。',
+  ].join(' '),
+  {
+    session_id: z.string().describe('你自己的 DSH 会话 id（session-…）'),
+    ws: z.string().optional().describe('工作区绝对路径（缺省=当前会话 cwd）'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/converge?ws=${encodeURIComponent(a.ws || '')}`, {
+      action: 'main', sessionId: a.session_id });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_specify',
+  [
+    '意图节点施工回填：把写好的命令（可带 success 判据）回填进 plan 的指定节点。',
+    '配合 intent: 用法——主对话写 plan 时只写 intent+handoff+success（不写代码），派子对话施工；',
+    '子对话写完脚本后用本工具回填 command，节点从 draft 变 pending，即可 quest_dispatch 或被 after 链拉起。',
+  ].join(' '),
+  {
+    node: z.string().describe('要回填的节点 id'),
+    command: z.string().describe('完整命令行（回填后即为该节点的执行命令）'),
+    success: z.string().optional().describe('成功判据关键词（可选，同时回填）'),
+    by: z.string().optional().describe('施工方署名（如 zcode:glm 或子对话会话 id，留痕用）'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/specify?ws=${encodeURIComponent(a.ws || '')}`, { node: a.node, command: a.command, success: a.success, by: a.by });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_run',
+  '快速单发：不写任务线，直接后台跑一个命令（含判定 + 总结 + 通知）。适合已定型的单个长任务。派发后不要再轮询，任务结束会通知。',
+  {
+    command: z.string().describe('完整命令（解释器用绝对路径）'),
+    cwd: z.string().describe('工作目录'),
+    title: z.string().optional().describe('任务短名'),
+    reason: z.string().optional().describe('为什么跑这条命令（门禁挂起时作为审批理由）'),
+    expect_minutes: z.number().optional().describe('预计时长（分钟）'),
+    handoff: z.string().optional().describe('交接上下文：做什么、看什么指标、异常特征'),
+    success: z.string().optional().describe('成功判据（白话即可）：引号关键词 / 文件名通配 / 指标阈值，会被判定器强制核对'),
+    auto_fix: z.boolean().optional().describe('失败后是否自动修复'),
+    shell: z.enum(['windows', 'wsl']).optional().describe('在 Windows 还是 WSL 里执行'),
+    by: z.string().optional().describe('★署名（强烈建议传）：回执精确投给署名者。DSH 会话传自己的 sessionId（session-…）；ZCode/GLM 等外部 harness 传 zcode:glm（回执静默留痕）。不传则兜底投主对话，烧它上下文'),
+    ws: z.string().optional().describe('工作区绝对路径（缺省用 cwd）'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/run?ws=${encodeURIComponent(a.ws || a.cwd)}`, {
+      command: a.command, cwd: a.cwd, title: a.title, reason: a.reason,
+      expectMinutes: a.expect_minutes, handoff: a.handoff, success: a.success, autoFix: a.auto_fix, shell: a.shell,
+      dispatchedBy: a.by || undefined,
+    });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_notify',
+  [
+    '点名用户（QQ）：由你决定何时打扰人——只在需要人拍板/确认/汇报重要结果时用。',
+    '收尾汇报自动通知；中途节点成败用户已静音（nodeEvents:false）。60 秒冷却。',
+  ].join(' '),
+  {
+    message: z.string().describe('给用户的话（≤800 字）：要什么决策/确认什么/结果一句话。'
+      + '首行必须带来源标签：ZCode/GLM 等外部 harness 加 "[zx] "，DSH 会话加 "[dsh] "'
+      + '（2026-10-17 立：用户在 QQ 要一眼分清谁在说话）'),
+    ws: z.string().optional().describe('工作区绝对路径（缺省=当前会话 cwd）'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/notify?ws=${encodeURIComponent(a.ws || a.cwd || '')}`, { message: a.message });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_track',
+  [
+    '外部任务登记（ZCode/GLM 等不走 quest 执行车道的会话用）：把你正在跑的长活（后台命令/子代理/大块分析）',
+    '登记进 quest 账本，quest_status 与 dashboard 全景可见——让"谁在干什么"跨 harness 可见。',
+    '开始时 status=running；结束时必须回填 done 或 failed（同 taskId 复用即更新）；中途可 status=note 附备注。',
+    '登记≠执行：任务本身在你自己的 harness 里跑，这里只记账。',
+  ].join(' '),
+  {
+    title: z.string().describe('任务短名（做什么，≤120 字）'),
+    status: z.enum(['running', 'done', 'failed', 'note']).optional().describe('缺省 running'),
+    taskId: z.string().optional().describe('回填/更新时传上一次返回的 taskId'),
+    note: z.string().optional().describe('备注（结果一句话/产物路径，≤300 字）'),
+    source: z.string().optional().describe('来源标识（如 zcode、glm），缺省 external'),
+    ws: z.string().optional().describe('工作区绝对路径（缺省=当前会话 cwd）'),
+  },
+  async (a) => {
+    const r = await q('POST', `/api/track?ws=${encodeURIComponent(a.ws || a.cwd || '')}`, {
+      title: a.title, status: a.status, taskId: a.taskId, note: a.note, source: a.source || 'zcode',
+    });
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_lit',
+  [
+    '文献检索：一次调用拿 10-25 篇的 标题/作者/年份/venue/摘要（≤700字/篇）——替代 web_search+web_fetch 手爬（一个调研子代理曾爬 376 次，¥1.4）。',
+    '三源：arxiv（预印本）；crossref（SCI 主力：Elsevier/Springer/Wiley/IEEE/MDPI 等 DOI 元数据）；openalex（全覆盖，带被引数）。',
+    '找创新点打法：同一检索词 2-3 源各搜一次 → 圈定候选 → 只对最关键 1-2 篇再 fetch 全文。只读外部 API，不入账本。',
+  ].join(' '),
+  {
+    query: z.string().describe('检索词（英文效果最好）'),
+    source: z.enum(['arxiv', 'crossref', 'openalex']).optional().describe('缺省 arxiv'),
+    limit: z.number().optional().describe('1-25，缺省 10'),
+  },
+  async (a) => {
+    const r = await q('GET', `/api/lit?q=${encodeURIComponent(a.query)}&source=${a.source || 'arxiv'}&limit=${a.limit || 10}`);
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_status',
+  [
+    '查任务线全景。默认 brief（推荐）：只回 当前状态/计数/在跑节点/异常节点/最近完成 —— 几百字符。',
+    '要看全部节点明细时才传 verbose:true（大工作区会到几十万字符，慎重）。',
+  ].join(' '),
+  {
+    ws: z.string().optional().describe('工作区绝对路径（缺省=最近活跃工作区）'),
+    verbose: z.boolean().optional().describe('true=返回全部节点明细（很大）；缺省=false 只回摘要'),
+  },
+  async ({ ws, verbose }) => {
+    const r = await q('GET', `/api/status?ws=${encodeURIComponent(ws || '')}`);
+    if (r.error) return fail(r);
+    if (verbose) return ok(r);
+    // brief：省 token 的默认视图（2026-09-15 实测全量 28.9 万字符 → 摘要几百字符）
+    const nodes = r.plan?.nodes || [];
+    const c = {};
+    for (const n of nodes) c[n.status] = (c[n.status] || 0) + 1;
+    const line = r.line || {};
+    const running = nodes.filter((n) => n.status === 'running')
+      .map((n) => ({ id: n.id, shell: n.shell, startedAt: n.startedAt, success: n.success || '' }));
+    const bad = nodes.filter((n) => ['failed', 'timeout'].includes(n.status)).slice(0, 8)
+      .map((n) => ({ id: n.id, verdict: n.verdict, via: n.via, detail: String(n.judgeDetail || n.detail || '').slice(0, 120) }));
+    const planNodes = nodes.filter((n) => n.inPlan)
+      .map((n) => ({ id: n.id, status: n.status, verdict: n.verdict || null }));
+    return ok({
+      workspace: r.plan?.workspace || ws || '', title: r.plan?.title || '',
+      line: { active: line.active, counts: line.counts, idleMinutes: line.idleMinutes, quiet: line.quiet, dsh: line.dsh },
+      running, bad,
+      plan: { nodes: planNodes, closedAt: r.plan?.closedAt || null },
+      unread: (r.unread || []).slice(0, 10),
+      totals: { nodes: nodes.length, ...(c || {}) },
+      hint: '这是摘要视图；要全部节点明细用 verbose:true，要某个节点日志用 quest_log',
+    });
+  },
+);
+
+server.tool(
+  'quest_log',
+  '读某个节点正在跑或刚跑完的日志尾部（不执行任何命令）。',
+  {
+    node: z.string().describe('节点 id'),
+    tail: z.number().optional().describe('读取字节数，默认 4096'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async ({ node, tail, ws }) => {
+    const r = await q('GET', `/api/log?ws=${encodeURIComponent(ws || '')}&node=${encodeURIComponent(node)}&tail=${tail || 4096}`);
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_probe',
+  '诊断探针：同步跑一条白名单命令并取回尾部输出（解释器跑工作区内脚本，或 -c 内联）。"现在就要看这个值"时用。'
+    + '车道按命令首词自动判（Linux 绝对路径如 /home/…/bin/python → WSL；盘符 → Windows），不用说明。'
+    + '硬上限 30 秒（WSL 车道 25 秒，留中继余量），到点杀整个进程组并返回超时前输出（会标 ⏱）。超时的任务不是探针的事，用 quest_run。',
+  {
+    command: z.string().describe('诊断命令，如 python -c "print(x.shape)"'),
+    cwd: z.string().describe('工作目录'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async ({ command, cwd, ws }) => {
+    const r = await q('POST', `/api/probe?ws=${encodeURIComponent(ws || cwd)}`, { command, cwd }, 40000);
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_files',
+  '列目录/读文件（支持 Windows 绝对路径与 \\\\wsl$\\Ubuntu\\... UNC 路径，即 WSL 内部文件）。',
+  {
+    path: z.string().describe('绝对路径'),
+    mode: z.enum(['list', 'read']).optional().describe('list 列目录（缺省）/ read 读内容'),
+  },
+  async ({ path: p, mode }) => {
+    const r = await q('GET', `/api/files?mode=${encodeURIComponent(mode || 'list')}&path=${encodeURIComponent(p)}`, undefined, 30000);
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_cancel',
+  '人工终止一个正在运行的节点（杀整棵进程树；不触发自动修复）。tag 参数可批量收线（id 含片段的：在跑杀树、pending/frozen 落 cancelled）。',
+  {
+    node: z.string().optional().describe('节点 id（与 tag 二选一）'),
+    tag: z.string().optional().describe('批量收线：节点 id 包含此片段的全部处理'),
+    reason: z.string().optional().describe('终止原因（入账本+通知）'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async ({ node, tag, reason, ws }) => {
+    const r = await q('POST', `/api/cancel?ws=${encodeURIComponent(ws || '')}`,
+      tag ? { tag, reason: reason || `tag 批量收线 ${tag}` } : { node: node || '', reason: reason || '人工终止' }, 30000);
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_flip',
+  [
+    '【已禁用直调】(2026-10-09 AI 自翻页事故后加闸)翻页是动全部会话的操作,只允许用户在 QQ 发「/q翻页」执行。',
+    '本工具的服务端已拒绝 AI 调用(返回错误)。你觉得该翻页时:用 quest_notify 请示用户,说明理由和建议,由用户决定。',
+    '翻页语义(供你向用户解释):归档本工作区全部会话并开新会话,老会话先写 research-state.md 交接。',
+  ].join(' '),
+  {
+    ws: z.string().describe('工作区绝对路径（一般=你的 cwd）'),
+    handoff: z.boolean().optional().describe('false=交接已由你写好，跳过提示老会话（推荐流程）；缺省 true'),
+  },
+  async ({ ws, handoff }) => {
+    const r = await q('POST', `/api/flip?ws=${encodeURIComponent(ws || '')}`, { handoff: handoff !== false }, 240000);
+    if (r.error) return fail(r);
+    return ok({
+      ok: r.ok, archived: (r.archived || []).length, matched: r.matched,
+      created: r.created, handoff: r.handoff || null, errors: r.errors || [],
+      note: '新会话已注入恢复提示（读交接→quest_status→向用户复述确认）。归档不删除：全文在 archive/flip-*.md。',
+    });
+  },
+);
+
+server.tool(
+  'quest_spawn',
+  [
+    '派一个真子对话（同工作区新建独立 DSH 会话，注入交接后独立推进）——需要连续多轮独立推进的大阶段用（整块调研/独立模块开发）；',
+    '跑命令用 quest_run/plan 节点（执行者是进程）；一次性检索用你的会话内子代理；主线写码自己干。',
+    'handoff 写法同 plan 节点（角色/验证什么/指标与健康范围/产物在哪/坑）；子对话干完调 quest_notify 交结构化简报，简报自动回派发者。',
+    'dispatchedBy 可省略：2026-10-09 起服务端缺省自动取本工作区登记主对话（你大概率就是它）。直接用即可。',
+  ].join(' '),
+  {
+    title: z.string().describe('子对话用途短名'),
+    handoff: z.string().describe('交接上下文（写法同 plan 节点 handoff）'),
+    deadline_minutes: z.number().optional().describe('约定时限（分钟，默认 240）'),
+    ws: z.string().optional().describe('工作区绝对路径（一般=你的 cwd）'),
+    dispatchedBy: z.string().optional().describe('可省：服务端缺省取本工作区登记主对话'),
+  },
+  async ({ title, handoff, deadline_minutes, ws, dispatchedBy }) => {
+    const r = await q('POST', `/api/spawn?ws=${encodeURIComponent(ws || '')}`, {
+      title, handoff,
+      ...(deadline_minutes ? { deadlineMinutes: deadline_minutes } : {}),
+      ...(dispatchedBy ? { dispatchedBy } : {}),
+    }, 60000);
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+server.tool(
+  'quest_tell',
+  [
+    '向 quest_spawn 派出的子对话发引导消息（补充指令/修正方向）——绕开 DSH send_message 的父子会话限制。',
+    'spawnId 传全称或唯一片段；queue 语义（它忙则排队）。',
+  ].join(' '),
+  {
+    spawnId: z.string().describe('目标子对话 spawnId（quest_status 的 spawned 区可查；片段即可）'),
+    message: z.string().describe('引导消息'),
+    ws: z.string().optional().describe('工作区绝对路径'),
+  },
+  async ({ spawnId, message, ws }) => {
+    const r = await q('POST', `/api/tell?ws=${encodeURIComponent(ws || '')}`, { spawnId, message }, 20000);
+    return r.error ? fail(r) : ok(r);
+  },
+);
+
+await server.connect(new StdioServerTransport());
