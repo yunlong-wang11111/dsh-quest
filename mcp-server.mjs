@@ -14,6 +14,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -23,7 +25,35 @@ const BASE = (process.env.QUEST_URL || 'http://127.0.0.1:3110').replace(/\/+$/, 
 
 function token() {
   if (process.env.QUEST_TOKEN) return process.env.QUEST_TOKEN.trim();
-  try { return fs.readFileSync(path.join(QUEST_HOME, '.token'), 'utf8').trim(); } catch { return ''; }
+  try { return fs.readFileSync(path.join(QUEST_HOME, '.token'), 'utf-8').trim(); } catch { return ''; }
+}
+
+// ── 本体自举（2026-11-07，npm 分发：用户零配置零守护）──────────────────────
+// quest 本体（server.mjs，HTTP 常驻）才是执行引擎；本桥只是客户端。跨 agent 用户
+// 没有义务手工建服务——MCP 客户端 spawn 本桥 → 桥发现本体没跑 → 自己拉起它。
+// 效果：注册一次 MCP，本体随首个会话自动常驻，MCP 客户端兼任守护。
+async function ensureQuestService() {
+  const probe = async () => {
+    try {
+      const r = await fetch(`${BASE}/api/status`, { headers: { 'x-quest-token': token() }, signal: AbortSignal.timeout(1500) });
+      return r.ok;
+    } catch { return false; }
+  };
+  if (await probe()) return;
+  const serverPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'server.mjs');
+  if (!fs.existsSync(serverPath)) return; // 分离布局（桥与本体不同目录）：不强行拉起
+  try { fs.mkdirSync(QUEST_HOME, { recursive: true }); } catch {}
+  const logFh = fs.openSync(path.join(QUEST_HOME, 'service-autostart.log'), 'a');
+  const child = spawn(process.execPath, [serverPath], {
+    detached: true, stdio: ['ignore', logFh, logFh], windowsHide: true,
+    env: { ...process.env },
+  });
+  child.unref();
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (await probe()) return;
+  }
+  // 拉起超时不阻塞桥：工具调用会返回"服务不可达"的明确错误（用户可查 autostart 日志）
 }
 
 async function q(method, pathname, body, timeoutMs = 60000) {
@@ -382,4 +412,6 @@ server.tool(
   },
 );
 
+// 先确保本体在跑（npm 分发零配置的核心），再挂 stdio 供 MCP 客户端调用。
+await ensureQuestService();
 await server.connect(new StdioServerTransport());

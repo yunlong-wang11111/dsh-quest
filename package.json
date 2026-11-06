@@ -1,11 +1,23 @@
 {
   "name": "dsh-quest-service",
-  "version": "0.8.5",
-  "private": true,
+  "version": "0.9.0",
   "type": "module",
-  "scripts": {
-    "start": "node server.mjs"
+  "description": "quest——AI 任务执行与治理层：plan 依赖链/判定回执/守护重试/画板。DSH 插件形态（本仓库原用途）；跨 agent 分发见 bin 入口 dsh-quest-mcp（npx 即用，本体自动拉起）。",
+  "bin": {
+    "dsh-quest-mcp": "./mcp-server.mjs"
   },
+  "files": [
+    "server.mjs",
+    "mcp-server.mjs",
+    "lib/",
+    "PLAN-TEMPLATE.md",
+    "README-MCP.md"
+  ],
+  "scripts": {
+    "start": "node server.mjs",
+    "mcp": "node mcp-server.mjs"
+  },
+  "keywords": ["mcp", "quest", "task-runner", "agent", "pipeline", "judge", "cron"],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "fzstd": "^0.1.1",
