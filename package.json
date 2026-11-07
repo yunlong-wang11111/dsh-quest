@@ -1,6 +1,6 @@
 {
   "name": "dsh-quest-service",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "type": "module",
   "description": "quest——AI 任务执行与治理层：plan 依赖链/判定回执/守护重试/画板。DSH 插件形态（本仓库原用途）；跨 agent 分发见 bin 入口 dsh-quest-mcp（npx 即用，本体自动拉起）。",
   "bin": {

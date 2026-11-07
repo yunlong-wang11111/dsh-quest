@@ -1,6 +1,17 @@
 # quest —— AI 任务执行与治理层
 
-> **非 DSH 用户（Claude Code / Cursor / ZCode 等任意 MCP 客户端）请看 [README-MCP.md](README-MCP.md)**——一行注册即用（`npx -y dsh-quest-service`），服务自动拉起，含采用纪律片段/通知通道/QQ 接入指引。
+> **非 DSH 用户（Claude Code / Cursor / ZCode 等任意 MCP 客户端）请看 [README-MCP.md](README-MCP.md)**
+>
+> **⭐ 0.9.2 新：GUI 安装向导** —— `npx dsh-quest-service install`，浏览器里勾选组件一键安装（含镜像加速，国内网络友好）。
+>
+> **可选生态模块**（独立仓库，按需装，向导里可勾选）：
+> | 模块 | 功能 | 仓库 |
+> |---|---|---|
+> | paper-fetch-mcp | 论文全文 PDF（OA 优先+订阅机构路由+全文 txt） | [yunlong-wang11111/paper-fetch-mcp](https://github.com/yunlong-wang11111/paper-fetch-mcp) |
+> | cae-lanes | CAE 仿真辅助（网格/TikZ 流程图/Abaqus-Comsol 接口/3D 结果在线查看） | [yunlong-wang11111/cae-lanes](https://github.com/yunlong-wang11111/cae-lanes) |
+> | mcp-libre | docx↔pdf 文档转换（公式感知路由保真） | [yunlong-wang11111/mcp-libre](https://github.com/yunlong-wang11111/mcp-libre) |
+> | qq-bridge-work | QQ 桥工作版（群→工作区映射/审批推送/晨报） | [yunlong-wang11111/qq-bridge-work](https://github.com/yunlong-wang11111/qq-bridge-work) |
+>
 > 下方文档面向 DSH（DeepSeek Harness）插件用户。
 
 # dsh-quest
