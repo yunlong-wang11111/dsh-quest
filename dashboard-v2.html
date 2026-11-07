@@ -484,10 +484,19 @@ function renderRunning(d) {
   box.innerHTML = run.sort((a, b) => nodeAt(b) - nodeAt(a)).map((n) => {
     const secs = n.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(n.startedAt)) / 1000)) : n.runSeconds;
     const started = n.startedAt ? new Date(n.startedAt).toLocaleTimeString("zh-CN", { hour12: false }).slice(0, 5) : "";
+    // 2026-10-22：派发人标签——zcode* → [zx]；session-* → [dsh]+短id；裸 UUID = DSH 侧子代理；
+    // 无署名用警示色标出（回执会兜底砸主对话，值得被一眼看见）。
+    const byTag = !n.by
+      ? ` · <span style="color:var(--warn,#c80)">未署名</span>`
+      : n.by.startsWith("zcode")
+        ? ` · 派发 <b>[zx]</b>`
+        : n.by.startsWith("session-")
+          ? ` · 派发 [dsh] ${esc(n.by.slice(8, 14))}`
+          : ` · 派发 [dsh] ${esc(n.by.slice(0, 6))}`;
     return `<div class="obj run">
       <span class="oi">▶</span>
       <span class="oid mono" title="${esc(n.id)}">${esc(n.id)}</span>
-      <span class="ostat">${n.inPlan ? "plan 节点" : "快速单发"}${n.shell === "wsl" ? " · WSL 车道" : " · Windows 车道"} · 已跑 ${secs != null ? Math.floor(secs / 60) + "分" + (secs % 60) + "秒" : "?"}${started ? " · 起于 " + started : ""}${n.expectedMinutes ? "" : ""}</span>
+      <span class="ostat">${n.inPlan ? "plan 节点" : "快速单发"}${n.shell === "wsl" ? " · WSL 车道" : " · Windows 车道"}${byTag} · 已跑 ${secs != null ? Math.floor(secs / 60) + "分" + (secs % 60) + "秒" : "?"}${started ? " · 起于 " + started : ""}</span>
       <button class="act" onclick="openLog('${esc(n.id)}')">日志</button>
       <button class="act danger" onclick="act('cancel','${esc(n.id)}')">终止</button>
     </div>`;

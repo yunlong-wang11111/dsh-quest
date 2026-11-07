@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>quest 生态安装向导</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:"Segoe UI","Microsoft YaHei",sans-serif; background:#f4f6f9; color:#1a2332; min-height:100vh; }
+  .band { background:linear-gradient(135deg,#0f2b46,#155088); color:#fff; padding:22px 36px; display:flex; align-items:center; gap:14px; }
+  .band .logo { width:38px; height:38px; border-radius:9px; background:#fff2; display:flex; align-items:center; justify-content:center; font-size:20px; font-weight:700; }
+  .band h1 { font-size:19px; font-weight:600; }
+  .band .sub { font-size:12px; opacity:.75; margin-top:2px; }
+  .wrap { max-width:860px; margin:26px auto; padding:0 20px; }
+  .card { background:#fff; border-radius:12px; box-shadow:0 1px 4px rgba(15,43,70,.08); margin-bottom:14px; padding:16px 18px; display:flex; gap:14px; align-items:flex-start; transition:.15s; border:1.5px solid transparent; }
+  .card.on { border-color:#155088; background:#f5faff; }
+  .card.required { opacity:.92; }
+  .cb { width:20px; height:20px; margin-top:2px; accent-color:#155088; cursor:pointer; }
+  .cb:disabled { cursor:default; }
+  .info { flex:1; }
+  .name { font-weight:600; font-size:15px; }
+  .meta { font-size:11.5px; color:#7a8aa0; margin-top:2px; }
+  .desc { font-size:13px; color:#44536b; margin-top:6px; line-height:1.5; }
+  .tag { display:inline-block; font-size:10.5px; background:#eef2f7; border-radius:4px; padding:1px 7px; margin-right:6px; color:#5a6b82; }
+  .manual { font-size:12px; background:#fff8e8; border-radius:6px; padding:8px 12px; margin-top:8px; line-height:1.7; display:none; }
+  .card.on .manual { display:block; }
+  .bar { position:sticky; bottom:14px; background:#fff; border-radius:12px; box-shadow:0 4px 16px rgba(15,43,70,.14); padding:14px 20px; display:flex; align-items:center; gap:16px; }
+  .bar .hint { flex:1; font-size:12.5px; color:#7a8aa0; }
+  .btn { background:#155088; color:#fff; border:none; border-radius:8px; padding:10px 30px; font-size:14.5px; cursor:pointer; }
+  .btn:disabled { background:#9db3c8; cursor:default; }
+  #progress { max-width:860px; margin:0 auto 20px; padding:0 20px; display:none; }
+  .step-line { background:#fff; border-radius:8px; padding:10px 14px; font-size:12.5px; margin-bottom:6px; }
+  .comp-head { font-weight:600; }
+  .comp-head.ok::before { content:"✔ "; color:#1a8f3c; }
+  .comp-head.fail::before { content:"✘ "; color:#c0392b; }
+  #log { font-family:Consolas,monospace; font-size:11.5px; background:#0f1b2a; color:#9fd0ff; border-radius:8px; padding:12px 16px; max-height:220px; overflow-y:auto; white-space:pre-wrap; }
+  .done-box { display:none; background:#eafaf0; border:1px solid #b7e4c7; border-radius:10px; padding:16px 20px; margin-top:10px; font-size:13.5px; line-height:1.8; }
+  .copy { cursor:pointer; color:#155088; font-size:12px; border-bottom:1px dashed; }
+</style>
+</head>
+<body>
+<div class="band">
+  <div class="logo">Q</div>
+  <div><h1>quest 生态安装向导</h1><div class="sub">任务执行治理层 · 按需勾选组件 · 自动安装+实时日志</div></div>
+</div>
+
+<div class="wrap" id="comps"></div>
+
+<div id="progress">
+  <div id="steps"></div>
+  <div id="log"></div>
+  <div class="done-box" id="doneBox">
+    <b>安装完成。</b>下一步（建议让 AI 代做）：对 AI 说——<br>
+    <span class="copy" onclick="navigator.clipboard.writeText(this.textContent);this.textContent='已复制'">帮我装一个MCP：包名dsh-quest-service，用npx跑，stdio模式。装完读它的README-MCP.md，把"采用纪律"四条加进规则文件，然后把已装姊妹件的 MCP 注册也配好。</span>
+  </div>
+</div>
+
+<div class="bar">
+  <div class="hint" id="hint">勾选要安装的组件（quest 核心必装）</div>
+  <button class="btn" id="goBtn" disabled>安装所选组件</button>
+</div>
+
+<script>
+const state = { sel:new Set(['quest-core']), tools:{}, busy:false };
+
+async function boot(){
+  const r = await (await fetch('/api/components')).json();
+  state.tools = r.tools;
+  const box = document.getElementById('comps');
+  box.innerHTML = r.components.map(c=>`
+    <div class="card ${c.required?'on required':''}" data-id="${c.id}">
+      <input type="checkbox" class="cb" ${c.required?'checked disabled':''} data-id="${c.id}">
+      <div class="info">
+        <div class="name">${c.name}</div>
+        <div class="meta"><span class="tag">${c.lang}</span><span class="tag">${c.size}</span>${c.required?'<span class="tag" style="background:#e8f0fa;color:#155088">必装</span>':''}</div>
+        <div class="desc">${c.desc}</div>
+        ${c.kind==='manual'?`<div class="manual">${(c.steps||[]).join('<br>')}</div>`:''}
+      </div>
+    </div>`).join('');
+  box.querySelectorAll('.cb').forEach(cb=>cb.addEventListener('change',e=>{
+    e.target.closest('.card').classList.toggle('on', e.target.checked);
+    e.target.checked ? state.sel.add(e.target.dataset.id) : state.sel.delete(e.target.dataset.id);
+    document.getElementById('goBtn').disabled = state.sel.size===0 || state.busy;
+  }));
+  const miss=[];
+  if(!r.tools.git) miss.push('git');
+  if(!r.tools.uv) miss.push('uv（Python 安装器，winget install astral-sh.uv）');
+  document.getElementById('hint').textContent = miss.length
+    ? '⚠ 缺少工具：'+miss.join('、')+' —— Python 组件安装需要它们'
+    : '环境就绪。勾选要安装的组件（quest 核心必装）';
+}
+
+document.getElementById('goBtn').addEventListener('click', async ()=>{
+  state.busy=true; document.getElementById('goBtn').disabled=true; document.getElementById('goBtn').textContent='安装中…';
+  document.getElementById('progress').style.display='block';
+  const es = new EventSource('/api/install?x='+Date.now());  // 用 fetch+SSE 手动读
+  const resp = await fetch('/api/install',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({selected:[...state.sel]})});
+  const reader = resp.body.getReader(); const dec=new TextDecoder(); let buf='';
+  while(true){
+    const {done,value}=await reader.read(); if(done)break;
+    buf+=dec.decode(value,{stream:true});
+    const parts=buf.split('\n\n'); buf=parts.pop();
+    for(const p of parts){
+      if(!p.startsWith('data: '))continue;
+      const ev=JSON.parse(p.slice(6));
+      handle(ev);
+    }
+  }
+});
+
+function handle(ev){
+  const steps=document.getElementById('steps'), log=document.getElementById('log');
+  if(ev.t==='comp-start'){ steps.insertAdjacentHTML('beforeend',`<div class="step-line"><span class="comp-head" id="c-${ev.id}">⟳ ${ev.name}</span></div>`); }
+  if(ev.t==='step'){ log.textContent+=`▸ ${ev.title}\n`; log.scrollTop=log.scrollHeight; }
+  if(ev.t==='log'){ log.textContent+=ev.line+'\n'; log.scrollTop=log.scrollHeight; }
+  if(ev.t==='comp-done'){ const h=document.getElementById('c-'+ev.id); if(h){h.classList.add(ev.ok===false?'fail':'ok'); h.textContent=(ev.ok===false?'':'')+h.textContent.slice(2);} if(ev.note) log.textContent+=`—— ${ev.note}\n`; }
+  if(ev.t==='all-done'){ document.getElementById('doneBox').style.display='block'; document.getElementById('goBtn').textContent='完成'; }
+}
+boot();
+</script>
+</body>
+</html>

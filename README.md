@@ -1,3 +1,8 @@
+# quest —— AI 任务执行与治理层
+
+> **非 DSH 用户（Claude Code / Cursor / ZCode 等任意 MCP 客户端）请看 [README-MCP.md](README-MCP.md)**——一行注册即用（`npx -y dsh-quest-service`），服务自动拉起，含采用纪律片段/通知通道/QQ 接入指引。
+> 下方文档面向 DSH（DeepSeek Harness）插件用户。
+
 # dsh-quest
 
 ![version](https://img.shields.io/github/v/tag/yunlong-wang11111/dsh-quest?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&sort=semver)

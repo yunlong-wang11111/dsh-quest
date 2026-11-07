@@ -544,6 +544,12 @@ function judge(node, exitCode, runSec, logFile, startedAtMs = null, endedAtMs = 
 
   // ② 未声明判据：与旧版完全一致的通用兜底
   if (FINISH_KEYWORDS.some((k) => tailLc.includes(k.toLowerCase()))) return { verdict: 'ok', via: 'finish-keyword' };
+  // 2026-10-22：项目自定义完成标记行（CE_PROBE3_OK / VERIFY35_DONE 这类全大写 *_OK/DONE/PASS/SUCCESS
+  // 独立行）。通用词表覆盖不到各项目的标记惯例——10-21 的 89 个 no-output 假报里 32 个日志尾
+  // 就带着这类标记。tailLc 已 toLowerCase，正则按小写写；标记后必须紧跟行尾/冒号/感叹号，
+  // 排除 "xxx_ok but failed" 这类否定语境。
+  if (/(?:^|\n)[ \t]*[a-z][a-z0-9_]{2,40}_(?:ok|done|pass(?:ed)?|success)[ \t]*(?=[\r\n:!]|$)/.test(tailLc))
+    return { verdict: 'ok', via: 'finish-marker' };
   // WSL 节点的包装器会在日志尾写 EXIT_CODE:<n>——那是真实退出码，比「产物新鲜」更硬
   const ec = tailLc.match(/exit_code:\s*(\d+)/);
   if (ec) {
@@ -1747,6 +1753,12 @@ async function maybeNotifyReceipt(wsKey, nodeId, runSec, summary) {
       if ((isQuick || isExplicit) && by) break;
     }
   } catch {}
+  // 2026-10-29 署名净化（"C4x 回执 subagent 静默"事故）：AI 会把 quest_status 返回的 role 值
+  // （'subagent'）学舌当 by 传——queueReceiptPrompt 的外部署名防御（非 session- 即静默跳过）
+  // 会把它当真外部署名（zcode:glm 那类）而不投，回执石沉大海。合法署名只有两种形态：
+  // session-<uuid>（DSH 会话）或 带冒号的命名署名（zcode:xxx / dsh:xxx）；其余一律视为
+  // 无效署名，落回主对话兜底（main-fallback）——学舌值不再吞回执。
+  if (by && !/^(session-[0-9a-f-]{10,}|[a-z0-9]+:[^:\s]+)$/i.test(by)) by = '';
   // 2026-09-20 补洞（用户抓到的不对称）：无署名任务**成功时完全静默**——失败有兜底（主对话层），
   // 成功没有。无署名的来源是常态：QQ 桥 /q派发 不带署名、插件未升级/未重启时派的任务、readopted 的旧任务。
   // 兜底规则：**人主动派的**（quick 单发，或手工 dispatch 的 plan 节点）→ 回执给登记主对话；
@@ -1831,7 +1843,7 @@ async function finishNode(wsKey, node, j, _code, runSec, startedAt = Date.now() 
   // 接下一步）靠回执驱动，只有成功回执才闭环。仅署名派发才回（自动链节点不带署名，不轰炸；
   // 线级汇总仍归收尾）。notify.receipt=false 可关。
   if (ok && !node.quiet && CFG.notify?.receipt !== false) maybeNotifyReceipt(wsKey, node.id, runSec, summary).catch((e) => log('成功回执异常:', e?.message));
-  try { pushInbox({ node: node.id, verdict: j.verdict, summary }); } catch {}
+  try { pushInbox({ wsKey, node: node.id, verdict: j.verdict, summary }); } catch {}   // 2026-10-29 带 wsKey：status 按工作区取，防串台
   if (!node.quiet && !node.__suppressFinishPush && notifyKind(CFG) !== 'off') {
     const icon = ok ? '✅' : (j.verdict === 'timeout' ? '⏹' : '❌');
     const text = `[${icon} ${j.verdict}] ${node.id} · ${formatDur(runSec)}\n${summary || [j.via, j.detail].filter(Boolean).join(' · ') || j.error || ''}`.slice(0, 600);
@@ -2404,8 +2416,43 @@ function lineActivity(state) {
  *   · 冷却（cooldownMin）防刷屏。状态按工作区持久化到 converge-state.json。
  */
 const CONVERGE_STATE_FILE = () => path.join(HOMEOverride, 'converge-state.json');
+/** 键规范化：折叠所有非 [\w-] 字符（逗号/引号/空格等手滑都会造出"近似键"）。 */
+function _wsKeyNorm(k) { return String(k).replace(/[^\w-]/g, '-'); }
+/** 键的"规范度"：越干净越优先当主键（无异常字符 > 异常字符少 > 字典序，保证确定性）。 */
+function _wsKeyCleanliness(k) {
+  const bad = (String(k).match(/[^\w-]/g) || []).length;
+  return `${String(k).length - bad}`.padStart(4, '0') + String(k);   // 干净字符多者胜，平手字典序
+}
 function loadConvergeState() {
-  try { return JSON.parse(fs.readFileSync(CONVERGE_STATE_FILE(), 'utf8')); } catch { return {}; }
+  let st;
+  try { st = JSON.parse(fs.readFileSync(CONVERGE_STATE_FILE(), 'utf8')); } catch { return {}; }
+  if (!st || typeof st !== 'object') return {};
+  // 2026-10-24 脏键防御（"code_kl 回执投旧会话两天"事故）：AI 传 ws 手滑（如路径多逗号）
+  // 会造出同工作区的第二个键，注册/查询各认各的 ⇒ 主对话注册分裂、回执投错届。
+  // 规则：norm 相同的键组折叠为一个主键（干净键胜出），其余键变为主键数据的同引用别名；
+  // 若发现别名内容已与主键分裂（分离写入过），以主键为准覆盖并写回 + 告警。
+  try {
+    const groups = new Map();
+    for (const k of Object.keys(st)) {
+      const n = _wsKeyNorm(k);
+      if (!groups.has(n)) groups.set(n, []);
+      groups.get(n).push(k);
+    }
+    let dirty = false;
+    let dirtyMain = '';
+    for (const [n, keys] of groups) {
+      if (keys.length < 2) continue;
+      const main = keys.slice().sort((a, b) => _wsKeyCleanliness(b).localeCompare(_wsKeyCleanliness(a)))[0];
+      for (const k of keys) {
+        if (k === main) continue;
+        if (JSON.stringify(st[k]) !== JSON.stringify(st[main])) { dirty = true; dirtyMain = main; }
+        st[k] = st[main];            // 别名 = 主键同引用：之后无论用哪个键读写都是同一份
+        log(`⚠️ converge-state 近似键折叠: "${k}" → 主键 "${main}"（ws 传参曾带手滑字符）`);
+      }
+    }
+    if (dirty) { saveConvergeState(st); qqPush(dirtyMain, `⚠️ quest：converge-state 检测到分裂的近似键已按主键合并（主键 ${dirtyMain}）——若主对话注册有变请重新 quest_register_main`).catch(() => {}); }
+  } catch (e) { log('converge-state 键折叠失败(忽略):', e?.message); }
+  return st;
 }
 function saveConvergeState(st) {
   try { fs.writeFileSync(CONVERGE_STATE_FILE(), JSON.stringify(st, null, 2)); } catch (e) { log('converge-state 写失败:', e?.message); }
@@ -3307,7 +3354,11 @@ const server = http.createServer(async (req, res) => {
         after: Array.isArray(n.after) ? n.after : [],
         manual: !!n.manual, shell: n.shell || 'windows', success: n.success || '',
       }));
-      const unread = inbox.splice(0); // 取走即清
+      // 2026-10-29：按工作区取未读（防串台——RL 的未读别被主动控制的查询捞走）
+      const _mine = [], _keep = [];
+      for (const m of inbox) (m.wsKey === wsKey || !m.wsKey ? _mine : _keep).push(m);
+      inbox.length = 0; inbox.push(..._keep);
+      const unread = _mine; // 取走即清
       writeProgress(wsKey); // 查询即刷新：progress.md 不再等下一个节点事件（排序/状态实时保鲜）
       // spawned：quest_spawn 派的子对话（2026-09-22 L3）——AI 与人都要能看见"谁在替我干活"。
       const spawned = buildSpawns(wsKey).slice(-20).reverse().map((s) => ({
@@ -3801,6 +3852,7 @@ const server = http.createServer(async (req, res) => {
           `2. 会产出需要追踪结果的步骤，写成 plan 节点或 quest_run（追溯留痕）；你修自己的失败节点。`,
           `3. 你**不能再派子对话**（只有一层）；需要并行检索用你自己的会话内子代理。`,
           `4. 全局纪律见 ~/.dsh/AGENTS.md（身份自查：quest_status 的 role 字段）。`,
+          `5. 写产物前先建父目录：os.makedirs(目录, exist_ok=True)——交接里给的产物目录默认不存在，直接写会崩（2026-11-03 独立复算教训）。`,
           ``,
           `── 简报契约（有界返回，完成即终态）──`,
           `干完（或确定干不下去）时，调 quest_notify 发简报，首行必须是：`,

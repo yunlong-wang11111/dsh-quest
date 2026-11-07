@@ -5,4 +5,10 @@
 import { pathToFileURL } from 'node:url';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-await import(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'mcp-server.mjs')).href);
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+// install 子命令（2026-11-07）：生态安装向导（GUI）——起本地服务+开浏览器
+if (process.argv[2] === 'install') {
+  await import(pathToFileURL(join(root, 'install', 'server.mjs')).href);
+} else {
+  await import(pathToFileURL(join(root, 'mcp-server.mjs')).href);
+}
